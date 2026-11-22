@@ -1,0 +1,96 @@
+## Mobile-first responsive PWA web UI for Motet, served directly by `mo serve`.
+## Thin client over `/v1/*` so future Mac and iOS apps share the exact same API.
+module WebUi
+expose app_html, manifest_json
+
+## PWA manifest so Motet can be added to an iPhone Home Screen over Tailscale/HTTPS.
+fn manifest_json() : Text
+  [
+    "{",
+    "\"name\":\"Motet\",",
+    "\"short_name\":\"Motet\",",
+    "\"start_url\":\"/\",",
+    "\"display\":\"standalone\",",
+    "\"background_color\":\"#0e1116\",",
+    "\"theme_color\":\"#6d5efc\"",
+    "}"
+  ].join("")
+end
+
+## Self-contained responsive Roster + Chat + Needs You Inbox UI.
+fn app_html() : Text
+  [
+    "<!doctype html>",
+    "<html lang=\"en\">",
+    "<head>",
+    "<meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">",
+    "<meta name=\"apple-mobile-web-app-capable\" content=\"yes\">",
+    "<link rel=\"manifest\" href=\"/manifest.json\">",
+    "<title>Motet — Living Bot Roster</title>",
+    "<style>",
+    ":root{--bg:#0e1116;--panel:#151a22;--panel2:#1b222d;--border:#273040;--text:#e8edf5;--muted:#909cb0;--accent:#7c6cff;--ok:#2ecc71;--warn:#f5a623;--bad:#ff5c77;--r:12px}",
+    "@media(prefers-color-scheme:light){:root{--bg:#f6f7fb;--panel:#fff;--panel2:#eef1f7;--border:#dce1ec;--text:#141821;--muted:#5a657a;--accent:#5b4bff}}",
+    "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,Inter,system-ui,sans-serif}",
+    ".app{display:grid;grid-template-columns:260px 1fr 320px;min-height:100dvh}",
+    "@media(max-width:960px){.app{grid-template-columns:1fr}.side,.right{border:none;border-top:1px solid var(--border)}}",
+    ".side,.right{background:var(--panel);border-right:1px solid var(--border);padding:16px;display:flex;flex-direction:column;gap:12px}",
+    ".right{border-right:none;border-left:1px solid var(--border)}",
+    ".main{display:flex;flex-direction:column;padding:16px;gap:12px;max-width:860px;width:100%;margin:0 auto}",
+    "h1{font-size:18px;margin:0;display:flex;align-items:center;justify-content:space-between}",
+    "h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:8px 0 4px}",
+    ".pill{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--panel2);border:1px solid var(--border);color:var(--muted)}",
+    ".bot{padding:10px 12px;border-radius:var(--r);border:1px solid var(--border);background:var(--panel2);cursor:pointer;text-align:left;color:var(--text)}",
+    ".bot.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}",
+    ".bot small{display:block;color:var(--muted);margin-top:2px}",
+    ".card{padding:12px;border-radius:var(--r);border:1px solid var(--border);background:var(--panel2)}",
+    ".chat{flex:1;display:flex;flex-direction:column;gap:10px;overflow:auto;min-height:42vh}",
+    ".msg{padding:10px 12px;border-radius:var(--r);white-space:pre-wrap;word-break:break-word}",
+    ".msg.user{background:var(--accent);color:#fff;align-self:flex-end;max-width:85%}",
+    ".msg.bot{background:var(--panel);border:1px solid var(--border);align-self:flex-start;max-width:90%}",
+    ".msg.meta{font-size:12px;color:var(--muted);background:transparent;padding:2px 4px}",
+    "form.composer{display:flex;gap:8px;position:sticky;bottom:0;background:var(--bg);padding:8px 0}",
+    "input,textarea,button{font:inherit;border-radius:10px;border:1px solid var(--border);background:var(--panel);color:var(--text);padding:10px 12px}",
+    "input,textarea{flex:1}button{cursor:pointer;background:var(--accent);color:#fff;border:none;font-weight:600}",
+    "button.ghost{background:var(--panel2);color:var(--text);border:1px solid var(--border)}",
+    "button.ok{background:var(--ok);color:#08160d}button.bad{background:var(--bad);color:#fff}",
+    ".row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}",
+    "code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}",
+    "</style></head><body>",
+    "<div class=\"app\">",
+    "<aside class=\"side\">",
+    "<h1>Motet <span id=\"health\" class=\"pill\">connecting…</span></h1>",
+    "<div class=\"row\"><input id=\"token\" type=\"password\" placeholder=\"Bearer token (optional)\"><button class=\"ghost\" onclick=\"saveToken()\">Set</button></div>",
+    "<h2>Bot Roster</h2><div id=\"bots\" style=\"display:flex;flex-direction:column;gap:8px\"></div>",
+    "<h2>Connectors</h2><div id=\"connectors\" class=\"card\" style=\"font-size:12px\"></div>",
+    "<div class=\"row\"><button class=\"ghost\" onclick=\"tickRoutines()\">Run Routines</button><a href=\"/docs\" class=\"pill\" style=\"text-decoration:none\">OpenAPI /docs</a></div>",
+    "</aside>",
+    "<main class=\"main\">",
+    "<div class=\"row\" style=\"justify-content:space-between\"><div><strong id=\"activeBot\">chief</strong> <span id=\"activeMeta\" class=\"pill\"></span></div><button class=\"ghost\" onclick=\"newSession()\">New Chat</button></div>",
+    "<div id=\"chat\" class=\"chat\"></div>",
+    "<form class=\"composer\" onsubmit=\"sendAsk(event)\"><input id=\"prompt\" placeholder=\"Message your bot…\" autocomplete=\"off\"><button type=\"submit\">Send</button></form>",
+    "</main>",
+    "<aside class=\"right\">",
+    "<h2>Needs You Inbox</h2><div id=\"inbox\" style=\"display:flex;flex-direction:column;gap:8px\"></div>",
+    "<h2>Budgets</h2><div id=\"budgets\" class=\"card\" style=\"font-size:12px\"></div>",
+    "<h2>Recent Memory</h2><div id=\"memory\" class=\"card\" style=\"font-size:12px\"></div>",
+    "</aside>",
+    "</div>",
+    "<script>",
+    "let activeBot='chief',sessionId=null;",
+    "const hdrs=()=>{const h={'Content-Type':'application/json'};const t=localStorage.getItem('motet_token');if(t)h['Authorization']='Bearer '+t;return h;};",
+    "async function api(p,o={}){const r=await fetch(p,{...o,headers:{...hdrs(),...(o.headers||{})}});if(!r.ok)throw new Error(await r.text());return r.json();}",
+    "function saveToken(){localStorage.setItem('motet_token',document.getElementById('token').value.trim());refresh();}",
+    "function newSession(){sessionId=null;document.getElementById('chat').innerHTML='';}",
+    "function addMsg(cls,txt){const d=document.createElement('div');d.className='msg '+cls;d.textContent=txt;const c=document.getElementById('chat');c.appendChild(d);c.scrollTop=c.scrollHeight;}",
+    "async function selectBot(name,meta){activeBot=name;sessionId=null;document.getElementById('activeBot').textContent=name;document.getElementById('activeMeta').textContent=meta;document.getElementById('chat').innerHTML='';renderBots();}",
+    "let botsCache=[];",
+    "function renderBots(){const el=document.getElementById('bots');el.innerHTML='';for(const b of botsCache){const btn=document.createElement('button');btn.className='bot'+(b.name===activeBot?' active':'');btn.innerHTML='<strong>'+b.name+'</strong>'+(b['is_primary?']?' ★':'')+'<small>'+b.role+' · '+b.model+'</small>';btn.onclick=()=>selectBot(b.name,b.role+' · '+b.model);el.appendChild(btn);}}",
+    "async function resolveInbox(id,yes){await api('/v1/inbox/'+id+'/'+(yes?'approve':'deny'),{method:'POST'});refresh();}",
+    "async function tickRoutines(){const r=await api('/v1/routines/tick',{method:'POST'});addMsg('meta','Routine tick: ran '+r.routines_ran+', approvals '+r.approvals_created);refresh();}",
+    "async function sendAsk(ev){ev.preventDefault();const inp=document.getElementById('prompt');const msg=inp.value.trim();if(!msg)return;inp.value='';addMsg('user',msg);try{const res=await api('/v1/bots/'+encodeURIComponent(activeBot)+'/ask',{method:'POST',body:JSON.stringify({message:msg,session_id:sessionId})});sessionId=res.session_id;addMsg('bot',res.reply||'(no reply)');addMsg('meta','steps '+res.steps+' · $'+res.spent_usd+(res.pending_approvals.length?' · '+res.pending_approvals.length+' pending approval':''));refresh();}catch(e){addMsg('meta','Error: '+e.message);}}",
+    "async function refresh(){try{const h=await api('/v1/health');document.getElementById('health').textContent=h.bots+' bots · '+h.pending_approvals+' inbox';botsCache=await api('/v1/bots');renderBots();const ib=await api('/v1/inbox?pending=true');const iel=document.getElementById('inbox');iel.innerHTML=ib.length?'':'<span class=\"pill\">Nothing blocked</span>';for(const a of ib){const c=document.createElement('div');c.className='card';c.innerHTML='<strong>#'+a.id+' '+a.bot_name+' → <code>'+a.tool_name+'</code></strong><div style=\"color:var(--muted);margin:4px 0;font-size:12px\">'+a.reason+'</div><div class=\"row\"><button class=\"ok\" onclick=\"resolveInbox('+a.id+',true)\">Approve</button><button class=\"bad\" onclick=\"resolveInbox('+a.id+',false)\">Deny</button></div>';iel.appendChild(c);}const cs=await api('/v1/connectors');document.getElementById('connectors').innerHTML=cs.map(c=>'<div><code>'+c.name+'</code> → '+c.url+'</div>').join('')||'None';const bs=await api('/v1/budget');document.getElementById('budgets').innerHTML=bs.map(b=>'<div><strong>'+b.bot_name+'</strong>: $'+b.spent_usd+' / $'+b.limit_usd+' ('+b.turns+' turns)</div>').join('')||'No spend yet';const ms=await api('/v1/memory');document.getElementById('memory').innerHTML=ms.slice(0,6).map(m=>'<div>['+m.scope+'] '+m.content+'</div>').join('')||'Empty';}catch(e){document.getElementById('health').textContent='auth needed';}}",
+    "document.getElementById('token').value=localStorage.getItem('motet_token')||'';refresh();setInterval(refresh,15000);",
+    "</script></body></html>"
+  ].join("")
+end

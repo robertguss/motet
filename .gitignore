@@ -1,0 +1,5 @@
+.motet/*.sqlite
+.motet/*.sqlite-*
+*.sqlite
+*.sqlite-*
+*.bc
