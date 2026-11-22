@@ -44,10 +44,16 @@ export MOTET_API_TOKEN="choose-a-strong-local-token"   # optional on loopback
 mo serve server.mo --port 8787 --data .motet
 ```
 
-- **Responsive Web UI (iPhone/macOS PWA):** `http://127.0.0.1:8787/`
+- **Responsive Web UI (iPhone/macOS PWA):** `http://127.0.0.1:8787/` — 3-pane desktop studio + 4-tab mobile bottom bar (`Chat`, `Inbox`, `Roster`, `Ops`), Bot Studio create/edit modal with provider presets, replayable session history & full-text search, **Needs You** approval cards, inline editors for `SKILL.md` skills, memory, routines, MCP connectors, policy rules, and artifacts
 - **Interactive OpenAPI 3.1 Docs:** `http://127.0.0.1:8787/docs` and `/openapi.json` (ready for future SwiftUI Mac/iOS or Electron clients)
 - **Built-in MCP endpoint (for T3 Code → Motet):** `POST http://127.0.0.1:8787/mcp`
 - **Webhook receiver (`External` trust):** `POST http://127.0.0.1:8787/webhooks/<source>`
+
+### 5. Deploy to an `exe.dev` VM
+
+```sh
+./deploy.sh    # syncs repo, runs mo test remotely, reinstalls CLI, restarts systemd services
+```
 
 ### 5. Connect T3 Code and future MCP integrations
 

@@ -35,6 +35,7 @@ use Types{
   SaveSkillRequest,
   SessionEvent,
   SessionSummary,
+  SkillDoc,
   SkillSummary,
   TickSummary,
   TrustLevel,
@@ -58,6 +59,7 @@ api
 
   get "/" get_ui
   get "/manifest.json" get_manifest
+  get "/icon.svg" get_icon
   get "/v1/health" get_health
 
   get "/v1/bots" get_bots
@@ -77,6 +79,7 @@ api
   post "/v1/memory" post_memory
 
   get "/v1/skills" get_skills
+  get "/v1/skills/:name" get_skill_by_name
   post "/v1/skills" post_skill
 
   get "/v1/routines" get_routines
@@ -130,6 +133,11 @@ end
 ## Serves the PWA web manifest for Home Screen installation on iOS/macOS.
 fn get_manifest() : Api.Response
   Api.response(200, [("Content-Type", "application/manifest+json")], WebUi.manifest_json().bytes)
+end
+
+## Serves the Motet SVG app icon and favicon.
+fn get_icon() : Api.Response
+  Api.response(200, [("Content-Type", "image/svg+xml")], WebUi.icon_svg().bytes)
 end
 
 ## Reports Motet server health and roster/inbox counts.
@@ -335,6 +343,11 @@ end
 ## Lists installed progressive-disclosure SKILL.md documents.
 fn get_skills(_op: Operator, files: ReadFiles) : List(SkillSummary)
   Skills.index_skills(files)
+end
+
+## Reads a single SKILL.md document in full by slug.
+fn get_skill_by_name(_op: Operator, files: ReadFiles, name: Text) : Result(SkillDoc, MotetError)
+  Skills.read_skill(files, name)
 end
 
 ## Creates or updates a SKILL.md file on disk with explicit provenance.
@@ -693,9 +706,11 @@ test "Motet unified API serves PWA UI, OpenAPI, auth, webhooks, MCP, and bot tur
   t0 = Time.parse("2026-11-22T00:00:00Z") or stop "time"
   clock = Clock.fixed(t0)
 
-  # 1. Public PWA UI, manifest, OpenAPI spec, and health
+  # 1. Public PWA UI, icon, manifest, OpenAPI spec, and health
   ui_resp = ApiTest.send(Server, Api.get("/"), sqlite, env, clock, budget, policy, sched)
   assert ui_resp.status == 200 and ui_resp.text.contains?("Motet")
+  icon_resp = ApiTest.send(Server, Api.get("/icon.svg"), sqlite, env, clock, budget, policy, sched)
+  assert icon_resp.status == 200 and icon_resp.text.contains?("<svg")
   oa_resp = ApiTest.send(
     Server,
     Api.get("/openapi.json"),
@@ -706,7 +721,44 @@ test "Motet unified API serves PWA UI, OpenAPI, auth, webhooks, MCP, and bot tur
     policy,
     sched
   )
-  assert oa_resp.status == 200 and oa_resp.text.contains?("/v1/bots")
+  assert oa_resp.status == 200 and
+    oa_resp.text.contains?("/v1/bots") and
+    oa_resp.text.contains?("/v1/skills/{name}")
+
+  # 1b. Skill write and single-skill read via API
+  files = Files.in_memory({})
+  save_sk = ApiTest.send(
+    Server,
+    Api.post("/v1/skills").with_bearer("secret-op").with_json(
+      SaveSkillRequest(
+        name: "release-check",
+        description: "Verify release checklist",
+        body: "Run mo test first.",
+        provenance: Some("user")
+      )
+    ),
+    files,
+    sqlite,
+    env,
+    clock,
+    budget,
+    policy,
+    sched
+  )
+  assert save_sk.status == 200
+  read_sk = ApiTest.send(
+    Server,
+    Api.get("/v1/skills/release-check").with_bearer("secret-op"),
+    files.read_only,
+    sqlite,
+    env,
+    clock,
+    budget,
+    policy,
+    sched
+  )
+  assert read_sk.status == 200
+  assert Json.decode[SkillDoc](read_sk.text) is Ok(sk_doc) and sk_doc.body == "Run mo test first."
 
   # 2. Auth enforcement on /v1/bots
   unauth = ApiTest.send(Server, Api.get("/v1/bots"), sqlite, env, clock, budget, policy, sched)
