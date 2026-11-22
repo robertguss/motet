@@ -253,7 +253,9 @@ end
 fn cmd_resolve(
   rt: ToolRuntime,
   db: Sqlite.Database,
+  budget: BudgetActor,
   policy: PolicyActor,
+  scheduler: SchedulerActor,
   console: Console,
   id_str: Text,
   approve?: Bool
@@ -261,7 +263,7 @@ fn cmd_resolve(
   case id_str.to_int
     None: print_err(console, BadInput(message: "invalid approval id: #{id_str}"))
     Some(id):
-      case Brain.resolve_approval(rt, db, policy, id, approve?)
+      case Brain.resolve_approval(rt, db, budget, policy, scheduler, id, approve?)
         Ok(item):
           console.print("approval ##{item.id} -> #{item.status}: #{item.result_text or "(ok)"}")
           0
@@ -458,8 +460,10 @@ fn main(
   return cmd_chat(rt, db, budget, policy, scheduler, console, rest.first or "chief") if head ==
     "chat"
   return cmd_inbox(db, console, rest) if head == "inbox"
-  return cmd_resolve(rt, db, policy, console, rest.first or "", true) if head == "approve"
-  return cmd_resolve(rt, db, policy, console, rest.first or "", false) if head == "deny"
+  return cmd_resolve(rt, db, budget, policy, scheduler, console, rest.first or "", true) if head ==
+    "approve"
+  return cmd_resolve(rt, db, budget, policy, scheduler, console, rest.first or "", false) if head ==
+    "deny"
   return cmd_connectors(db, console, rest) if head == "connectors"
   return cmd_memory(db, clock, console, rest) if head == "memory"
   return cmd_skills(files.read_only, console, rest) if head == "skills"

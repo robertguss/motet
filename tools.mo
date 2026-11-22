@@ -11,6 +11,7 @@ use Mcp
 use Skills
 use Store
 use Types{BotConfig, ConnectorSpec, EffectClass, MotetError, ProviderKind}
+use Web
 
 struct ToolRuntime
   files: Files
@@ -157,6 +158,42 @@ fn core_tool_defs() : List(ToolDef)
         },
         ["connector", "tool"]
       )
+    ),
+    ToolDef(
+      name: "web_search",
+      description: "Search the live web for current news, docs, versions, prices, or facts. Returns a concise summary and source URLs.",
+      schema: obj_schema(
+        {
+          "query": str_prop("Search query"),
+          "max_results": int_prop("Maximum sources to return (1-10, default 5)")
+        },
+        ["query"]
+      )
+    ),
+    ToolDef(
+      name: "web_fetch",
+      description: "Fetch and extract readable text from a public http(s) web page URL (blocks private/loopback addresses).",
+      schema: obj_schema({"url": str_prop("Public http(s) URL to read")}, ["url"])
+    ),
+    ToolDef(
+      name: "bot_list",
+      description: "List active specialist bots in this Motet roster along with their roles, models, and mounted connectors.",
+      schema: obj_schema({}, [])
+    ),
+    ToolDef(
+      name: "bot_delegate",
+      description: "Delegate a focused sub-task to another bot in the roster (e.g. 'builder' for deep engineering or 'watcher' for fast monitoring) and receive its reply. Runs in a durable child session under the child bot's budget.",
+      schema: obj_schema(
+        {
+          "bot": str_prop("Target bot name from the roster (e.g. 'builder' or 'watcher')"),
+          "task": str_prop("Clear, self-contained task brief and expected output"),
+          "read_only": Json.Object({
+            "type": Json.String("boolean"),
+            "description": Json.String("Set true to restrict the delegated run to read-only tools")
+          })
+        },
+        ["bot", "task"]
+      )
     )
   ]
 end
@@ -190,6 +227,17 @@ fn classify_tool_effect(tool_name: Text, arguments_json: Text, connectors: List(
       "{\"connector\":\"t3code\",\"tool\":\"pull_request_merge\"}",
       []
     ) == (Irreversible, "t3code:pull_request_merge")
+    classify_tool_effect("web_search", "{\"query\":\"Mo language\"}", []) == (Read, "web_search")
+    classify_tool_effect("web_fetch", "{\"url\":\"https://example.com\"}", []) == (Read, "web_fetch")
+    classify_tool_effect(
+      "bot_delegate",
+      "{\"bot\":\"builder\",\"task\":\"review diff\",\"read_only\":true}",
+      []
+    ) == (Read, "bot_delegate:builder")
+    classify_tool_effect("bot_delegate", "{\"bot\":\"builder\",\"task\":\"implement fix\"}", []) == (
+      WriteLocal,
+      "bot_delegate:builder"
+    )
   end
 
   if tool_name == "memory_search" or
@@ -197,8 +245,18 @@ fn classify_tool_effect(tool_name: Text, arguments_json: Text, connectors: List(
     tool_name == "skill_read" or
     tool_name == "file_read" or
     tool_name == "file_list" or
-    tool_name == "connector_tools"
+    tool_name == "connector_tools" or
+    tool_name == "web_search" or
+    tool_name == "web_fetch" or
+    tool_name == "bot_list"
     return (Read, tool_name)
+  end
+
+  if tool_name == "bot_delegate"
+    args = parse_args_obj(arguments_json)
+    target = (args.text_at("bot") or "unknown").trim
+    ro = if args.get("read_only") is Some(Json.Boolean(v)): v else: false
+    return if ro: (Read, "bot_delegate:#{target}") else: (WriteLocal, "bot_delegate:#{target}")
   end
 
   if tool_name == "memory_save" or
@@ -430,6 +488,38 @@ fn execute_tool(
           end
         end
     end
+  end
+
+  if tool_name == "web_search"
+    q = args.text_at("query") or ""
+    limit = args.int_at("max_results") or 5
+    return case Web.web_search(rt.network, rt.env, q, limit)
+      Ok(out): Ok(out)
+      Error(err): Ok("web_search_error: #{err}")
+    end
+  end
+
+  if tool_name == "web_fetch"
+    url = args.text_at("url") or ""
+    return case Web.web_fetch(rt.network, url)
+      Ok(out): Ok(out)
+      Error(err): Ok("web_fetch_error: #{err}")
+    end
+  end
+
+  if tool_name == "bot_list"
+    bots = try Store.list_bots(db)
+    lines = bots.filter(fn(b) b.active? end).map(fn(b)
+      conns = if b.connectors.empty?: "none" else: b.connectors.join(",")
+      tag = if b.name == bot.name: " (you)" else: ""
+      "- #{b.name}#{tag}: #{b.role} | model=#{b.model} (#{b.model_tier}) | connectors=#{conns} | workspace=#{b
+        .workspace}"
+    end)
+    return Ok(if lines.empty?: "no active bots" else: lines.join("\n"))
+  end
+
+  if tool_name == "bot_delegate"
+    return Ok("delegation_error: bot_delegate must execute via Brain")
   end
 
   Ok("unknown tool: #{tool_name}")

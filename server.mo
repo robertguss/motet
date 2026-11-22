@@ -296,7 +296,9 @@ end
 fn post_approve(
   _op: Operator,
   db: Sqlite.Database,
+  budget: BudgetActor,
   policy: PolicyActor,
+  scheduler: SchedulerActor,
   files: Files,
   command: Command,
   network: Network,
@@ -306,14 +308,16 @@ fn post_approve(
 ) : Result(ApprovalItem, MotetError)
   try ensure_ready(db, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  Brain.resolve_approval(rt, db, policy, id, true)
+  Brain.resolve_approval(rt, db, budget, policy, scheduler, id, true)
 end
 
 ## Denies a Needs-You item without executing the paused tool action.
 fn post_deny(
   _op: Operator,
   db: Sqlite.Database,
+  budget: BudgetActor,
   policy: PolicyActor,
+  scheduler: SchedulerActor,
   files: Files,
   command: Command,
   network: Network,
@@ -323,7 +327,7 @@ fn post_deny(
 ) : Result(ApprovalItem, MotetError)
   try ensure_ready(db, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  Brain.resolve_approval(rt, db, policy, id, false)
+  Brain.resolve_approval(rt, db, budget, policy, scheduler, id, false)
 end
 
 ## Lists or keyword-searches persistent shared and bot-scoped memory.
