@@ -160,7 +160,7 @@ fn post_bot(_op: Operator, db: Sqlite.Database, clock: Clock, body: CreateBotReq
   try ensure_ready(db, clock)
   clean_name = body.name.trim
   return Error(BadInput(message: "bot name cannot be empty")) if clean_name.empty?
-  provider = body.provider or OpenAiCompat
+  provider = body.provider or Anthropic
   default_ep = case provider
     OpenAiCompat: "https://api.x.ai/v1/chat/completions"
     Anthropic: "https://api.anthropic.com/v1/messages"
@@ -171,7 +171,7 @@ fn post_bot(_op: Operator, db: Sqlite.Database, clock: Clock, body: CreateBotReq
   end
   default_model = case provider
     OpenAiCompat: "grok-4"
-    Anthropic: "claude-sonnet-4-6"
+    Anthropic: "claude-sonnet-5-5"
   end
   ep = body.endpoint or default_ep
   bot = BotConfig(
@@ -702,7 +702,7 @@ test "Motet unified API serves PWA UI, OpenAPI, auth, webhooks, MCP, and bot tur
   budget = Actor.start(BudgetActor)
   policy = Actor.start(PolicyActor)
   sched = Actor.start(SchedulerActor)
-  env = Env.of({"MOTET_API_TOKEN": "secret-op", "XAI_API_KEY": "xai-test"})
+  env = Env.of({"MOTET_API_TOKEN": "secret-op", "ANTHROPIC_API_KEY": "sk-ant-test"})
   t0 = Time.parse("2026-11-22T00:00:00Z") or stop "time"
   clock = Clock.fixed(t0)
 

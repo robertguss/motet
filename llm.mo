@@ -397,7 +397,7 @@ test "OpenAI-compatible and Anthropic wire adapters parse tool calls and cache u
     provider: Anthropic,
     endpoint: "https://api.anthropic.com/v1/messages",
     api_key_env: "ANTHROPIC_API_KEY",
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5-5",
     workspace: ".",
     allowed_programs: [],
     allowed_hosts: ["api.anthropic.com:443"],

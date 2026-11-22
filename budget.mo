@@ -25,11 +25,13 @@ struct BudgetState
   quotas: Map(Text, BotQuota)
 end
 
-## Per-million (input, output) USD rates by named model tier.
+## Per-million (input, output) USD rates by named model tier (Claude 5.x defaults).
 fn tier_rates(tier: Text) : (Decimal, Decimal)
   examples
-    tier_rates("fast") == (0.30, 1.50)
-    tier_rates("smart") == (3.00, 15.00)
+    tier_rates("fast") == (0.10, 0.50)
+    tier_rates("smart") == (2.00, 10.00)
+    tier_rates("opus") == (4.00, 20.00)
+    tier_rates("frontier") == (8.00, 40.00)
     tier_rates("local") == (0.00, 0.00)
   end
 
@@ -37,11 +39,13 @@ fn tier_rates(tier: Text) : (Decimal, Decimal)
   if low == "local" or low == "free"
     (0.00, 0.00)
   else if low == "fast" or low == "mini" or low == "haiku"
-    (0.30, 1.50)
-  else if low == "frontier" or low == "opus"
-    (15.00, 75.00)
+    (0.10, 0.50)
+  else if low == "opus"
+    (4.00, 20.00)
+  else if low == "frontier" or low == "fable"
+    (8.00, 40.00)
   else
-    (3.00, 15.00)
+    (2.00, 10.00)
   end
 end
 
@@ -57,8 +61,9 @@ fn compute_cost_usd(input_tokens: Int, output_tokens: Int, cached_input_tokens: 
   end
 
   examples
-    compute_cost_usd(1000, 100, 0, "smart") == Ok(0.0045)
-    compute_cost_usd(1000, 100, 800, "smart") == Ok(0.00234)
+    compute_cost_usd(1000, 100, 0, "smart") == Ok(0.003)
+    compute_cost_usd(1000, 100, 800, "smart") == Ok(0.00156)
+    compute_cost_usd(1000, 100, 0, "opus") == Ok(0.006)
     compute_cost_usd(1000, 100, 0, "local") == Ok(0.0)
   end
 
@@ -223,10 +228,10 @@ test "BudgetActor enforces exact Decimal USD caps and daily resets"
   actor_b = Actor.start(BudgetActor)
   assert actor_b.configure("watcher", 0.01) is Ok(_)
   assert actor_b.record_spend("watcher", 0.01, 1000, 100, 0, "smart") is Ok(snap1)
-  assert snap1.spent_usd == 0.0045
+  assert snap1.spent_usd == 0.003
   assert actor_b.record_spend("watcher", 0.01, 2000, 1000, 0, "smart") is
     Error(LimitExceeded(bot_name: _, spent_usd: _, limit_usd: _))
   Actor.advance(actor_b, 1.day)
   assert actor_b.record_spend("watcher", 0.01, 1000, 100, 0, "smart") is Ok(snap2)
-  assert snap2.spent_usd == 0.0045
+  assert snap2.spent_usd == 0.003
 end

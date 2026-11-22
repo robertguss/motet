@@ -478,27 +478,31 @@ test "Brain pauses WriteExternal T3 thread launch into Needs You and executes on
 
   files = Files.in_memory({})
   cmd = Command.fake({})
-  env = Env.of({"XAI_API_KEY": "test-xai", "T3_MCP_TOKEN": "test-t3"})
+  env = Env.of({"ANTHROPIC_API_KEY": "test-ant", "T3_MCP_TOKEN": "test-t3"})
   clock = Clock.fixed(t0)
 
   assert Store.get_bot(db, "chief") is Ok(Some(chief))
   assert build_prompt_tiers(db, files.read_only, chief, Owner, t0.to_text) is Ok(tiers)
   tool_defs = core_tool_defs()
 
-  call_args = "{\"connector\":\"t3code\",\"tool\":\"t3_thread_launch\",\"arguments\":{\"title\":\"Fix CI\"}}"
-  r1_body = "{\"choices\":[{\"message\":{\"content\":\"Launching a T3 thread to fix CI.\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"connector_call\",\"arguments\":\"{\\\"connector\\\":\\\"t3code\\\",\\\"tool\\\":\\\"t3_thread_launch\\\",\\\"arguments\\\":{\\\"title\\\":\\\"Fix CI\\\"}}\"}}]}}],\"usage\":{\"prompt_tokens\":300,\"completion_tokens\":50}}"
-  r2_body = "{\"choices\":[{\"message\":{\"content\":\"Queued T3 thread launch in your Needs You inbox (#1).\"}}],\"usage\":{\"prompt_tokens\":380,\"completion_tokens\":25}}"
+  call_args = Json.Object({
+    "connector": Json.String("t3code"),
+    "tool": Json.String("t3_thread_launch"),
+    "arguments": Json.Object({"title": Json.String("Fix CI")})
+  }).to_text
+  r1_body = "{\"content\":[{\"type\":\"text\",\"text\":\"Launching a T3 thread to fix CI.\"},{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"connector_call\",\"input\":#{call_args}}],\"usage\":{\"input_tokens\":300,\"output_tokens\":50}}"
+  r2_body = "{\"content\":[{\"type\":\"text\",\"text\":\"Queued T3 thread launch in your Needs You inbox (#1).\"}],\"usage\":{\"input_tokens\":380,\"output_tokens\":25}}"
 
   m1 = [UserMsg(content: "Fix CI in T3")]
-  req1 = build_http_request(chief, "test-xai", tiers, m1, tool_defs)
+  req1 = build_http_request(chief, "test-ant", tiers, m1, tool_defs)
   paused_obs = "PAUSED_FOR_APPROVAL (Needs You #1): external action paused for Needs You approval (add an Allow rule to automate). Inform the user what is waiting in their Needs You inbox."
   m2 = m1.append(
     AssistantMsg(
       content: "Launching a T3 thread to fix CI.",
-      tool_calls: [ToolCallReq(id: "call_1", name: "connector_call", arguments_json: call_args)]
+      tool_calls: [ToolCallReq(id: "toolu_1", name: "connector_call", arguments_json: call_args)]
     )
-  ).append(ToolResultMsg(tool_call_id: "call_1", tool_name: "connector_call", content: paused_obs))
-  req2 = build_http_request(chief, "test-xai", tiers, m2, tool_defs)
+  ).append(ToolResultMsg(tool_call_id: "toolu_1", tool_name: "connector_call", content: paused_obs))
+  req2 = build_http_request(chief, "test-ant", tiers, m2, tool_defs)
 
   mcp_init_req = Http.post("http://127.0.0.1:3773/mcp").header(
     "Accept",

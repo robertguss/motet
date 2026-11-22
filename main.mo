@@ -118,9 +118,9 @@ fn cmd_bot_sub(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
   if sub == "create" and rest.size >= 4
     name = (rest.get(1) or "").trim
     role = (rest.get(2) or "Assistant").trim
-    model = (rest.get(3) or "grok-4").trim
-    prov_str = (rest.get(4) or "openai").ascii_lowercase
-    prov = if prov_str == "anthropic": Anthropic else: OpenAiCompat
+    model = (rest.get(3) or "claude-sonnet-5-5").trim
+    prov_str = (rest.get(4) or "anthropic").ascii_lowercase
+    prov = if prov_str == "openai": OpenAiCompat else: Anthropic
     ep = case prov
       Anthropic: "https://api.anthropic.com/v1/messages"
       OpenAiCompat: "https://api.x.ai/v1/chat/completions"
@@ -154,7 +154,7 @@ fn cmd_bot_sub(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
       Error(err): print_err(console, err)
     end
   end
-  console.error("usage: motet bot (show <name> | create <name> <role> <model> [openai|anthropic])")
+  console.error("usage: motet bot (show <name> | create <name> <role> <model> [anthropic|openai])")
   2
 end
 
@@ -513,7 +513,7 @@ test "motet CLI initializes roster, manages connectors and memory, and runs bot 
   cmd = Command.fake({})
   t0 = Time.parse("2026-11-22T00:00:00Z") or stop "time"
   clock = Clock.fixed(t0)
-  env = Env.of({"XAI_API_KEY": "k-cli"})
+  env = Env.of({"ANTHROPIC_API_KEY": "k-cli"})
   budget = Actor.start(BudgetActor)
   policy = Actor.start(PolicyActor)
   sched = Actor.start(SchedulerActor)
@@ -584,7 +584,7 @@ test "motet CLI initializes roster, manages connectors and memory, and runs bot 
         ask_req,
         Http.reply(
           200,
-          "{\"choices\":[{\"message\":{\"content\":\"All 3 bots nominal.\"}}],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":12}}"
+          "{\"content\":[{\"type\":\"text\",\"text\":\"All 3 bots nominal.\"}],\"usage\":{\"input_tokens\":120,\"output_tokens\":12}}"
         )
       )
     ])

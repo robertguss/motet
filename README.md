@@ -27,11 +27,12 @@ motet bots
 ### 3. Set a provider key and talk to your roster
 
 ```sh
-# OpenAI-compatible (xAI/Grok, OpenAI, OpenRouter, Ollama/vLLM)
-export XAI_API_KEY="..."
-
-# Anthropic Messages API (used by `builder` by default, with prompt caching)
+# Anthropic Messages API (default for seeded chief/builder/watcher, with prompt caching)
 export ANTHROPIC_API_KEY="..."
+
+# Or OpenAI-compatible (Google Gemini, xAI/Grok, OpenAI, OpenRouter, Ollama/vLLM)
+export GEMINI_API_KEY="..."
+export XAI_API_KEY="..."
 
 motet ask chief "Summarize what you can monitor for me"
 motet chat chief
