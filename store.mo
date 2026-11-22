@@ -13,6 +13,13 @@ get_connector,
 list_connectors,
 set_connector_enabled,
 delete_connector,
+OAuthPending(..),
+save_oauth_pending,
+take_oauth_pending,
+save_connector_token,
+get_connector_token,
+get_connector_token_meta,
+delete_connector_token,
 add_rule,
 list_rules,
 delete_rule,
@@ -298,7 +305,7 @@ fn init_schema(db: Sqlite.Database) : Result(Unit, MotetError)
       ")"
     ].join("")
   )
-  run_ddl(
+  try run_ddl(
     db,
     [
       "CREATE TABLE IF NOT EXISTS budget_ledger (",
@@ -309,6 +316,33 @@ fn init_schema(db: Sqlite.Database) : Result(Unit, MotetError)
       "  output_tokens INT NOT NULL,",
       "  cost_usd TEXT NOT NULL,",
       "  created_at TEXT NOT NULL",
+      ")"
+    ].join("")
+  )
+  try run_ddl(
+    db,
+    [
+      "CREATE TABLE IF NOT EXISTS oauth_pending (",
+      "  state TEXT PRIMARY KEY,",
+      "  connector_name TEXT NOT NULL,",
+      "  client_id TEXT NOT NULL,",
+      "  redirect_uri TEXT NOT NULL,",
+      "  code_verifier TEXT NOT NULL,",
+      "  token_endpoint TEXT NOT NULL,",
+      "  resource TEXT NOT NULL,",
+      "  created_at TEXT NOT NULL",
+      ")"
+    ].join("")
+  )
+  run_ddl(
+    db,
+    [
+      "CREATE TABLE IF NOT EXISTS connector_tokens (",
+      "  connector_name TEXT PRIMARY KEY,",
+      "  access_token TEXT NOT NULL,",
+      "  scope TEXT NOT NULL,",
+      "  expires_at TEXT NOT NULL,",
+      "  updated_at TEXT NOT NULL",
       ")"
     ].join("")
   )
@@ -576,7 +610,123 @@ fn set_connector_enabled(db: Sqlite.Database, name: Text, enabled_opt: Option(Bo
 end
 
 fn delete_connector(db: Sqlite.Database, name: Text) : Result(Unit, MotetError)
+  try db.run("DELETE FROM connector_tokens WHERE connector_name = ?", [Sqlite.String(name)])
+    .map_error(db_err)
   db.run("DELETE FROM connectors WHERE name = ?", [Sqlite.String(name)]).map_error(db_err)
+end
+
+struct OAuthPending
+  state: Text
+  connector_name: Text
+  client_id: Text
+  redirect_uri: Text
+  code_verifier: Text
+  token_endpoint: Text
+  resource: Text
+  created_at: Text
+end
+
+fn save_oauth_pending(db: Sqlite.Database, pending: OAuthPending) : Result(Unit, MotetError)
+  db.run(
+    [
+      "INSERT INTO oauth_pending (state, connector_name, client_id, redirect_uri, code_verifier, token_endpoint, resource, created_at) ",
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ",
+      "ON CONFLICT(state) DO UPDATE SET connector_name = excluded.connector_name, client_id = excluded.client_id, ",
+      "redirect_uri = excluded.redirect_uri, code_verifier = excluded.code_verifier, ",
+      "token_endpoint = excluded.token_endpoint, resource = excluded.resource, created_at = excluded.created_at"
+    ].join(""),
+    [
+      Sqlite.String(pending.state),
+      Sqlite.String(pending.connector_name),
+      Sqlite.String(pending.client_id),
+      Sqlite.String(pending.redirect_uri),
+      Sqlite.String(pending.code_verifier),
+      Sqlite.String(pending.token_endpoint),
+      Sqlite.String(pending.resource),
+      Sqlite.String(pending.created_at)
+    ]
+  ).map_error(db_err)
+end
+
+fn take_oauth_pending(db: Sqlite.Database, state: Text) : Result(Option(OAuthPending), MotetError)
+  rows = try db.query(
+    "SELECT state, connector_name, client_id, redirect_uri, code_verifier, token_endpoint, resource, created_at FROM oauth_pending WHERE state = ?",
+    [Sqlite.String(state)]
+  ).map_error(db_err)
+  case rows.rows.first
+    None: Ok(None)
+    Some(r):
+      try db.run("DELETE FROM oauth_pending WHERE state = ?", [Sqlite.String(state)]).map_error(
+        db_err
+      )
+      Ok(
+        Some(
+          OAuthPending(
+            state: cell_str(r, 0),
+            connector_name: cell_str(r, 1),
+            client_id: cell_str(r, 2),
+            redirect_uri: cell_str(r, 3),
+            code_verifier: cell_str(r, 4),
+            token_endpoint: cell_str(r, 5),
+            resource: cell_str(r, 6),
+            created_at: cell_str(r, 7)
+          )
+        )
+      )
+  end
+end
+
+fn save_connector_token(
+  db: Sqlite.Database,
+  connector_name: Text,
+  access_token: Text,
+  scope: Text,
+  expires_at: Text,
+  now_text: Text
+) : Result(Unit, MotetError)
+  db.run(
+    [
+      "INSERT INTO connector_tokens (connector_name, access_token, scope, expires_at, updated_at) ",
+      "VALUES (?, ?, ?, ?, ?) ",
+      "ON CONFLICT(connector_name) DO UPDATE SET access_token = excluded.access_token, ",
+      "scope = excluded.scope, expires_at = excluded.expires_at, updated_at = excluded.updated_at"
+    ].join(""),
+    [
+      Sqlite.String(connector_name),
+      Sqlite.String(access_token),
+      Sqlite.String(scope),
+      Sqlite.String(expires_at),
+      Sqlite.String(now_text)
+    ]
+  ).map_error(db_err)
+end
+
+fn get_connector_token(db: Sqlite.Database, connector_name: Text) : Result(Option(Text), MotetError)
+  rows = try db.query(
+    "SELECT access_token FROM connector_tokens WHERE connector_name = ?",
+    [Sqlite.String(connector_name)]
+  ).map_error(db_err)
+  tok = case rows.rows.first
+    Some(r): cell_opt_str(r, 0)
+    None: None
+  end
+  Ok(tok)
+end
+
+fn get_connector_token_meta(db: Sqlite.Database, connector_name: Text) : Result(
+  Option((Text, Text)),
+  MotetError
+)
+  rows = try db.query(
+    "SELECT scope, expires_at FROM connector_tokens WHERE connector_name = ?",
+    [Sqlite.String(connector_name)]
+  ).map_error(db_err)
+  Ok(rows.rows.first.map(fn(r) (cell_str(r, 0), cell_str(r, 1)) end))
+end
+
+fn delete_connector_token(db: Sqlite.Database, connector_name: Text) : Result(Unit, MotetError)
+  db.run("DELETE FROM connector_tokens WHERE connector_name = ?", [Sqlite.String(connector_name)])
+    .map_error(db_err)
 end
 
 fn add_rule(

@@ -48,16 +48,24 @@ fn resolve_connector_url(spec: ConnectorSpec, env: Env) : Text
   end
 end
 
-## Resolves an auth header value from outer Env; secrets never enter Command sandboxes or memory.
-fn resolve_connector_token(spec: ConnectorSpec, env: Env) : Option(Text)
+## Resolves an auth header value: prefers outer Env, then falls back to stored OAuth Bearer token.
+fn resolve_connector_token(spec: ConnectorSpec, env: Env, stored_token: Option(Text)) : Option(Text)
   primary = if spec.auth_env.trim.empty?: None else: env.get(spec.auth_env.trim)
   case primary
     Some(tok) if not tok.trim.empty?: Some(tok.trim)
     Some(_) | None:
-      if spec.name == "t3code"
+      env_fallback = if spec.name == "t3code"
         env.get("T3_ACP_MCP_AUTHORIZATION")
       else
         None
+      end
+      case env_fallback
+        Some(t2) if not t2.trim.empty?: Some(t2.trim)
+        Some(_) | None:
+          case stored_token
+            Some(st) if not st.trim.empty?: Some(st.trim)
+            Some(_) | None: None
+          end
       end
   end
 end
@@ -91,6 +99,8 @@ fn infer_tool_effect(connector_name: Text, tool_name: Text, default_effect: Effe
     low.ends_with?("_read") or
     low.ends_with?("_search") or
     low.ends_with?("_status") or
+    low.ends_with?("_links") or
+    low == "t3_thread_wait" or
     low == "ci_logs" or
     low == "orchestrator_capabilities" or (
       connector_name == "t3code" and low.starts_with?("preview_status")
@@ -107,7 +117,9 @@ fn infer_tool_effect(connector_name: Text, tool_name: Text, default_effect: Effe
     low.contains?("review") or
     low.contains?("respond") or
     low.contains?("schedule") or
-    low.contains?("rerun")
+    low.contains?("rerun") or
+    low.contains?("interrupt") or
+    low.contains?("cancel")
     return WriteExternal
   end
 
@@ -149,6 +161,7 @@ fn send_rpc(
   network: Network,
   env: Env,
   spec: ConnectorSpec,
+  stored_token: Option(Text),
   rpc_payload: Json,
   session_id: Option(Text)
 ) : Result((Json, Option(Text)), MotetError)
@@ -158,9 +171,9 @@ fn send_rpc(
 
   var req = Http.post(url).header("Accept", "application/json, text/event-stream").header(
     "MCP-Protocol-Version",
-    "2025-11-25"
+    "2025-06-18"
   )
-  case resolve_connector_token(spec, env)
+  case resolve_connector_token(spec, env, stored_token)
     Some(tok): req = req.header("Authorization", format_auth_header(tok))
     None: Unit
   end
@@ -191,37 +204,41 @@ fn send_rpc(
   Ok((doc, next_sid))
 end
 
-fn initialize_session(network: Network, env: Env, spec: ConnectorSpec) : Result(
-  Option(Text),
-  MotetError
-)
+fn initialize_session(
+  network: Network,
+  env: Env,
+  spec: ConnectorSpec,
+  stored_token: Option(Text)
+) : Result(Option(Text), MotetError)
   payload = Json.Object({
     "jsonrpc": Json.String("2.0"),
     "id": Json.int(1),
     "method": Json.String("initialize"),
     "params": Json.Object({
-      "protocolVersion": Json.String("2025-11-25"),
+      "protocolVersion": Json.String("2025-06-18"),
       "capabilities": Json.Object({}),
       "clientInfo": Json.Object({"name": Json.String("motet"), "version": Json.String("0.1.0")})
     })
   })
-  (_doc, sid) = try send_rpc(network, env, spec, payload, None)
+  (_doc, sid) = try send_rpc(network, env, spec, stored_token, payload, None)
   Ok(sid)
 end
 
 ## Progressive discovery: queries `tools/list` on one mounted MCP connector.
-fn list_tools(network: Network, env: Env, spec: ConnectorSpec) : Result(
-  List(McpToolInfo),
-  MotetError
-)
-  sid = try initialize_session(network, env, spec)
+fn list_tools(
+  network: Network,
+  env: Env,
+  spec: ConnectorSpec,
+  stored_token: Option(Text)
+) : Result(List(McpToolInfo), MotetError)
+  sid = try initialize_session(network, env, spec, stored_token)
   payload = Json.Object({
     "jsonrpc": Json.String("2.0"),
     "id": Json.int(2),
     "method": Json.String("tools/list"),
     "params": Json.Object({})
   })
-  (doc, _sid2) = try send_rpc(network, env, spec, payload, sid)
+  (doc, _sid2) = try send_rpc(network, env, spec, stored_token, payload, sid)
   raw_tools = doc.list_at("result.tools") or []
   tools = raw_tools.filter_map(fn(item)
     case item.text_at("name")
@@ -241,10 +258,14 @@ fn list_tools(network: Network, env: Env, spec: ConnectorSpec) : Result(
 end
 
 ## Executes a single MCP tool call and extracts readable text/JSON output.
-fn call_tool(network: Network, env: Env, spec: ConnectorSpec, tool_name: Text, arguments_json: Text) : Result(
-  Text,
-  MotetError
-)
+fn call_tool(
+  network: Network,
+  env: Env,
+  spec: ConnectorSpec,
+  stored_token: Option(Text),
+  tool_name: Text,
+  arguments_json: Text
+) : Result(Text, MotetError)
   args_doc = if arguments_json.trim.empty?
     Json.Object({})
   else
@@ -252,14 +273,14 @@ fn call_tool(network: Network, env: Env, spec: ConnectorSpec, tool_name: Text, a
       fn(e) BadInput(message: "invalid tool arguments JSON: #{e}") end
     )
   end
-  sid = try initialize_session(network, env, spec)
+  sid = try initialize_session(network, env, spec, stored_token)
   payload = Json.Object({
     "jsonrpc": Json.String("2.0"),
     "id": Json.int(3),
     "method": Json.String("tools/call"),
     "params": Json.Object({"name": Json.String(tool_name), "arguments": args_doc})
   })
-  (doc, _sid2) = try send_rpc(network, env, spec, payload, sid)
+  (doc, _sid2) = try send_rpc(network, env, spec, stored_token, payload, sid)
   case doc.path("result.structuredContent")
     Some(sc) if sc != Json.Null: return Ok(sc.to_text)
     Some(_) | None: Unit
@@ -289,13 +310,13 @@ test "MCP HTTP client initializes, discovers T3 Code tools, and invokes a tool o
   init_req = Http.post("http://127.0.0.1:3773/mcp").header(
     "Accept",
     "application/json, text/event-stream"
-  ).header("MCP-Protocol-Version", "2025-11-25").header("Authorization", "Bearer tok-123").json(
+  ).header("MCP-Protocol-Version", "2025-06-18").header("Authorization", "Bearer tok-123").json(
     Json.Object({
       "jsonrpc": Json.String("2.0"),
       "id": Json.int(1),
       "method": Json.String("initialize"),
       "params": Json.Object({
-        "protocolVersion": Json.String("2025-11-25"),
+        "protocolVersion": Json.String("2025-06-18"),
         "capabilities": Json.Object({}),
         "clientInfo": Json.Object({"name": Json.String("motet"), "version": Json.String("0.1.0")})
       })
@@ -305,7 +326,7 @@ test "MCP HTTP client initializes, discovers T3 Code tools, and invokes a tool o
   list_req = Http.post("http://127.0.0.1:3773/mcp").header(
     "Accept",
     "application/json, text/event-stream"
-  ).header("MCP-Protocol-Version", "2025-11-25").header("Authorization", "Bearer tok-123").json(
+  ).header("MCP-Protocol-Version", "2025-06-18").header("Authorization", "Bearer tok-123").json(
     Json.Object({
       "jsonrpc": Json.String("2.0"),
       "id": Json.int(2),
@@ -314,13 +335,13 @@ test "MCP HTTP client initializes, discovers T3 Code tools, and invokes a tool o
     })
   ).within(30.seconds)
 
-  init_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\"}}"
+  init_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\"}}"
   list_body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"t3_thread_list\",\"description\":\"List threads\"},{\"name\":\"pull_request_merge\",\"description\":\"Merge PR\"}]}}"
   net = Network.fake(
     Http.replies([(init_req, Http.reply(200, init_body)), (list_req, Http.reply(200, list_body))])
   )
 
-  assert list_tools(net, env, spec) is Ok(tools)
+  assert list_tools(net, env, spec, None) is Ok(tools)
   assert tools.size == 2
   assert tools.first is Some(t0) and t0.name == "t3_thread_list" and t0.effect_class == Read
   assert tools.last is Some(t1) and

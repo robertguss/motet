@@ -9,7 +9,8 @@ use Brain
 use Budget{BudgetActor}
 use Command
 use Json
-use Mcp{parse_host_port}
+use Mcp{parse_host_port, resolve_connector_url}
+use Oauth
 use Policy{PolicyActor}
 use Scheduler{SchedulerActor}
 use Skills
@@ -22,7 +23,9 @@ use Types{
   BotConfig,
   BudgetSnapshot,
   BulkActionResult,
+  ConnectorAuthStatus,
   ConnectorSpec,
+  ConnectorTestResult,
   CreateBotRequest,
   CreateRoutineRequest,
   CreateRuleRequest,
@@ -39,6 +42,8 @@ use Types{
   SessionSummary,
   SkillDoc,
   SkillSummary,
+  StartOAuthRequest,
+  StartOAuthResponse,
   TickSummary,
   ToggleRequest,
   TrustLevel,
@@ -63,6 +68,7 @@ api
   get "/" get_ui
   get "/manifest.json" get_manifest
   get "/icon.svg" get_icon
+  get "/oauth/callback" get_oauth_callback
   get "/v1/health" get_health
 
   get "/v1/bots" get_bots
@@ -94,8 +100,12 @@ api
   delete "/v1/routines/:id" delete_routine_by_id
 
   get "/v1/connectors" get_connectors
+  get "/v1/connectors/auth" get_connectors_auth
   post "/v1/connectors" post_connector
   post "/v1/connectors/:name/toggle" post_toggle_connector
+  post "/v1/connectors/:name/oauth/start" post_connector_oauth_start
+  post "/v1/connectors/:name/test" post_test_connector
+  delete "/v1/connectors/:name/auth" delete_connector_auth
   delete "/v1/connectors/:name" delete_connector_by_name
 
   get "/v1/rules" get_rules
@@ -519,6 +529,267 @@ fn delete_connector_by_name(_op: Operator, db: Sqlite.Database, clock: Clock, na
   try ensure_ready(db, clock)
   try Store.delete_connector(db, name)
   Ok(DeleteResult(deleted?: true))
+end
+
+## Reports safe auth status (connected, source, scope, expiry) for every connector without exposing tokens.
+fn get_connectors_auth(_op: Operator, db: Sqlite.Database, env: Env, clock: Clock) : Result(
+  List(ConnectorAuthStatus),
+  MotetError
+)
+  try ensure_ready(db, clock)
+  conns = try Store.list_connectors(db)
+  var out = []
+  for c in conns
+    env_tok = Mcp.resolve_connector_token(c, env, None)
+    case env_tok
+      Some(_):
+        out = out.append(
+          ConnectorAuthStatus(
+            connector_name: c.name,
+            connected?: true,
+            source: "env",
+            scope: "env:#{c.auth_env}",
+            expires_at: None
+          )
+        )
+      None:
+        meta = try Store.get_connector_token_meta(db, c.name)
+        case meta
+          Some((sc, exp)):
+            out = out.append(
+              ConnectorAuthStatus(
+                connector_name: c.name,
+                connected?: true,
+                source: "oauth",
+                scope: sc,
+                expires_at: if exp.empty?: None else: Some(exp)
+              )
+            )
+          None:
+            out = out.append(
+              ConnectorAuthStatus(
+                connector_name: c.name,
+                connected?: false,
+                source: "none",
+                scope: "",
+                expires_at: None
+              )
+            )
+        end
+    end
+  end
+  Ok(out)
+end
+
+## Starts standard MCP OAuth 2.0 + PKCE (RFC 9728 / 8414 / 7591 / 7636) sign-in for a connector.
+fn post_connector_oauth_start(
+  _op: Operator,
+  db: Sqlite.Database,
+  network: Network,
+  env: Env,
+  clock: Clock,
+  rng: Random,
+  name: Text,
+  body: StartOAuthRequest
+) : Result(StartOAuthResponse, MotetError)
+  try ensure_ready(db, clock)
+  redir = body.redirect_uri.trim
+  valid_redir = redir.starts_with?("https://") or
+    redir.starts_with?("http://localhost") or
+    redir.starts_with?("http://127.0.0.1")
+  if not valid_redir
+    return Error(BadInput(message: "redirect_uri must be https:// or loopback http://"))
+  end
+  spec = try (try Store.get_connector(db, name)).or_fail(
+    ItemNotFound(message: "unknown connector: #{name}")
+  )
+  mcp_url = resolve_connector_url(spec, env)
+  meta = try Oauth.discover(network, mcp_url)
+  client_id = try Oauth.register_client(network, meta.registration_endpoint, redir)
+  verifier = Oauth.random_token(rng, 64)
+  state = Oauth.random_token(rng, 32)
+  challenge = Oauth.pkce_s256(verifier)
+  try Store.save_oauth_pending(
+    db,
+    Store.OAuthPending(
+      state: state,
+      connector_name: spec.name,
+      client_id: client_id,
+      redirect_uri: redir,
+      code_verifier: verifier,
+      token_endpoint: meta.token_endpoint,
+      resource: meta.resource,
+      created_at: clock.now.to_text
+    )
+  )
+  auth_url = Oauth.build_authorize_url(
+    meta.authorization_endpoint,
+    client_id,
+    redir,
+    challenge,
+    state,
+    meta.resource
+  )
+  Ok(StartOAuthResponse(connector_name: spec.name, authorize_url: auth_url, state: state))
+end
+
+fn html_esc(s: Text) : Text
+  s
+    .replace("&", "&amp;")
+    .replace("<", "&lt;")
+    .replace(">", "&gt;")
+    .replace("\"", "&quot;")
+    .replace("'", "&#39;")
+end
+
+fn oauth_html_page(status: Int, title: Text, body_text: Text, redirect_to: Option(Text)) : Api.Response
+  meta_refresh = case redirect_to
+    Some(u): "<meta http-equiv=\"refresh\" content=\"1;url=#{html_esc(u)}\">"
+    None: ""
+  end
+  target_href = case redirect_to
+    Some(u): u
+    None: "/"
+  end
+  html = [
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+    meta_refresh,
+    "<title>#{html_esc(title)} — Motet</title>",
+    "<style>body{margin:0;min-height:100dvh;display:flex;align-items:center;justify-content:center;background:#0c0f14;color:#edf2fa;font:15px/1.5 -apple-system,system-ui,sans-serif;padding:20px}",
+    ".box{max-width:460px;width:100%;background:#161c26;border:1px solid #283347;border-radius:14px;padding:22px;display:flex;flex-direction:column;gap:12px}",
+    "a.btn{display:inline-flex;justify-content:center;padding:9px 14px;border-radius:10px;background:#7c6cff;color:#fff;text-decoration:none;font-weight:600}</style>",
+    "</head><body><div class=\"box\">",
+    "<h2 style=\"margin:0\">#{html_esc(title)}</h2>",
+    "<p style=\"margin:0;color:#8f9db5\">#{html_esc(body_text)}</p>",
+    "<a class=\"btn\" href=\"#{html_esc(target_href)}\">Return to Motet</a>",
+    "</div></body></html>"
+  ].join("")
+  Api.html_response(status, html)
+end
+
+## Handles the browser redirect back from T3 Code (or any OAuth MCP server) and exchanges PKCE code for a Bearer token.
+fn get_oauth_callback(
+  db: Sqlite.Database,
+  network: Network,
+  clock: Clock,
+  code: Option(Text),
+  state: Option(Text),
+  error: Option(Text),
+  error_description: Option(Text)
+) : Api.Response
+  case ensure_ready(db, clock)
+    Error(e): return oauth_html_page(500, "OAuth Error", "Database setup failed: #{e}", None)
+    Ok(Unit): Unit
+  end
+  case error
+    Some(err_code) if not err_code.trim.empty?:
+      desc = error_description or err_code
+      return oauth_html_page(400, "Connection Denied", "OAuth returned #{err_code}: #{desc}", None)
+    Some(_) | None: Unit
+  end
+  auth_code = case code
+    Some(c) if not c.trim.empty?: c.trim
+    Some(_) | None:
+      return oauth_html_page(400, "Missing Code", "OAuth callback is missing authorization code.", None)
+  end
+  st = case state
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None:
+      return oauth_html_page(400, "Missing State", "OAuth callback is missing state parameter.", None)
+  end
+  pending = case Store.take_oauth_pending(db, st)
+    Ok(Some(p)): p
+    Ok(None):
+      return oauth_html_page(
+        400,
+        "Expired or Unknown Sign-In",
+        "This OAuth sign-in state was already used or expired. Start Connect OAuth again from Motet.",
+        None
+      )
+    Error(e): return oauth_html_page(500, "Storage Error", "#{e}", None)
+  end
+  tok = case Oauth.exchange_code(
+    network,
+    pending.token_endpoint,
+    auth_code,
+    pending.redirect_uri,
+    pending.client_id,
+    pending.code_verifier,
+    pending.resource
+  )
+    Ok(t): t
+    Error(e): return oauth_html_page(502, "Token Exchange Failed", "#{e}", None)
+  end
+  now_time = clock.now
+  expires_at = (now_time + tok.expires_in.seconds).to_text
+  case Store.save_connector_token(
+    db,
+    pending.connector_name,
+    tok.access_token,
+    tok.scope,
+    expires_at,
+    now_time.to_text
+  )
+    Ok(Unit): Unit
+    Error(e): return oauth_html_page(500, "Token Save Failed", "#{e}", None)
+  end
+  _en = Store.set_connector_enabled(db, pending.connector_name, Some(true))
+  dest = "/?connected=#{Oauth.percent_encode(pending.connector_name)}"
+  oauth_html_page(
+    200,
+    "Connected #{pending.connector_name}",
+    "Bearer token saved (scope: #{if tok.scope.empty?: "default" else: tok.scope}). Redirecting back to Motet…",
+    Some(dest)
+  )
+end
+
+## Clears a stored OAuth token for a connector without removing the connector definition.
+fn delete_connector_auth(_op: Operator, db: Sqlite.Database, clock: Clock, name: Text) : Result(
+  DeleteResult,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  try Store.delete_connector_token(db, name)
+  Ok(DeleteResult(deleted?: true))
+end
+
+## Live connectivity check: initializes MCP session and lists tools exposed by a connector.
+fn post_test_connector(
+  _op: Operator,
+  db: Sqlite.Database,
+  network: Network,
+  env: Env,
+  clock: Clock,
+  name: Text
+) : Result(ConnectorTestResult, MotetError)
+  try ensure_ready(db, clock)
+  spec = try (try Store.get_connector(db, name)).or_fail(
+    ItemNotFound(message: "unknown connector: #{name}")
+  )
+  stored_tok = try Store.get_connector_token(db, spec.name)
+  case Mcp.list_tools(network, env, spec, stored_tok)
+    Ok(tools):
+      Ok(
+        ConnectorTestResult(
+          connector_name: spec.name,
+          ok?: true,
+          tool_count: tools.size,
+          tools: tools.map(fn(t) t.name end),
+          error: None
+        )
+      )
+    Error(err):
+      Ok(
+        ConnectorTestResult(
+          connector_name: spec.name,
+          ok?: false,
+          tool_count: 0,
+          tools: [],
+          error: Some("#{err}")
+        )
+      )
+  end
 end
 
 ## Lists custom host-enforced policy rules.
@@ -954,4 +1225,34 @@ test "Motet unified API serves PWA UI, OpenAPI, auth, webhooks, MCP, and bot tur
     sched
   )
   assert bud.status == 200 and Json.decode[List(BudgetSnapshot)](bud.text) is Ok(bs) and bs.size == 3
+
+  # 7. Connector auth status (never returns tokens) & OAuth callback error handling
+  cauth = ApiTest.send(
+    Server,
+    Api.get("/v1/connectors/auth").with_bearer("secret-op"),
+    sqlite,
+    env,
+    clock,
+    budget,
+    policy,
+    sched
+  )
+  assert cauth.status == 200 and
+    Json.decode[List(ConnectorAuthStatus)](cauth.text) is Ok(alist) and
+    alist.size == 1 and
+    alist.first is Some(ca0) and
+    ca0.connector_name == "t3code" and
+    not ca0.connected?
+
+  bad_cb = ApiTest.send(
+    Server,
+    Api.get("/oauth/callback").with_query("code", "abc").with_query("state", "unknown-state"),
+    sqlite,
+    Network.fake({}),
+    clock,
+    budget,
+    policy,
+    sched
+  )
+  assert bad_cb.status == 400 and bad_cb.text.contains?("Expired or Unknown Sign-In")
 end

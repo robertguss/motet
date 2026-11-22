@@ -458,7 +458,8 @@ fn execute_tool(
         if not spec.enabled?
           Ok("connector_error: connector '#{cname}' is disabled")
         else
-          case Mcp.list_tools(rt.network, rt.env, spec)
+          stored_tok = try Store.get_connector_token(db, spec.name)
+          case Mcp.list_tools(rt.network, rt.env, spec, stored_tok)
             Ok(tools):
               lines = tools.map(fn(t) "#{t.name} [#{t.effect_class}]: #{t.description}" end)
               Ok(if lines.empty?: "no tools exposed" else: lines.join("\n"))
@@ -482,7 +483,8 @@ fn execute_tool(
           Ok("connector_error: connector '#{cname}' is disabled")
         else
           rargs = (args.get("arguments") or Json.Object({})).to_text
-          case Mcp.call_tool(rt.network, rt.env, spec, rtool, rargs)
+          stored_tok = try Store.get_connector_token(db, spec.name)
+          case Mcp.call_tool(rt.network, rt.env, spec, stored_tok, rtool, rargs)
             Ok(out): Ok(out)
             Error(err): Ok("connector_error: #{err}")
           end

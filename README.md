@@ -56,15 +56,17 @@ mo serve server.mo --port 8787 --data .motet
 ./deploy.sh    # syncs repo, runs mo test remotely, reinstalls CLI, restarts systemd services
 ```
 
-### 5. Connect T3 Code and future MCP integrations
+### 6. Connect T3 Code and future MCP integrations
 
-T3 Code is pre-registered as connector `t3code`. Point it at your authenticated T3 MCP endpoint (or any future HTTP MCP server like Notion, Linear, GitHub, Slack, or Gmail):
+T3 Code is pre-registered as connector `t3code` and Motet includes a built-in **standard MCP OAuth 2.0 + PKCE client** (RFC 9728 / 8414 / 7591 / 7636):
+
+1. In T3 Code, open **Settings → Environments → Copy MCP URL** (with T3 Connect enabled).
+2. In Motet's Web UI (**Ops → Connectors**), click **Edit URL** on `t3code` and paste your `https://<env>/mcp` URL.
+3. Click **Connect OAuth**, choose the access level (**Auto** or **Read only**) on T3 Code's Approve screen, and click **Test Tools**.
+
+You can also mount additional HTTP MCP servers (OAuth or env-var Bearer token) with zero code changes:
 
 ```sh
-export T3_MCP_URL="http://127.0.0.1:3773/mcp"
-export T3_MCP_TOKEN="..."
-
-# Mount additional HTTP MCP servers with zero code changes:
 motet connectors add notion https://mcp.notion.com/mcp NOTION_TOKEN write_external
 motet connectors add linear https://mcp.linear.app/mcp LINEAR_TOKEN write_external
 ```

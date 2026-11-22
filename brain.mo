@@ -665,13 +665,13 @@ test "Brain pauses WriteExternal T3 thread launch into Needs You and executes on
   mcp_init_req = Http.post("http://127.0.0.1:3773/mcp").header(
     "Accept",
     "application/json, text/event-stream"
-  ).header("MCP-Protocol-Version", "2025-11-25").header("Authorization", "Bearer test-t3").json(
+  ).header("MCP-Protocol-Version", "2025-06-18").header("Authorization", "Bearer test-t3").json(
     Json.Object({
       "jsonrpc": Json.String("2.0"),
       "id": Json.int(1),
       "method": Json.String("initialize"),
       "params": Json.Object({
-        "protocolVersion": Json.String("2025-11-25"),
+        "protocolVersion": Json.String("2025-06-18"),
         "capabilities": Json.Object({}),
         "clientInfo": Json.Object({"name": Json.String("motet"), "version": Json.String("0.1.0")})
       })
@@ -681,7 +681,7 @@ test "Brain pauses WriteExternal T3 thread launch into Needs You and executes on
   mcp_call_req = Http.post("http://127.0.0.1:3773/mcp").header(
     "Accept",
     "application/json, text/event-stream"
-  ).header("MCP-Protocol-Version", "2025-11-25").header("Authorization", "Bearer test-t3").json(
+  ).header("MCP-Protocol-Version", "2025-06-18").header("Authorization", "Bearer test-t3").json(
     Json.Object({
       "jsonrpc": Json.String("2.0"),
       "id": Json.int(3),

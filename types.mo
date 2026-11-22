@@ -32,6 +32,10 @@ HealthSummary(..),
 ToggleRequest(..),
 BulkActionResult(..),
 DeleteResult(..),
+ConnectorAuthStatus(..),
+StartOAuthRequest(..),
+StartOAuthResponse(..),
+ConnectorTestResult(..),
 MotetError(..),
 provider_to_text,
 provider_from_text,
@@ -306,6 +310,32 @@ end
 
 struct DeleteResult
   deleted?: Bool
+end
+
+struct ConnectorAuthStatus
+  connector_name: Text
+  connected?: Bool
+  source: Text
+  scope: Text
+  expires_at: Option(Text)
+end
+
+struct StartOAuthRequest
+  redirect_uri: Text
+end
+
+struct StartOAuthResponse
+  connector_name: Text
+  authorize_url: Text
+  state: Text
+end
+
+struct ConnectorTestResult
+  connector_name: Text
+  ok?: Bool
+  tool_count: Int
+  tools: List(Text)
+  error: Option(Text)
 end
 
 enum MotetError
