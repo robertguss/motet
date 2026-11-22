@@ -11,8 +11,11 @@ list_bots,
 upsert_connector,
 get_connector,
 list_connectors,
+set_connector_enabled,
+delete_connector,
 add_rule,
 list_rules,
+delete_rule,
 create_session,
 list_sessions,
 append_event,
@@ -21,18 +24,25 @@ search_events,
 save_memory,
 list_memories,
 search_memories,
+delete_memory,
 upsert_routine,
 list_routines,
 list_due_routines,
 mark_routine_ran,
+set_routine_enabled,
+delete_routine,
 create_approval,
 get_approval,
 list_approvals,
 update_approval,
+dismiss_all_pending_approvals,
 save_artifact,
 list_artifacts,
 record_spend_ledger,
 bot_spend_total,
+bot_daily_spend,
+daily_budget_snapshots,
+utc_day_prefix,
 health_summary
 use Json
 use Types{
@@ -41,6 +51,7 @@ use Types{
   ApprovalStatus,
   ArtifactItem,
   BotConfig,
+  BudgetSnapshot,
   ConnectorSpec,
   EffectClass,
   HealthSummary,
@@ -395,7 +406,7 @@ fn seed_defaults(db: Sqlite.Database, now_text: Text) : Result(Unit, MotetError)
       db,
       "watcher",
       "t3-thread-pulse",
-      "Check active T3 Code projects and threads via the t3code connector. Report any failed, stalled, or waiting threads concisely and save key findings to memory.",
+      "Check active T3 Code projects and threads via the t3code connector and summarize any failed, stalled, or waiting threads concisely in your reply. Do not call write tools unless an action genuinely requires owner approval.",
       900,
       true,
       now_text
@@ -536,6 +547,38 @@ fn list_connectors(db: Sqlite.Database) : Result(List(ConnectorSpec), MotetError
   Ok(rows.rows.map(fn(r) row_to_connector(r) end))
 end
 
+fn set_connector_enabled(db: Sqlite.Database, name: Text, enabled_opt: Option(Bool)) : Result(
+  ConnectorSpec,
+  MotetError
+)
+  cur = try (try get_connector(db, name)).or_fail(
+    ItemNotFound(message: "connector not found: #{name}")
+  )
+  next_en = case enabled_opt
+    Some(v): v
+    None: not cur.enabled?
+  end
+  try db.run(
+    "UPDATE connectors SET enabled = ? WHERE name = ?",
+    [Sqlite.Integer(if next_en: 1 else: 0), Sqlite.String(name)]
+  ).map_error(db_err)
+  Ok(
+    ConnectorSpec(
+      name: cur.name,
+      kind: cur.kind,
+      url: cur.url,
+      auth_env: cur.auth_env,
+      allowed_host: cur.allowed_host,
+      default_effect: cur.default_effect,
+      enabled?: next_en
+    )
+  )
+end
+
+fn delete_connector(db: Sqlite.Database, name: Text) : Result(Unit, MotetError)
+  db.run("DELETE FROM connectors WHERE name = ?", [Sqlite.String(name)]).map_error(db_err)
+end
+
 fn add_rule(
   db: Sqlite.Database,
   bot_name: Text,
@@ -580,6 +623,10 @@ fn list_rules(db: Sqlite.Database) : Result(List(PolicyRule), MotetError)
       )
     end)
   )
+end
+
+fn delete_rule(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
+  db.run("DELETE FROM policy_rules WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
 end
 
 fn create_session(
@@ -864,6 +911,13 @@ fn search_memories(db: Sqlite.Database, scope_opt: Option(Text), query: Text) : 
   Ok(hits)
 end
 
+fn delete_memory(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
+  try db.run("DELETE FROM memory_tokens WHERE memory_id = ?", [Sqlite.Integer(id)]).map_error(
+    db_err
+  )
+  db.run("DELETE FROM memories WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
+end
+
 fn row_to_routine(r: List(Sqlite.Value)) : RoutineSpec
   RoutineSpec(
     id: cell_int(r, 0),
@@ -939,6 +993,43 @@ fn mark_routine_ran(db: Sqlite.Database, id: Int, now_text: Text, next_due_at: T
   ).map_error(db_err)
 end
 
+fn set_routine_enabled(db: Sqlite.Database, id: Int, enabled_opt: Option(Bool)) : Result(
+  RoutineSpec,
+  MotetError
+)
+  rows = try db.query(
+    "SELECT id, bot_name, name, prompt, interval_seconds, read_only, enabled, next_due_at, last_run_at FROM routines WHERE id = ?",
+    [Sqlite.Integer(id)]
+  ).map_error(db_err)
+  row = try rows.rows.first.or_fail(ItemNotFound(message: "routine ##{id} not found"))
+  cur = row_to_routine(row)
+  next_en = case enabled_opt
+    Some(v): v
+    None: not cur.enabled?
+  end
+  try db.run(
+    "UPDATE routines SET enabled = ? WHERE id = ?",
+    [Sqlite.Integer(if next_en: 1 else: 0), Sqlite.Integer(id)]
+  ).map_error(db_err)
+  Ok(
+    RoutineSpec(
+      id: cur.id,
+      bot_name: cur.bot_name,
+      name: cur.name,
+      prompt: cur.prompt,
+      interval_seconds: cur.interval_seconds,
+      read_only?: cur.read_only?,
+      enabled?: next_en,
+      next_due_at: cur.next_due_at,
+      last_run_at: cur.last_run_at
+    )
+  )
+end
+
+fn delete_routine(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
+  db.run("DELETE FROM routines WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
+end
+
 fn row_to_approval(r: List(Sqlite.Value)) : ApprovalItem
   ApprovalItem(
     id: cell_int(r, 0),
@@ -964,6 +1055,49 @@ fn create_approval(
   reason: Text,
   now_text: Text
 ) : Result(ApprovalItem, MotetError)
+  # Deduplicate identical pending approvals so repeated calls do not flood Needs You.
+  exact_rows = try db.query(
+    "SELECT id, bot_name, session_id, tool_name, arguments_json, effect_class, reason, status, result_text, created_at FROM approvals WHERE status = 'pending' AND bot_name = ? AND tool_name = ? AND arguments_json = ? ORDER BY id DESC LIMIT 1",
+    [Sqlite.String(bot_name), Sqlite.String(tool_name), Sqlite.String(arguments_json)]
+  ).map_error(db_err)
+  if exact_rows.rows.first is Some(existing_row)
+    return Ok(row_to_approval(existing_row))
+  end
+
+  # Coalesce repeated read-only routine blocks for the same (bot, tool) by updating in place.
+  if reason.starts_with?("read-only routine")
+    routine_rows = try db.query(
+      "SELECT id, bot_name, session_id, tool_name, arguments_json, effect_class, reason, status, result_text, created_at FROM approvals WHERE status = 'pending' AND bot_name = ? AND tool_name = ? AND reason = ? ORDER BY id DESC LIMIT 1",
+      [Sqlite.String(bot_name), Sqlite.String(tool_name), Sqlite.String(reason)]
+    ).map_error(db_err)
+    if routine_rows.rows.first is Some(rrow)
+      existing = row_to_approval(rrow)
+      try db.run(
+        "UPDATE approvals SET session_id = ?, arguments_json = ?, created_at = ? WHERE id = ?",
+        [
+          Sqlite.String(session_id),
+          Sqlite.String(arguments_json),
+          Sqlite.String(now_text),
+          Sqlite.Integer(existing.id)
+        ]
+      ).map_error(db_err)
+      return Ok(
+        ApprovalItem(
+          id: existing.id,
+          bot_name: existing.bot_name,
+          session_id: session_id,
+          tool_name: existing.tool_name,
+          arguments_json: arguments_json,
+          effect_class: existing.effect_class,
+          reason: existing.reason,
+          status: Pending,
+          result_text: None,
+          created_at: now_text
+        )
+      )
+    end
+  end
+
   try db.run(
     [
       "INSERT INTO approvals (bot_name, session_id, tool_name, arguments_json, effect_class, reason, status, result_text, created_at) ",
@@ -1027,6 +1161,17 @@ fn update_approval(db: Sqlite.Database, id: Int, status: ApprovalStatus, result_
     "UPDATE approvals SET status = ?, result_text = ? WHERE id = ?",
     [Sqlite.String(approval_status_to_text(status)), Sqlite.String(result_text), Sqlite.Integer(id)]
   ).map_error(db_err)
+end
+
+fn dismiss_all_pending_approvals(db: Sqlite.Database) : Result(Int, MotetError)
+  pending_count = try count_table(db, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'")
+  if pending_count > 0
+    try db.run(
+      "UPDATE approvals SET status = 'denied', result_text = 'dismissed in bulk by owner' WHERE status = 'pending'",
+      []
+    ).map_error(db_err)
+  end
+  Ok(pending_count)
 end
 
 fn save_artifact(
@@ -1114,6 +1259,10 @@ fn record_spend_ledger(
   ).map_error(db_err)
 end
 
+fn utc_day_prefix(ts: Text) : Text
+  Text.from_chars(ts.chars.take(10))
+end
+
 fn bot_spend_total(db: Sqlite.Database, bot_name: Text) : Result(Decimal, MotetError)
   rows = try db.query(
     "SELECT cost_usd FROM budget_ledger WHERE bot_name = ?",
@@ -1124,6 +1273,59 @@ fn bot_spend_total(db: Sqlite.Database, bot_name: Text) : Result(Decimal, MotetE
     sum = (sum + cell_decimal(r, 0)).round(6)
   end
   Ok(sum)
+end
+
+fn bot_daily_spend(db: Sqlite.Database, bot_name: Text, day_prefix: Text) : Result(
+  Decimal,
+  MotetError
+)
+  rows = try db.query(
+    "SELECT cost_usd FROM budget_ledger WHERE bot_name = ? AND created_at LIKE ?",
+    [Sqlite.String(bot_name), Sqlite.String("#{day_prefix}%")]
+  ).map_error(db_err)
+  var sum = 0.0
+  for r in rows.rows
+    sum = (sum + cell_decimal(r, 0)).round(6)
+  end
+  Ok(sum)
+end
+
+fn daily_budget_snapshots(db: Sqlite.Database, day_prefix: Text) : Result(
+  List(BudgetSnapshot),
+  MotetError
+)
+  bots = try list_bots(db)
+  like_pat = "#{day_prefix}%"
+  var out = []
+  for b in bots
+    rows = try db.query(
+      "SELECT input_tokens, output_tokens, cost_usd FROM budget_ledger WHERE bot_name = ? AND created_at LIKE ?",
+      [Sqlite.String(b.name), Sqlite.String(like_pat)]
+    ).map_error(db_err)
+    var spent = 0.0
+    var in_toks = 0
+    var out_toks = 0
+    var turns = 0
+    for r in rows.rows
+      in_toks = in_toks.saturating_add(cell_int(r, 0))
+      out_toks = out_toks.saturating_add(cell_int(r, 1))
+      spent = (spent + cell_decimal(r, 2)).round(6)
+      turns += 1
+    end
+    rem = if b.daily_budget_usd > spent: (b.daily_budget_usd - spent).round(6) else: 0.0
+    out = out.append(
+      BudgetSnapshot(
+        bot_name: b.name,
+        limit_usd: b.daily_budget_usd,
+        spent_usd: spent,
+        remaining_usd: rem,
+        turns: turns,
+        input_tokens: in_toks,
+        output_tokens: out_toks
+      )
+    )
+  end
+  Ok(out)
 end
 
 fn count_table(db: Sqlite.Database, sql: Text) : Result(Int, MotetError)
@@ -1170,7 +1372,45 @@ test "store seeds default roster, persists append-only events, and searches FTS 
     Ok(_)
   assert search_events(db, "latency regression", 10) is Ok(hits)
   assert hits.size == 1
-  assert save_memory(db, "shared", "profile", "Timezone is America/New_York", "user", now) is Ok(_)
+  assert save_memory(db, "shared", "profile", "Timezone is America/New_York", "user", now) is Ok(m1)
   assert search_memories(db, Some("chief"), "New_York") is Ok(mems)
   assert mems.size == 1
+  assert delete_memory(db, m1.id) is Ok(Unit)
+  assert list_memories(db, None, 10) is Ok(mems_after) and mems_after.empty?
+
+  # Approval deduplication (exact + read-only routine coalesce) and bulk dismiss
+  assert create_approval(
+    db,
+    "watcher",
+    "s1",
+    "memory_save",
+    "{\"content\":\"run 1\"}",
+    WriteLocal,
+    "read-only routine paused local write",
+    now
+  ) is
+    Ok(a1)
+  assert create_approval(
+    db,
+    "watcher",
+    "s2",
+    "memory_save",
+    "{\"content\":\"run 2\"}",
+    WriteLocal,
+    "read-only routine paused local write",
+    "2026-11-22T00:15:00Z"
+  ) is
+    Ok(a2)
+  assert a1.id == a2.id and a2.session_id == "s2"
+  assert dismiss_all_pending_approvals(db) is Ok(1)
+  assert list_approvals(db, true) is Ok(pend) and pend.empty?
+
+  # Cross-process daily budget ledger aggregation
+  assert record_spend_ledger(db, "watcher", "s1", 1000, 200, 0.0002, now) is Ok(Unit)
+  assert daily_budget_snapshots(db, utc_day_prefix(now)) is Ok(snaps) and snaps.size == 3
+  assert bot_daily_spend(db, "watcher", "2026-11-22") == Ok(0.0002)
+
+  # Routine & connector toggle/delete
+  assert set_routine_enabled(db, 1, Some(false)) is Ok(rt_off) and not rt_off.enabled?
+  assert set_connector_enabled(db, "t3code", Some(false)) is Ok(c_off) and not c_off.enabled?
 end

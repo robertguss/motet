@@ -21,10 +21,12 @@ use Types{
   AskRequest,
   BotConfig,
   BudgetSnapshot,
+  BulkActionResult,
   ConnectorSpec,
   CreateBotRequest,
   CreateRoutineRequest,
   CreateRuleRequest,
+  DeleteResult,
   HealthSummary,
   MemoryEntry,
   MotetError,
@@ -38,6 +40,7 @@ use Types{
   SkillDoc,
   SkillSummary,
   TickSummary,
+  ToggleRequest,
   TrustLevel,
   TurnReply,
   WebhookReceipt
@@ -72,11 +75,13 @@ api
   get "/v1/sessions/:id/events" get_session_events
 
   get "/v1/inbox" get_inbox
+  post "/v1/inbox/dismiss-all" post_dismiss_all_inbox
   post "/v1/inbox/:id/approve" post_approve
   post "/v1/inbox/:id/deny" post_deny
 
   get "/v1/memory" get_memory
   post "/v1/memory" post_memory
+  delete "/v1/memory/:id" delete_memory_by_id
 
   get "/v1/skills" get_skills
   get "/v1/skills/:name" get_skill_by_name
@@ -85,12 +90,17 @@ api
   get "/v1/routines" get_routines
   post "/v1/routines" post_routine
   post "/v1/routines/tick" post_tick_routines
+  post "/v1/routines/:id/toggle" post_toggle_routine
+  delete "/v1/routines/:id" delete_routine_by_id
 
   get "/v1/connectors" get_connectors
   post "/v1/connectors" post_connector
+  post "/v1/connectors/:name/toggle" post_toggle_connector
+  delete "/v1/connectors/:name" delete_connector_by_name
 
   get "/v1/rules" get_rules
   post "/v1/rules" post_rule
+  delete "/v1/rules/:id" delete_rule_by_id
 
   get "/v1/artifacts" get_artifacts
   get "/v1/budget" get_budget
@@ -272,6 +282,16 @@ fn get_inbox(_op: Operator, db: Sqlite.Database, clock: Clock, pending: Option(B
   Store.list_approvals(db, pending or false)
 end
 
+## Dismisses all pending Needs-You approvals in bulk without executing them.
+fn post_dismiss_all_inbox(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+  BulkActionResult,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  count = try Store.dismiss_all_pending_approvals(db)
+  Ok(BulkActionResult(affected: count))
+end
+
 ## Approves a Needs-You item and immediately executes its paused tool action.
 fn post_approve(
   _op: Operator,
@@ -338,6 +358,16 @@ fn post_memory(_op: Operator, db: Sqlite.Database, clock: Clock, body: SaveMemor
     body.provenance or "user",
     clock.now.to_text
   )
+end
+
+## Deletes a persistent memory entry by id.
+fn delete_memory_by_id(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+  DeleteResult,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  try Store.delete_memory(db, id)
+  Ok(DeleteResult(deleted?: true))
 end
 
 ## Lists installed progressive-disclosure SKILL.md documents.
@@ -411,6 +441,28 @@ fn post_tick_routines(
   Brain.run_due_routines(rt, db, budget, policy, scheduler)
 end
 
+## Pauses, resumes, or flips a standing routine by id.
+fn post_toggle_routine(
+  _op: Operator,
+  db: Sqlite.Database,
+  clock: Clock,
+  id: Int,
+  body: ToggleRequest
+) : Result(RoutineSpec, MotetError)
+  try ensure_ready(db, clock)
+  Store.set_routine_enabled(db, id, body.enabled)
+end
+
+## Deletes a standing routine by id.
+fn delete_routine_by_id(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+  DeleteResult,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  try Store.delete_routine(db, id)
+  Ok(DeleteResult(deleted?: true))
+end
+
 ## Lists configured MCP/HTTP connectors (T3 Code, Slack, Notion, Linear, GitHub, etc.).
 fn get_connectors(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
   List(ConnectorSpec),
@@ -443,6 +495,28 @@ fn post_connector(_op: Operator, db: Sqlite.Database, clock: Clock, body: Connec
   )
 end
 
+## Enables, disables, or flips an MCP/HTTP connector by name.
+fn post_toggle_connector(
+  _op: Operator,
+  db: Sqlite.Database,
+  clock: Clock,
+  name: Text,
+  body: ToggleRequest
+) : Result(ConnectorSpec, MotetError)
+  try ensure_ready(db, clock)
+  Store.set_connector_enabled(db, name, body.enabled)
+end
+
+## Deletes an MCP/HTTP connector by name.
+fn delete_connector_by_name(_op: Operator, db: Sqlite.Database, clock: Clock, name: Text) : Result(
+  DeleteResult,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  try Store.delete_connector(db, name)
+  Ok(DeleteResult(deleted?: true))
+end
+
 ## Lists custom host-enforced policy rules.
 fn get_rules(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
   List(PolicyRule),
@@ -463,6 +537,16 @@ fn post_rule(_op: Operator, db: Sqlite.Database, clock: Clock, body: CreateRuleR
   Store.add_rule(db, bname, body.tool_pattern.trim, body.decision, body.note.trim)
 end
 
+## Deletes a custom policy rule by id.
+fn delete_rule_by_id(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+  DeleteResult,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  try Store.delete_rule(db, id)
+  Ok(DeleteResult(deleted?: true))
+end
+
 ## Lists durable artifacts produced by bots.
 fn get_artifacts(_op: Operator, db: Sqlite.Database, clock: Clock, bot: Option(Text)) : Result(
   List(ArtifactItem),
@@ -472,34 +556,13 @@ fn get_artifacts(_op: Operator, db: Sqlite.Database, clock: Clock, bot: Option(T
   Store.list_artifacts(db, bot)
 end
 
-## Inspects per-bot exact Decimal USD spend and limits from BudgetActor + SQLite ledger.
-fn get_budget(_op: Operator, db: Sqlite.Database, budget: BudgetActor, clock: Clock) : Result(
+## Inspects per-bot exact Decimal USD spend for the current UTC day across server, watch, and CLI.
+fn get_budget(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
   List(BudgetSnapshot),
   MotetError
 )
   try ensure_ready(db, clock)
-  live = budget.all_snapshots
-  if not live.empty?
-    return Ok(live)
-  end
-  bots = try Store.list_bots(db)
-  var out = []
-  for b in bots
-    spent = try Store.bot_spend_total(db, b.name)
-    rem = if b.daily_budget_usd > spent: b.daily_budget_usd - spent else: 0.0
-    out = out.append(
-      BudgetSnapshot(
-        bot_name: b.name,
-        limit_usd: b.daily_budget_usd,
-        spent_usd: spent,
-        remaining_usd: rem,
-        turns: 0,
-        input_tokens: 0,
-        output_tokens: 0
-      )
-    )
-  end
-  Ok(out)
+  Store.daily_budget_snapshots(db, Store.utc_day_prefix(clock.now.to_text))
 end
 
 ## Streams a Server-Sent Events snapshot of health and pending Needs-You approvals.
@@ -830,4 +893,61 @@ test "Motet unified API serves PWA UI, OpenAPI, auth, webhooks, MCP, and bot tur
     sched
   )
   assert sse.status == 200 and sse.header("content-type") == Some("text/event-stream")
+
+  # 6. Ops lifecycle controls: routine toggle, connector toggle, memory delete, inbox dismiss-all, daily budget
+  tog_rt = ApiTest.send(
+    Server,
+    Api.post("/v1/routines/1/toggle").with_bearer("secret-op").with_json(
+      ToggleRequest(enabled: Some(false))
+    ),
+    sqlite,
+    env,
+    clock,
+    budget,
+    policy,
+    sched
+  )
+  assert tog_rt.status == 200 and Json.decode[RoutineSpec](tog_rt.text) is Ok(rt_paused) and not rt_paused
+    .enabled?
+
+  tog_conn = ApiTest.send(
+    Server,
+    Api.post("/v1/connectors/t3code/toggle").with_bearer("secret-op").with_json(
+      ToggleRequest(enabled: Some(false))
+    ),
+    sqlite,
+    env,
+    clock,
+    budget,
+    policy,
+    sched
+  )
+  assert tog_conn.status == 200 and Json.decode[ConnectorSpec](tog_conn.text) is Ok(c_off) and not c_off
+    .enabled?
+
+  dismiss = ApiTest.send(
+    Server,
+    Api.post("/v1/inbox/dismiss-all").with_bearer("secret-op"),
+    sqlite,
+    env,
+    clock,
+    budget,
+    policy,
+    sched
+  )
+  assert dismiss.status == 200 and Json.decode[BulkActionResult](dismiss.text) is Ok(br) and br
+    .affected ==
+    0
+
+  bud = ApiTest.send(
+    Server,
+    Api.get("/v1/budget").with_bearer("secret-op"),
+    sqlite,
+    env,
+    clock,
+    budget,
+    policy,
+    sched
+  )
+  assert bud.status == 200 and Json.decode[List(BudgetSnapshot)](bud.text) is Ok(bs) and bs.size == 3
 end

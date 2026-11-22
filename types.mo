@@ -29,6 +29,9 @@ BudgetSnapshot(..),
 WebhookReceipt(..),
 TickSummary(..),
 HealthSummary(..),
+ToggleRequest(..),
+BulkActionResult(..),
+DeleteResult(..),
 MotetError(..),
 provider_to_text,
 provider_from_text,
@@ -291,6 +294,18 @@ struct HealthSummary
   pending_approvals: Int
   connectors: Int
   routines: Int
+end
+
+struct ToggleRequest
+  enabled: Option(Bool)
+end
+
+struct BulkActionResult
+  affected: Int
+end
+
+struct DeleteResult
+  deleted?: Bool
 end
 
 enum MotetError

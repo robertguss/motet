@@ -173,7 +173,8 @@ fn run_turn(
   max_steps = if bot.max_steps > 0 and bot.max_steps <= 32: bot.max_steps else: 8
 
   while steps < max_steps
-    if not budget.can_spend(bot.name, bot.daily_budget_usd)
+    day_spent = try Store.bot_daily_spend(db, bot.name, Store.utc_day_prefix(now_text))
+    if day_spent >= bot.daily_budget_usd or not budget.can_spend(bot.name, bot.daily_budget_usd)
       stopped_reason = Some("daily budget exhausted for #{bot.name}")
       break
     end
