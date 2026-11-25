@@ -64,6 +64,9 @@ EvaluateIntentsRequest(..),
 EvaluateIntentsResponse(..),
 DreamingDigest(..),
 WeeklyAuditReport(..),
+ModbVerifySummary(..),
+ReplaySimulateRequest(..),
+RevokeGrantRequest(..),
 provider_to_text,
 provider_from_text,
 effect_to_text,
@@ -603,6 +606,31 @@ struct WeeklyAuditReport
   unused_bot_skills: List(Text)
   repeated_approval_tools: List(Text)
   summary_markdown: Text
+end
+
+struct ModbVerifySummary
+  ok?: Bool
+  txid: Int
+  page_count: Int
+  bucket_count: Int
+  schema_version: Int
+  audit_entries: Int
+  last_audit_hash: Text
+  invariants_checked: Int
+  call_count: Int
+  secrets_ok?: Bool
+end
+
+struct ReplaySimulateRequest
+  id: Text
+  description: Text
+  exclude_principal: Option(Text)
+  exclude_seqs: Option(List(Int))
+  stop_before_seq: Option(Int)
+end
+
+struct RevokeGrantRequest
+  reason: Option(Text)
 end
 
 fn provider_to_text(p: ProviderKind) : Text

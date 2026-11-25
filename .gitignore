@@ -2,6 +2,9 @@
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+*.modb
+*.modb.lock
+*.modb.tmp
 *.bc
 frontend/node_modules/
 public/

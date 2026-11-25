@@ -1,12 +1,34 @@
-## Durable append-only WAL SQLite storage for Motet v1:
-## strict specialist bots, write-only AES-256-GCM vault secrets & OAuth tokens,
-## canonical forever-chats, append-only event log + tool_calls replay + FTS,
-## async bot runs + live steering queue, tiered memory, routines, editable approvals,
-## connectors, policy rules, webhooks, artifacts, and spend/cache ledger.
+## Durable pure-Mo MoDB storage engine for Motet (`motet.modb` + isolated `motet-secrets.modb`):
+## - Layer 1/2: Crash-safe CoW B+Tree (`Modb`) + typed tables & secondary indexes (`Modb.Table`)
+##              + batched single-transaction inverted keyword indexes (`event_tokens`, `memory_tokens`)
+## - Layer 3:   Tamper-evident SHA-256 hash-chained audit ledger, schema v1, commit invariants
+## - Layer 4:   Attenuated `Grants`, `Claims` leases, `Views` + `OnboardingManifest`,
+##              lossless `Replay`, and canonical SHA-256 `Export`.
+## - Security:  AES-256-GCM Vault ciphertexts, OAuth PKCE state, and Bearer access tokens live ONLY
+##              in bare Layer 1/2 `motet-secrets.modb`, physically excluded from audit, replay, views,
+##              and export.
 module Store
-expose init_schema,
+expose default_db_path,
+default_secrets_path,
+DbHandle(..),
+open,
+open_at,
+init_schema,
 seed_defaults,
+ensure_seeded,
 tokenize,
+motet_schema,
+motet_view_catalog,
+motet_replay_catalog,
+DreamingRunRow(..),
+RoutineRunRow(..),
+SkillUsageRow(..),
+BudgetLedgerRow(..),
+BotRunRow(..),
+VaultSecretRow(..),
+ConnectorTokenRow(..),
+MemoryRow(..),
+MigrationSnapshot(..),
 upsert_bot,
 get_bot,
 list_bots,
@@ -46,6 +68,8 @@ list_events,
 list_events_after,
 search_events,
 count_session_tool_denials,
+has_events_since,
+list_recent_owner_user_messages,
 save_memory,
 save_memory_full,
 list_memories,
@@ -56,6 +80,15 @@ archive_memory,
 restore_memory,
 search_memories,
 delete_memory,
+record_dreaming_run,
+list_dreaming_runs,
+get_dreaming_run,
+mark_dreaming_rolled_back,
+has_dreamed_today,
+create_intent,
+list_intents,
+cancel_intent,
+record_intent_fired,
 record_skill_usage,
 get_skill_usage_map,
 upsert_routine,
@@ -73,6 +106,7 @@ list_approvals,
 update_approval,
 update_approval_args,
 dismiss_all_pending_approvals,
+list_repeated_executed_approvals,
 save_artifact,
 list_artifacts,
 record_spend_ledger,
@@ -101,8 +135,45 @@ save_push_subscription,
 list_push_subscriptions,
 delete_push_subscription,
 analytics_summary,
-health_summary
+health_summary,
+import_snapshot,
+import_secrets_snapshot,
+bot_root_grant_id,
+ensure_bot_root_grant,
+delegate_bot_grant,
+authorize_grant_action,
+list_grants,
+revoke_grant,
+try_claim_routine,
+release_routine_claim,
+list_active_claims,
+describe_for_caller,
+run_read_program,
+verify_all,
+audit_tail,
+export_snapshot,
+simulate_replay,
+list_replay_proposals,
+accept_replay_proposal,
+discard_replay_proposal
 use Json
+use Modb{WriteTx}
+use Modb.Claims
+use Modb.Errors{ModbError}
+use Modb.Export{PortableSnapshot}
+use Modb.Grants{GrantSpec}
+use Modb.Ledger{AuditEntry, LedgerError, Schema, WriteMeta}
+use Modb.Replay{ReplayCatalog, ReplayFilter, ReplayProposal}
+use Modb.Table{Index, Table, TableError}
+use Modb.Views{
+  OnboardingManifest,
+  ReadProgram,
+  ReadResult,
+  ReleaseDef,
+  ViewCatalog,
+  ViewDef,
+  ViewField
+}
 use Types{
   AnalyticsSummary,
   AppSettings,
@@ -114,9 +185,11 @@ use Types{
   BotRun,
   BudgetSnapshot,
   ConnectorSpec,
+  DreamingDigest,
   EffectClass,
   HealthSummary,
   MemoryEntry,
+  ModbVerifySummary,
   MotetError,
   PolicyRule,
   ProviderKind,
@@ -124,55 +197,684 @@ use Types{
   RoutineSpec,
   SessionEvent,
   SessionSummary,
+  StandingIntent,
   TrustLevel,
   VaultSecretMeta,
   WebhookConfig,
-  approval_status_from_text,
-  approval_status_to_text,
-  decision_from_text,
-  decision_to_text,
-  effect_from_text,
-  effect_to_text,
-  provider_from_text,
-  provider_to_text,
-  trust_from_text,
-  trust_to_text
+  approval_status_to_text
 }
 use Unicode16
 use Vault
 
-fn db_err(e: SqliteError) : MotetError
-  StorageFailed(message: "#{e}")
+default_db_path = "motet.modb"
+default_secrets_path = "motet-secrets.modb"
+
+struct DbHandle
+  files: Files
+  clock: Clock
+  path: Text
+  secrets_path: Text
 end
 
-fn cell_str(row: List(Sqlite.Value), idx: Int) : Text
-  if row.get(idx) is Some(Sqlite.String(s)): s else: ""
+fn open(files: Files, clock: Clock) : DbHandle
+  DbHandle(files: files, clock: clock, path: default_db_path, secrets_path: default_secrets_path)
 end
 
-fn cell_opt_str(row: List(Sqlite.Value), idx: Int) : Option(Text)
-  case row.get(idx)
-    Some(Sqlite.String(s)): if s.empty?: None else: Some(s)
-    Some(_) | None: None
+fn open_at(files: Files, clock: Clock, path: Text, secrets_path: Text) : DbHandle
+  DbHandle(files: files, clock: clock, path: path, secrets_path: secrets_path)
+end
+
+## Internal typed records stored in `motet.modb` and `motet-secrets.modb`.
+struct MemoryRow
+  id: Int
+  scope: Text
+  kind: Text
+  content: Text
+  provenance: Text
+  origin: Text
+  session_kind: Text
+  staged: Bool
+  archived?: Bool
+  created_at: Text
+end
+
+struct DreamingRunRow
+  id: Int
+  run_at: Text
+  summary: Text
+  promoted_count: Int
+  pruned_count: Int
+  rollback_snapshot_json: Text
+  rolled_back?: Bool
+end
+
+struct SkillUsageRow
+  skill_name: Text
+  read_count: Int
+  last_used_at: Text
+end
+
+struct RoutineRunRow
+  key: Text
+  id: Int
+  routine_id: Int
+  slot_key: Text
+  status: Text
+  detail: Text
+  created_at: Text
+end
+
+struct BudgetLedgerRow
+  id: Int
+  bot_name: Text
+  session_id: Text
+  input_tokens: Int
+  output_tokens: Int
+  cached_input_tokens: Int
+  cost_usd: Decimal
+  created_at: Text
+  day: Text
+end
+
+struct BotRunRow
+  id: Text
+  bot_name: Text
+  session_id: Text
+  trust: TrustLevel
+  routine_read_only?: Bool
+  status: Text
+  prompt: Text
+  steer_queue_json: Text
+  steps: Int
+  spent_usd: Decimal
+  reply: Text
+  error: Option(Text)
+  created_at: Text
+  updated_at: Text
+end
+
+struct OAuthPending
+  state: Text
+  connector_name: Text
+  client_id: Text
+  redirect_uri: Text
+  code_verifier: Text
+  token_endpoint: Text
+  resource: Text
+  created_at: Text
+end
+
+struct ConnectorTokenRow
+  connector_name: Text
+  access_token: Text
+  scope: Text
+  expires_at: Text
+  updated_at: Text
+end
+
+struct VaultSecretRow
+  name: Text
+  scope: Text
+  ciphertext: Text
+  updated_at: Text
+end
+
+struct MigrationSnapshot
+  bots: List(BotConfig)
+  connectors: List(ConnectorSpec)
+  policy_rules: List(PolicyRule)
+  sessions: List(SessionSummary)
+  events: List(SessionEvent)
+  memories: List(MemoryRow)
+  dreaming_runs: List(DreamingRunRow)
+  standing_intents: List(StandingIntent)
+  skill_usage: List(SkillUsageRow)
+  routines: List(RoutineSpec)
+  routine_runs: List(RoutineRunRow)
+  app_settings: Map(Text, Text)
+  push_subscriptions: List(PushSubscription)
+  approvals: List(ApprovalItem)
+  artifacts: List(ArtifactItem)
+  budget_ledger: List(BudgetLedgerRow)
+  bot_runs: List(BotRunRow)
+  webhook_configs: List(WebhookConfig)
+end
+
+## Action argument structs for deterministic Replay recording.
+struct SeedDefaultsArgs
+  now_text: Text
+end
+
+struct ToggleNameArgs
+  name: Text
+  enabled: Option(Bool)
+end
+
+struct CloneBotArgs
+  source_name: Text
+  new_name: Text
+  role: Option(Text)
+  persona: Option(Text)
+  connectors: Option(List(Text))
+  read_only_connectors: Option(List(Text))
+end
+
+struct NameArgs
+  name: Text
+end
+
+struct IdArgs
+  id: Int
+end
+
+struct ToggleIdArgs
+  id: Int
+  enabled: Option(Bool)
+end
+
+struct AddRuleArgs
+  bot_name: Text
+  tool_pattern: Text
+  decision: ApprovalDecision
+  note: Text
+end
+
+struct CreateSessionArgs
+  id: Text
+  bot_name: Text
+  title: Text
+  trust: TrustLevel
+  canonical: Bool
+  now_text: Text
+end
+
+struct SetCompactionSeqArgs
+  session_id: Text
+  compaction_seq: Int
+end
+
+struct AppendEventArgs
+  session_id: Text
+  kind: Text
+  role: Text
+  content: Text
+  tool_name: Option(Text)
+  tool_call_id: Option(Text)
+  tool_calls_json: Option(Text)
+  cost_usd: Decimal
+  now_text: Text
+end
+
+struct SaveMemoryArgs
+  scope: Text
+  kind: Text
+  content: Text
+  provenance: Text
+  origin: Text
+  session_kind: Text
+  staged: Bool
+  now_text: Text
+end
+
+struct UpdateMemoryContentArgs
+  id: Int
+  content: Text
+end
+
+struct RecordDreamingArgs
+  run_at: Text
+  summary: Text
+  promoted_count: Int
+  pruned_count: Int
+  rollback_snapshot_json: Text
+end
+
+struct CreateIntentArgs
+  bot_name: Text
+  name: Text
+  watch_terms: Text
+  instruction: Text
+  cooldown_seconds: Int
+  max_fires: Int
+  expires_at: Text
+end
+
+struct RecordIntentFiredArgs
+  id: Int
+  now_text: Text
+end
+
+struct RecordSkillUsageArgs
+  skill_name: Text
+  now_text: Text
+end
+
+struct UpsertRoutineArgs
+  bot_name: Text
+  name: Text
+  prompt: Text
+  interval_seconds: Int
+  schedule_kind: Text
+  schedule_expr: Text
+  timezone: Text
+  read_only: Bool
+  skip_memory: Bool
+  precheck_kind: Text
+  next_due_at: Text
+end
+
+struct ClaimRoutineSlotArgs
+  routine_id: Int
+  slot_key: Text
+  now_text: Text
+end
+
+struct MarkRoutineRanArgs
+  id: Int
+  now_text: Text
+  next_due_at: Text
+end
+
+struct MarkRoutineSkippedArgs
+  id: Int
+  next_due_at: Text
+end
+
+struct CreateApprovalArgs
+  bot_name: Text
+  session_id: Text
+  tool_name: Text
+  arguments_json: Text
+  effect_class: EffectClass
+  reason: Text
+  now_text: Text
+end
+
+struct UpdateApprovalArgs
+  id: Int
+  status: ApprovalStatus
+  result_text: Text
+end
+
+struct UpdateApprovalJsonArgs
+  id: Int
+  arguments_json: Text
+end
+
+struct SaveArtifactArgs
+  bot_name: Text
+  session_id: Text
+  kind: Text
+  title: Text
+  content: Text
+  now_text: Text
+end
+
+struct RecordSpendArgs
+  bot_name: Text
+  session_id: Text
+  input_tokens: Int
+  output_tokens: Int
+  cached_input_tokens: Int
+  cost_usd: Decimal
+  now_text: Text
+end
+
+struct EnqueueRunArgs
+  run_id: Text
+  bot_name: Text
+  session_id: Text
+  trust: TrustLevel
+  routine_read_only: Bool
+  prompt: Text
+  now_text: Text
+end
+
+struct ClaimRunArgs
+  run_id: Text
+  now_text: Text
+end
+
+struct AppendRunSteerArgs
+  run_id: Text
+  mode: Text
+  message: Text
+  now_text: Text
+end
+
+struct UpdateRunProgressArgs
+  run_id: Text
+  steps: Int
+  spent_usd: Decimal
+  now_text: Text
+end
+
+struct FinishRunArgs
+  run_id: Text
+  status: Text
+  steps: Int
+  spent_usd: Decimal
+  reply: Text
+  error_text: Text
+  now_text: Text
+end
+
+struct SavePushSubArgs
+  sub: PushSubscription
+  now_text: Text
+end
+
+struct SetSettingArgs
+  key: Text
+  value: Text
+end
+
+## Error conversion helpers.
+fn modb_err(e: ModbError) : MotetError
+  StorageFailed(message: e.to_text)
+end
+
+fn table_err(e: TableError) : MotetError
+  StorageFailed(message: e.to_text)
+end
+
+fn ledger_err(e: LedgerError) : MotetError
+  case e
+    InvariantViolation(name: n, detail: d): BadInput(message: "invariant '#{n}': #{d}")
+    InvalidMeta(reason: r): BadInput(message: r)
+    TableFailure(_) | SchemaTooNew(found: _, supported: _) | InvalidMigration(reason: _) | AuditCorrupt(
+      reason: _
+    ): StorageFailed(message: e.to_text)
   end
 end
 
-fn cell_int(row: List(Sqlite.Value), idx: Int) : Int
-  if row.get(idx) is Some(Sqlite.Integer(n)): n else: 0
+fn grant_err(e: Grants.GrantError) : MotetError
+  case e
+    Grants.LedgerFailure(le): ledger_err(le)
+    Grants.GrantNotFound(id: _): ItemNotFound(message: e.to_text)
+    Grants.InvalidGrant(reason: _): BadInput(message: e.to_text)
+    Grants.GrantAlreadyExists(id: _): Conflict(message: e.to_text)
+    Grants.WideningDenied(field: _, detail: _) | Grants.Revoked(id: _, revoked_ancestor: _) | Grants
+      .Expired(id: _, expired_ancestor: _) | Grants.ActionDenied(id: _, action: _) | Grants
+      .ViewDenied(id: _, view: _) | Grants.ReleaseDenied(id: _, release: _) | Grants.BudgetExhausted(
+        id: _,
+        ancestor_id: _,
+        max_calls: _
+      ): PolicyDenied(message: e.to_text)
+  end
 end
 
-fn cell_bool(row: List(Sqlite.Value), idx: Int) : Bool
-  cell_int(row, idx) != 0
+fn claim_err(e: Claims.ClaimError) : MotetError
+  case e
+    Claims.LedgerFailure(le): ledger_err(le)
+    Claims.InvalidClaim(reason: _): BadInput(message: e.to_text)
+    Claims.ClaimNotFound(resource: _): ItemNotFound(message: e.to_text)
+    Claims.AlreadyClaimed(resource: _, holder: _, expires_at: _) | Claims.NotHolder(
+      resource: _,
+      expected: _,
+      actual: _
+    ): Conflict(message: e.to_text)
+  end
 end
 
-fn cell_decimal(row: List(Sqlite.Value), idx: Int) : Decimal
-  cell_str(row, idx).to_decimal or 0.0
+fn views_err(e: Views.ViewsError) : MotetError
+  case e
+    Views.LedgerFailure(le): ledger_err(le)
+    Views.GrantFailure(ge): grant_err(ge)
+    Views.UnknownView(name: _) | Views.UnknownRelease(name: _): ItemNotFound(message: e.to_text)
+    Views.FieldNotInView(view: _, field: _, allowed: _) | Views.ReleaseThresholdBlocked(
+      release: _,
+      min_group_size: _,
+      actual_count: _
+    ): PolicyDenied(message: e.to_text)
+    Views.WorkBudgetExceeded(metric: _, limit: _): BudgetExceeded(message: e.to_text)
+    Views.InvalidProgram(reason: _): BadInput(message: e.to_text)
+    Views.ViewLoadFailed(view: _, detail: _) | Views.ReleaseFailed(release: _, detail: _): StorageFailed(
+      message: e.to_text
+    )
+  end
 end
 
-fn last_id(db: Sqlite.Database) : Result(Int, MotetError)
-  rows = try db.query("SELECT last_insert_rowid()", []).map_error(db_err)
-  Ok(cell_int(rows.rows.first or [], 0))
+fn export_err(e: Export.ExportError) : MotetError
+  case e
+    Export.LedgerFailure(le): ledger_err(le)
+    Export.StorageFailure(me): modb_err(me)
+    Export.UnsupportedFormat(found: _, supported: _) | Export.InvalidEncoding(bucket: _, detail: _) | Export
+      .ChecksumMismatch(expected: _, actual: _): StorageFailed(message: e.to_text)
+    Export.TargetNotEmpty(path: _): Conflict(message: e.to_text)
+  end
 end
 
+fn strip_pfx(s: Text, pfx: Text) : Text
+  Text.from_chars(s.chars.drop(pfx.chars.size)).trim
+end
+
+fn replay_action_detail_err(detail: Text) : MotetError
+  if detail.starts_with?("item_not_found:")
+    ItemNotFound(message: strip_pfx(detail, "item_not_found:"))
+  else if detail.starts_with?("bad_input:")
+    BadInput(message: strip_pfx(detail, "bad_input:"))
+  else if detail.starts_with?("conflict:")
+    Conflict(message: strip_pfx(detail, "conflict:"))
+  else
+    StorageFailed(message: detail)
+  end
+end
+
+fn replay_err(e: Replay.ReplayError) : MotetError
+  case e
+    Replay.LedgerFailure(le): ledger_err(le)
+    Replay.ExportFailure(ee): export_err(ee)
+    Replay.GrantFailure(ge): grant_err(ge)
+    Replay.ProposalNotFound(id: _): ItemNotFound(message: e.to_text)
+    Replay.ProposalAlreadyExists(id: _) | Replay.ProposalNotPending(id: _, status: _) | Replay
+      .ProposalStale(
+        id: _,
+        expected_audit_seq: _,
+        actual_audit_seq: _,
+        expected_call_seq: _,
+        actual_call_seq: _
+      ): Conflict(message: e.to_text)
+    Replay.ReplayActionRejected(action: _, detail: d): replay_action_detail_err(d)
+    Replay.UnknownReplayAction(action: _, schema_version: _) | Replay.MissingReplayMigration(
+      version: _
+    ) | Replay.ReplayFailed(detail: _): StorageFailed(message: e.to_text)
+  end
+end
+
+fn parse_time(ts: Text) : Time
+  Time.parse(ts) or (Time.parse("2026-01-01T00:00:00Z") or stop "fallback epoch time")
+end
+
+## Row conversions between internal storage structs and public Types.
+fn mem_row_to_entry(r: MemoryRow) : MemoryEntry
+  MemoryEntry(
+    id: r.id,
+    scope: r.scope,
+    kind: r.kind,
+    content: r.content,
+    provenance: r.provenance,
+    origin: r.origin,
+    session_kind: r.session_kind,
+    staged: r.staged,
+    created_at: r.created_at
+  )
+end
+
+fn dream_row_to_digest(r: DreamingRunRow) : DreamingDigest
+  DreamingDigest(
+    id: r.id,
+    run_at: r.run_at,
+    summary: r.summary,
+    promoted_count: r.promoted_count,
+    pruned_count: r.pruned_count,
+    rolled_back?: r.rolled_back?
+  )
+end
+
+fn bot_run_row_to_public(r: BotRunRow) : BotRun
+  BotRun(
+    id: r.id,
+    bot_name: r.bot_name,
+    session_id: r.session_id,
+    trust: r.trust,
+    routine_read_only?: r.routine_read_only?,
+    status: r.status,
+    prompt: r.prompt,
+    steps: r.steps,
+    spent_usd: r.spent_usd,
+    reply: r.reply,
+    error: r.error,
+    created_at: r.created_at,
+    updated_at: r.updated_at
+  )
+end
+
+## Typed tables and secondary indexes in `motet.modb`.
+fn seqs_table() : Table(Text, Int)
+  Table.text_key[Int]("_motet_seqs")
+end
+
+fn bots_table() : Table(Text, BotConfig)
+  Table.text_key[BotConfig]("bots")
+end
+
+fn connectors_table() : Table(Text, ConnectorSpec)
+  Table.text_key[ConnectorSpec]("connectors")
+end
+
+fn policy_rules_table() : Table(Int, PolicyRule)
+  Table.int_key[PolicyRule]("policy_rules")
+end
+
+fn sessions_by_bot_index() : Index(Text, SessionSummary, Text)
+  Table.text_index[Text, SessionSummary]("sessions_by_bot", fn(s) s.bot_name end)
+end
+
+fn sessions_table() : Table(Text, SessionSummary)
+  Table.text_key[SessionSummary]("sessions").with_index(sessions_by_bot_index())
+end
+
+fn events_by_session_index() : Index(Int, SessionEvent, Text)
+  Table.text_index[Int, SessionEvent]("events_by_session", fn(e) e.session_id end)
+end
+
+fn events_table() : Table(Int, SessionEvent)
+  Table.int_key[SessionEvent]("events").with_index(events_by_session_index())
+end
+
+fn memories_by_scope_index() : Index(Int, MemoryRow, Text)
+  Table.text_index[Int, MemoryRow]("memories_by_scope", fn(m) m.scope end)
+end
+
+fn memories_table() : Table(Int, MemoryRow)
+  Table.int_key[MemoryRow]("memories").with_index(memories_by_scope_index())
+end
+
+fn dreaming_runs_table() : Table(Int, DreamingRunRow)
+  Table.int_key[DreamingRunRow]("dreaming_runs")
+end
+
+fn intents_table() : Table(Int, StandingIntent)
+  Table.int_key[StandingIntent]("standing_intents")
+end
+
+fn skill_usage_table() : Table(Text, SkillUsageRow)
+  Table.text_key[SkillUsageRow]("skill_usage")
+end
+
+fn routines_by_bot_name_index() : Index(Int, RoutineSpec, Text)
+  Table.unique_text_index[Int, RoutineSpec](
+    "routines_by_bot_name",
+    fn(r) "#{r.bot_name}\u{1f}#{r.name}" end
+  )
+end
+
+fn routines_table() : Table(Int, RoutineSpec)
+  Table.int_key[RoutineSpec]("routines").with_index(routines_by_bot_name_index())
+end
+
+fn routine_runs_by_routine_index() : Index(Text, RoutineRunRow, Int)
+  Table.int_index[Text, RoutineRunRow]("routine_runs_by_routine", fn(r) r.routine_id end)
+end
+
+fn routine_runs_table() : Table(Text, RoutineRunRow)
+  Table.text_key[RoutineRunRow]("routine_runs").with_index(routine_runs_by_routine_index())
+end
+
+fn app_settings_table() : Table(Text, Text)
+  Table.text_key[Text]("app_settings")
+end
+
+fn push_subscriptions_table() : Table(Text, PushSubscription)
+  Table.text_key[PushSubscription]("push_subscriptions")
+end
+
+fn approvals_by_status_index() : Index(Int, ApprovalItem, Text)
+  Table.text_index[Int, ApprovalItem](
+    "approvals_by_status",
+    fn(a) approval_status_to_text(a.status) end
+  )
+end
+
+fn approvals_table() : Table(Int, ApprovalItem)
+  Table.int_key[ApprovalItem]("approvals").with_index(approvals_by_status_index())
+end
+
+fn artifacts_by_bot_index() : Index(Int, ArtifactItem, Text)
+  Table.text_index[Int, ArtifactItem]("artifacts_by_bot", fn(a) a.bot_name end)
+end
+
+fn artifacts_table() : Table(Int, ArtifactItem)
+  Table.int_key[ArtifactItem]("artifacts").with_index(artifacts_by_bot_index())
+end
+
+fn budget_by_bot_index() : Index(Int, BudgetLedgerRow, Text)
+  Table.text_index[Int, BudgetLedgerRow]("budget_by_bot", fn(r) r.bot_name end)
+end
+
+fn budget_by_bot_day_index() : Index(Int, BudgetLedgerRow, Text)
+  Table.text_index[Int, BudgetLedgerRow]("budget_by_bot_day", fn(r) "#{r.bot_name}:#{r.day}" end)
+end
+
+fn budget_ledger_table() : Table(Int, BudgetLedgerRow)
+  Table.int_key[BudgetLedgerRow]("budget_ledger").with_index(budget_by_bot_index()).with_index(
+    budget_by_bot_day_index()
+  )
+end
+
+fn bot_runs_by_status_index() : Index(Text, BotRunRow, Text)
+  Table.text_index[Text, BotRunRow]("bot_runs_by_status", fn(r) r.status end)
+end
+
+fn bot_runs_by_bot_index() : Index(Text, BotRunRow, Text)
+  Table.text_index[Text, BotRunRow]("bot_runs_by_bot", fn(r) r.bot_name end)
+end
+
+fn bot_runs_table() : Table(Text, BotRunRow)
+  Table.text_key[BotRunRow]("bot_runs").with_index(bot_runs_by_status_index()).with_index(
+    bot_runs_by_bot_index()
+  )
+end
+
+fn webhook_configs_table() : Table(Text, WebhookConfig)
+  Table.text_key[WebhookConfig]("webhook_configs")
+end
+
+## Physical isolation: secrets tables live ONLY in bare Layer 1+2 `motet-secrets.modb`.
+fn oauth_pending_table() : Table(Text, OAuthPending)
+  Table.text_key[OAuthPending]("oauth_pending")
+end
+
+fn connector_tokens_table() : Table(Text, ConnectorTokenRow)
+  Table.text_key[ConnectorTokenRow]("connector_tokens")
+end
+
+fn vault_secrets_table() : Table(Text, VaultSecretRow)
+  Table.text_key[VaultSecretRow]("vault_secrets")
+end
+
+## Pure-Mo Unicode tokenizer for inverted keyword indexing.
 fn all_nonempty?(items: List(Text)) : Bool
   for item in items
     return false if item.empty?
@@ -180,7 +882,6 @@ fn all_nonempty?(items: List(Text)) : Bool
   true
 end
 
-## Lowercase Unicode search tokenizer for inverted full-text search across sessions and memory.
 fn tokenize(text: Text) : List(Text)
   promise
     all_nonempty?(result)
@@ -197,887 +898,579 @@ fn tokenize(text: Text) : List(Text)
   cleaned.words.unique
 end
 
-fn run_ddl(db: Sqlite.Database, sql: Text) : Result(Unit, MotetError)
-  db.run(sql, []).map_error(db_err)
+fn token_index_key(tok: Text, id: Int) : Bytes
+  Table.encode_composite_key(Table.encode_text_key(tok), Table.encode_int_key(id))
 end
 
-## Safely adds a column to an existing table if absent (zero-downtime schema migration).
-fn ensure_column(db: Sqlite.Database, table: Text, column: Text, col_def: Text) : Result(
-  Unit,
-  MotetError
+fn token_prefix(tok: Text) : Bytes
+  Table.encode_composite_key(Table.encode_text_key(tok), Bytes.empty)
+end
+
+fn tx_index_tokens(tx: WriteTx, bucket: Text, tokens: List(Text), id: Int) : Result(
+  WriteTx,
+  TableError
 )
-  info = try db.query("PRAGMA table_info(#{table})", []).map_error(db_err)
-  has_col = info.rows.any?(fn(r) cell_str(r, 1) == column end)
-  if not has_col
-    try run_ddl(db, "ALTER TABLE #{table} ADD COLUMN #{column} #{col_def}")
+  var cur = tx
+  for tok in tokens
+    cur = try Modb.tx_put(cur, bucket, token_index_key(tok, id), Bytes.empty).map_error(fn(e)
+      Table.Storage(e)
+    end)
   end
-  Ok(Unit)
+  Ok(cur)
 end
 
-## Creates all durable tables and applies additive migrations idempotently.
-fn init_schema(db: Sqlite.Database) : Result(Unit, MotetError)
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS bots (",
-      "  name TEXT PRIMARY KEY,",
-      "  role TEXT NOT NULL,",
-      "  persona TEXT NOT NULL,",
-      "  is_primary INT NOT NULL,",
-      "  model_tier TEXT NOT NULL,",
-      "  provider TEXT NOT NULL,",
-      "  endpoint TEXT NOT NULL,",
-      "  api_key_env TEXT NOT NULL,",
-      "  model TEXT NOT NULL,",
-      "  workspace TEXT NOT NULL,",
-      "  allowed_programs_json TEXT NOT NULL,",
-      "  allowed_hosts_json TEXT NOT NULL,",
-      "  connectors_json TEXT NOT NULL,",
-      "  read_only_connectors_json TEXT NOT NULL DEFAULT '[]',",
-      "  daily_budget_usd TEXT NOT NULL,",
-      "  max_steps INT NOT NULL,",
-      "  active INT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try ensure_column(db, "bots", "read_only_connectors_json", "TEXT NOT NULL DEFAULT '[]'")
-
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS connectors (",
-      "  name TEXT PRIMARY KEY,",
-      "  kind TEXT NOT NULL,",
-      "  url TEXT NOT NULL,",
-      "  auth_env TEXT NOT NULL,",
-      "  allowed_host TEXT NOT NULL,",
-      "  default_effect TEXT NOT NULL,",
-      "  enabled INT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS policy_rules (",
-      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
-      "  bot_name TEXT NOT NULL,",
-      "  tool_pattern TEXT NOT NULL,",
-      "  decision TEXT NOT NULL,",
-      "  note TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS sessions (",
-      "  id TEXT PRIMARY KEY,",
-      "  bot_name TEXT NOT NULL,",
-      "  title TEXT NOT NULL,",
-      "  trust TEXT NOT NULL,",
-      "  canonical INT NOT NULL DEFAULT 0,",
-      "  compaction_seq INT NOT NULL DEFAULT 0,",
-      "  created_at TEXT NOT NULL,",
-      "  updated_at TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try ensure_column(db, "sessions", "canonical", "INT NOT NULL DEFAULT 0")
-  try ensure_column(db, "sessions", "compaction_seq", "INT NOT NULL DEFAULT 0")
-
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS events (",
-      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
-      "  session_id TEXT NOT NULL,",
-      "  seq INT NOT NULL,",
-      "  kind TEXT NOT NULL,",
-      "  role TEXT NOT NULL,",
-      "  content TEXT NOT NULL,",
-      "  tool_name TEXT NOT NULL,",
-      "  tool_call_id TEXT NOT NULL,",
-      "  tool_calls_json TEXT NOT NULL DEFAULT '',",
-      "  cost_usd TEXT NOT NULL,",
-      "  created_at TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try ensure_column(db, "events", "tool_calls_json", "TEXT NOT NULL DEFAULT ''")
-
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS event_tokens (",
-      "  token TEXT NOT NULL,",
-      "  event_id INT NOT NULL,",
-      "  PRIMARY KEY (token, event_id)",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS memories (",
-      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
-      "  scope TEXT NOT NULL,",
-      "  kind TEXT NOT NULL,",
-      "  content TEXT NOT NULL,",
-      "  provenance TEXT NOT NULL,",
-      "  origin TEXT NOT NULL DEFAULT 'owner',",
-      "  session_kind TEXT NOT NULL DEFAULT 'direct',",
-      "  staged INT NOT NULL DEFAULT 0,",
-      "  archived INT NOT NULL DEFAULT 0,",
-      "  created_at TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try ensure_column(db, "memories", "origin", "TEXT NOT NULL DEFAULT 'owner'")
-  try ensure_column(db, "memories", "session_kind", "TEXT NOT NULL DEFAULT 'direct'")
-  try ensure_column(db, "memories", "staged", "INT NOT NULL DEFAULT 0")
-  try ensure_column(db, "memories", "archived", "INT NOT NULL DEFAULT 0")
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS dreaming_runs (",
-      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
-      "  run_at TEXT NOT NULL,",
-      "  summary TEXT NOT NULL,",
-      "  promoted_count INT NOT NULL,",
-      "  pruned_count INT NOT NULL,",
-      "  rollback_snapshot_json TEXT NOT NULL,",
-      "  rolled_back INT NOT NULL DEFAULT 0",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS standing_intents (",
-      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
-      "  bot_name TEXT NOT NULL,",
-      "  name TEXT NOT NULL,",
-      "  watch_terms TEXT NOT NULL,",
-      "  instruction TEXT NOT NULL,",
-      "  cooldown_seconds INT NOT NULL,",
-      "  max_fires INT NOT NULL,",
-      "  fire_count INT NOT NULL DEFAULT 0,",
-      "  expires_at TEXT NOT NULL,",
-      "  active INT NOT NULL DEFAULT 1,",
-      "  last_fired_at TEXT NOT NULL DEFAULT ''",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS skill_usage (",
-      "  skill_name TEXT PRIMARY KEY,",
-      "  read_count INT NOT NULL DEFAULT 0,",
-      "  last_used_at TEXT NOT NULL DEFAULT ''",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS memory_tokens (",
-      "  token TEXT NOT NULL,",
-      "  memory_id INT NOT NULL,",
-      "  PRIMARY KEY (token, memory_id)",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS routines (",
-      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
-      "  bot_name TEXT NOT NULL,",
-      "  name TEXT NOT NULL,",
-      "  prompt TEXT NOT NULL,",
-      "  interval_seconds INT NOT NULL,",
-      "  schedule_kind TEXT NOT NULL DEFAULT 'interval',",
-      "  schedule_expr TEXT NOT NULL DEFAULT '',",
-      "  timezone TEXT NOT NULL DEFAULT 'America/Los_Angeles',",
-      "  read_only INT NOT NULL,",
-      "  skip_memory INT NOT NULL DEFAULT 1,",
-      "  precheck_kind TEXT NOT NULL DEFAULT '',",
-      "  enabled INT NOT NULL,",
-      "  next_due_at TEXT NOT NULL,",
-      "  last_run_at TEXT NOT NULL,",
-      "  run_count INT NOT NULL DEFAULT 0,",
-      "  skip_count INT NOT NULL DEFAULT 0,",
-      "  UNIQUE (bot_name, name)",
-      ")"
-    ].join("")
-  )
-  try ensure_column(db, "routines", "schedule_kind", "TEXT NOT NULL DEFAULT 'interval'")
-  try ensure_column(db, "routines", "schedule_expr", "TEXT NOT NULL DEFAULT ''")
-  try ensure_column(db, "routines", "timezone", "TEXT NOT NULL DEFAULT 'America/Los_Angeles'")
-  try ensure_column(db, "routines", "skip_memory", "INT NOT NULL DEFAULT 1")
-  try ensure_column(db, "routines", "precheck_kind", "TEXT NOT NULL DEFAULT ''")
-  try ensure_column(db, "routines", "run_count", "INT NOT NULL DEFAULT 0")
-  try ensure_column(db, "routines", "skip_count", "INT NOT NULL DEFAULT 0")
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS routine_runs (",
-      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
-      "  routine_id INT NOT NULL,",
-      "  slot_key TEXT NOT NULL,",
-      "  status TEXT NOT NULL,",
-      "  detail TEXT NOT NULL,",
-      "  created_at TEXT NOT NULL,",
-      "  UNIQUE (routine_id, slot_key)",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS app_settings (",
-      "  key TEXT PRIMARY KEY,",
-      "  value TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS push_subscriptions (",
-      "  endpoint TEXT PRIMARY KEY,",
-      "  p256dh TEXT NOT NULL,",
-      "  auth TEXT NOT NULL,",
-      "  user_agent TEXT NOT NULL,",
-      "  created_at TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS approvals (",
-      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
-      "  bot_name TEXT NOT NULL,",
-      "  session_id TEXT NOT NULL,",
-      "  tool_name TEXT NOT NULL,",
-      "  arguments_json TEXT NOT NULL,",
-      "  effect_class TEXT NOT NULL,",
-      "  reason TEXT NOT NULL,",
-      "  status TEXT NOT NULL,",
-      "  result_text TEXT NOT NULL,",
-      "  created_at TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS artifacts (",
-      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
-      "  bot_name TEXT NOT NULL,",
-      "  session_id TEXT NOT NULL,",
-      "  kind TEXT NOT NULL,",
-      "  title TEXT NOT NULL,",
-      "  content TEXT NOT NULL,",
-      "  created_at TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS budget_ledger (",
-      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
-      "  bot_name TEXT NOT NULL,",
-      "  session_id TEXT NOT NULL,",
-      "  input_tokens INT NOT NULL,",
-      "  output_tokens INT NOT NULL,",
-      "  cached_input_tokens INT NOT NULL DEFAULT 0,",
-      "  cost_usd TEXT NOT NULL,",
-      "  created_at TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try ensure_column(db, "budget_ledger", "cached_input_tokens", "INT NOT NULL DEFAULT 0")
-
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS oauth_pending (",
-      "  state TEXT PRIMARY KEY,",
-      "  connector_name TEXT NOT NULL,",
-      "  client_id TEXT NOT NULL,",
-      "  redirect_uri TEXT NOT NULL,",
-      "  code_verifier TEXT NOT NULL,",
-      "  token_endpoint TEXT NOT NULL,",
-      "  resource TEXT NOT NULL,",
-      "  created_at TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS connector_tokens (",
-      "  connector_name TEXT PRIMARY KEY,",
-      "  access_token TEXT NOT NULL,",
-      "  scope TEXT NOT NULL,",
-      "  expires_at TEXT NOT NULL,",
-      "  updated_at TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS vault_secrets (",
-      "  name TEXT PRIMARY KEY,",
-      "  scope TEXT NOT NULL,",
-      "  ciphertext TEXT NOT NULL,",
-      "  updated_at TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  try run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS bot_runs (",
-      "  id TEXT PRIMARY KEY,",
-      "  bot_name TEXT NOT NULL,",
-      "  session_id TEXT NOT NULL,",
-      "  trust TEXT NOT NULL,",
-      "  routine_read_only INT NOT NULL,",
-      "  status TEXT NOT NULL,",
-      "  prompt TEXT NOT NULL,",
-      "  steer_queue_json TEXT NOT NULL,",
-      "  steps INT NOT NULL,",
-      "  spent_usd TEXT NOT NULL,",
-      "  reply TEXT NOT NULL,",
-      "  error TEXT NOT NULL,",
-      "  created_at TEXT NOT NULL,",
-      "  updated_at TEXT NOT NULL",
-      ")"
-    ].join("")
-  )
-  run_ddl(
-    db,
-    [
-      "CREATE TABLE IF NOT EXISTS webhook_configs (",
-      "  source TEXT PRIMARY KEY,",
-      "  target_bot TEXT NOT NULL,",
-      "  secret_name TEXT NOT NULL,",
-      "  enabled INT NOT NULL",
-      ")"
-    ].join("")
-  )
-end
-
-## Seeds the Motet v1 everyday specialist-wall roster (`chief`, `work`, `personal`,
-## `finance`, `researcher`, plus dormant `builder` & `watcher` presets).
-fn seed_defaults(db: Sqlite.Database, now_text: Text) : Result(Unit, MotetError)
-  try init_schema(db)
-  existing = try list_bots(db)
-  if existing.empty?
-    _b1 = try upsert_bot(
-      db,
-      BotConfig(
-        name: "chief",
-        role: "Chief of Staff",
-        persona: "You are Chief, the user's primary Motet teammate. Coordinate walled specialist bots (work, personal, finance, researcher) via read-only delegation for unified morning briefs and daily triage, and route any external writes through the right walled specialist. Keep updates crisp, remember preferences, and escalate only real judgment calls.",
-        is_primary?: true,
-        model_tier: "smart",
-        provider: Anthropic,
-        endpoint: "https://api.anthropic.com/v1/messages",
-        api_key_env: "ANTHROPIC_API_KEY",
-        model: "claude-sonnet-5-5",
-        workspace: ".",
-        allowed_programs: [],
-        allowed_hosts: ["api.anthropic.com:443"],
-        connectors: ["qmd"],
-        read_only_connectors: ["qmd"],
-        daily_budget_usd: 5.00,
-        max_steps: 10,
-        active?: true
-      )
-    )
-    _b2 = try upsert_bot(
-      db,
-      BotConfig(
-        name: "work",
-        role: "Work Executive",
-        persona: "You are Work, the user's strictly walled professional executive assistant. Handle work Gmail triage, reply drafts, work Google Calendar prep, Notion docs/databases, and shareable work Google Docs. Never cross into personal accounts.",
-        is_primary?: false,
-        model_tier: "smart",
-        provider: Anthropic,
-        endpoint: "https://api.anthropic.com/v1/messages",
-        api_key_env: "ANTHROPIC_API_KEY",
-        model: "claude-sonnet-5-5",
-        workspace: ".",
-        allowed_programs: [],
-        allowed_hosts: ["api.anthropic.com:443"],
-        connectors: ["gmail-work", "gcal-work", "notion", "gdocs-work"],
-        read_only_connectors: [],
-        daily_budget_usd: 5.00,
-        max_steps: 10,
-        active?: true
-      )
-    )
-    _b3 = try upsert_bot(
-      db,
-      BotConfig(
-        name: "personal",
-        role: "Personal Life & Vault",
-        persona: "You are Personal, the user's strictly walled personal assistant. Manage personal Gmail, personal Google Calendar, Todoist tasks and reminders, Git-backed personal Markdown notes via qmd, and personal Google Docs.",
-        is_primary?: false,
-        model_tier: "smart",
-        provider: Anthropic,
-        endpoint: "https://api.anthropic.com/v1/messages",
-        api_key_env: "ANTHROPIC_API_KEY",
-        model: "claude-sonnet-5-5",
-        workspace: ".",
-        allowed_programs: ["git"],
-        allowed_hosts: ["api.anthropic.com:443"],
-        connectors: ["gmail-personal", "gcal-personal", "todoist", "qmd", "gdocs-personal"],
-        read_only_connectors: [],
-        daily_budget_usd: 5.00,
-        max_steps: 10,
-        active?: true
-      )
-    )
-    _b4 = try upsert_bot(
-      db,
-      BotConfig(
-        name: "finance",
-        role: "Household Finance",
-        persona: "You are Finance, a strictly walled household finance specialist connected to Hearth Arvo (with live Mercury sync and transactional Undo) and read-only personal Gmail receipt search. Track Safe-to-Spend, envelopes, upcoming paycheck bills, and subscription renewals; propose moves or categorizations clearly for owner approval.",
-        is_primary?: false,
-        model_tier: "gemini_flash",
-        provider: Gemini,
-        endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
-        api_key_env: "GEMINI_API_KEY",
-        model: "gemini-3-flash-preview",
-        workspace: ".",
-        allowed_programs: [],
-        allowed_hosts: ["generativelanguage.googleapis.com:443"],
-        connectors: ["hearth-arvo", "gmail-personal", "qmd"],
-        read_only_connectors: ["gmail-personal"],
-        daily_budget_usd: 3.00,
-        max_steps: 10,
-        active?: true
-      )
-    )
-    _b5 = try upsert_bot(
-      db,
-      BotConfig(
-        name: "researcher",
-        role: "Deep Research & Writing",
-        persona: "You are Researcher, a deep research and long-form synthesis specialist. Search the live web and personal Markdown vault via qmd, produce structured Pages and reports, and prepare clean Google Docs for sharing.",
-        is_primary?: false,
-        model_tier: "gemini_pro",
-        provider: Gemini,
-        endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
-        api_key_env: "GEMINI_API_KEY",
-        model: "gemini-3.1-pro-preview",
-        workspace: ".",
-        allowed_programs: [],
-        allowed_hosts: ["generativelanguage.googleapis.com:443"],
-        connectors: ["qmd", "gdocs-personal", "gdocs-work"],
-        read_only_connectors: [],
-        daily_budget_usd: 6.00,
-        max_steps: 12,
-        active?: true
-      )
-    )
-    # Engineering presets preserved dormant for future re-enablement
-    _b6 = try upsert_bot(
-      db,
-      BotConfig(
-        name: "builder",
-        role: "Software Engineering Lead (Dormant)",
-        persona: "You are Builder, a software engineering lead for isolated T3 Code worktree threads and repo tasks. Currently dormant until re-enabled.",
-        is_primary?: false,
-        model_tier: "opus",
-        provider: Anthropic,
-        endpoint: "https://api.anthropic.com/v1/messages",
-        api_key_env: "ANTHROPIC_API_KEY",
-        model: "claude-opus-5-5",
-        workspace: ".",
-        allowed_programs: ["mo", "git"],
-        allowed_hosts: ["api.anthropic.com:443"],
-        connectors: ["t3code"],
-        read_only_connectors: [],
-        daily_budget_usd: 10.00,
-        max_steps: 14,
-        active?: false
-      )
-    )
-    _b7 = try upsert_bot(
-      db,
-      BotConfig(
-        name: "watcher",
-        role: "Engineering Monitor (Dormant)",
-        persona: "You are Watcher, a fast read-only sentinel for projects, PRs, CI, and T3 Code threads. Currently dormant until re-enabled.",
-        is_primary?: false,
-        model_tier: "fast",
-        provider: Anthropic,
-        endpoint: "https://api.anthropic.com/v1/messages",
-        api_key_env: "ANTHROPIC_API_KEY",
-        model: "claude-haiku-5-5",
-        workspace: ".",
-        allowed_programs: ["git", "mo"],
-        allowed_hosts: ["api.anthropic.com:443"],
-        connectors: ["t3code"],
-        read_only_connectors: ["t3code"],
-        daily_budget_usd: 2.00,
-        max_steps: 8,
-        active?: false
-      )
-    )
-  end
-
-  conns = try list_connectors(db)
-  if conns.empty?
-    _c_qmd = try upsert_connector(
-      db,
-      ConnectorSpec(
-        name: "qmd",
-        kind: "mcp_stateless",
-        url: "http://127.0.0.1:8181/mcp",
-        auth_env: "",
-        allowed_host: "127.0.0.1:8181",
-        default_effect: Read,
-        enabled?: true
-      )
-    )
-    _c_gw = try upsert_connector(
-      db,
-      ConnectorSpec(
-        name: "gmail-work",
-        kind: "google_gmail",
-        url: "https://gmail.googleapis.com/gmail/v1",
-        auth_env: "GMAIL_WORK_TOKEN",
-        allowed_host: "gmail.googleapis.com:443",
-        default_effect: WriteExternal,
-        enabled?: false
-      )
-    )
-    _c_cw = try upsert_connector(
-      db,
-      ConnectorSpec(
-        name: "gcal-work",
-        kind: "google_gcal",
-        url: "https://www.googleapis.com/calendar/v3",
-        auth_env: "GCAL_WORK_TOKEN",
-        allowed_host: "www.googleapis.com:443",
-        default_effect: WriteExternal,
-        enabled?: false
-      )
-    )
-    _c_dw = try upsert_connector(
-      db,
-      ConnectorSpec(
-        name: "gdocs-work",
-        kind: "google_gdocs",
-        url: "https://docs.googleapis.com/v1",
-        auth_env: "GDOCS_WORK_TOKEN",
-        allowed_host: "docs.googleapis.com:443",
-        default_effect: WriteExternal,
-        enabled?: false
-      )
-    )
-    _c_notion = try upsert_connector(
-      db,
-      ConnectorSpec(
-        name: "notion",
-        kind: "mcp_http",
-        url: "https://mcp.notion.com/mcp",
-        auth_env: "NOTION_TOKEN",
-        allowed_host: "mcp.notion.com:443",
-        default_effect: WriteExternal,
-        enabled?: false
-      )
-    )
-    _c_gp = try upsert_connector(
-      db,
-      ConnectorSpec(
-        name: "gmail-personal",
-        kind: "google_gmail",
-        url: "https://gmail.googleapis.com/gmail/v1",
-        auth_env: "GMAIL_PERSONAL_TOKEN",
-        allowed_host: "gmail.googleapis.com:443",
-        default_effect: WriteExternal,
-        enabled?: false
-      )
-    )
-    _c_cp = try upsert_connector(
-      db,
-      ConnectorSpec(
-        name: "gcal-personal",
-        kind: "google_gcal",
-        url: "https://www.googleapis.com/calendar/v3",
-        auth_env: "GCAL_PERSONAL_TOKEN",
-        allowed_host: "www.googleapis.com:443",
-        default_effect: WriteExternal,
-        enabled?: false
-      )
-    )
-    _c_dp = try upsert_connector(
-      db,
-      ConnectorSpec(
-        name: "gdocs-personal",
-        kind: "google_gdocs",
-        url: "https://docs.googleapis.com/v1",
-        auth_env: "GDOCS_PERSONAL_TOKEN",
-        allowed_host: "docs.googleapis.com:443",
-        default_effect: WriteExternal,
-        enabled?: false
-      )
-    )
-    _c_td = try upsert_connector(
-      db,
-      ConnectorSpec(
-        name: "todoist",
-        kind: "todoist",
-        url: "https://api.todoist.com/api/v1",
-        auth_env: "TODOIST_API_TOKEN",
-        allowed_host: "api.todoist.com:443",
-        default_effect: WriteExternal,
-        enabled?: false
-      )
-    )
-    _c_ha = try upsert_connector(
-      db,
-      ConnectorSpec(
-        name: "hearth-arvo",
-        kind: "hearth_arvo",
-        url: "https://hearth.exe.xyz/api/v1/agent",
-        auth_env: "HEARTH_API_TOKEN",
-        allowed_host: "hearth.exe.xyz:443",
-        default_effect: WriteExternal,
-        enabled?: false
-      )
-    )
-    _c_t3 = try upsert_connector(
-      db,
-      ConnectorSpec(
-        name: "t3code",
-        kind: "mcp_http",
-        url: "http://127.0.0.1:3773/mcp",
-        auth_env: "T3_MCP_TOKEN",
-        allowed_host: "127.0.0.1:3773",
-        default_effect: WriteExternal,
-        enabled?: false
-      )
-    )
-  end
-
-  routines = try list_routines(db)
-  if routines.empty?
-    _r1 = try upsert_routine_full(
-      db,
-      "chief",
-      "morning-brief",
-      "Coordinate read-only summaries from work, personal, and finance for today's calendar, urgent emails, due Todoist items, and Hearth Arvo Safe-to-Spend + upcoming bills. Deliver one crisp morning brief.",
-      86400,
-      "weekdays",
-      "07:30",
-      "America/Los_Angeles",
-      true,
-      true,
-      "",
-      now_text
-    )
-    _r2 = try upsert_routine_full(
-      db,
-      "chief",
-      "evening-wrap",
-      "Summarize today's completed items, pending Needs-You drafts, tomorrow's first meeting, and any overdue Todoist tasks in 5 concise bullets.",
-      86400,
-      "weekdays",
-      "18:00",
-      "America/Los_Angeles",
-      true,
-      true,
-      "",
-      now_text
-    )
-    _r3 = try upsert_routine_full(
-      db,
-      "finance",
-      "receipt-renewal-sweep",
-      "Check recent Mercury transactions in Hearth Arvo and read-only personal Gmail receipts for upcoming subscription renewals or unusual charges. Queue any proposed envelope moves for approval; stay quiet if nothing changed.",
-      86400,
-      "daily",
-      "21:30",
-      "America/Los_Angeles",
-      true,
-      true,
-      "unread_events",
-      now_text
-    )
-    _r4 = try upsert_routine_full(
-      db,
-      "chief",
-      "weekly-self-audit",
-      "Run the weekly anti-job self-audit: review routine run/skip noise ratio, unused bot-proposed skills, and repeated approval tools that could become narrow Allow rules. Deliver one concise Sunday scorecard.",
-      604800,
-      "weekly",
-      "sun@19:00",
-      "America/Los_Angeles",
-      true,
-      true,
-      "",
-      now_text
-    )
-  end
-  Ok(Unit)
-end
-
-fn decode_text_list(raw: Text) : List(Text)
-  case Json.decode[List(Text)](raw)
-    Ok(items): items
-    Error(_): []
-  end
-end
-
-fn row_to_bot(r: List(Sqlite.Value)) : BotConfig
-  BotConfig(
-    name: cell_str(r, 0),
-    role: cell_str(r, 1),
-    persona: cell_str(r, 2),
-    is_primary?: cell_bool(r, 3),
-    model_tier: cell_str(r, 4),
-    provider: provider_from_text(cell_str(r, 5)),
-    endpoint: cell_str(r, 6),
-    api_key_env: cell_str(r, 7),
-    model: cell_str(r, 8),
-    workspace: cell_str(r, 9),
-    allowed_programs: decode_text_list(cell_str(r, 10)),
-    allowed_hosts: decode_text_list(cell_str(r, 11)),
-    connectors: decode_text_list(cell_str(r, 12)),
-    read_only_connectors: decode_text_list(cell_str(r, 13)),
-    daily_budget_usd: cell_decimal(r, 14),
-    max_steps: cell_int(r, 15),
-    active?: cell_bool(r, 16)
-  )
-end
-
-bot_select_cols = "name, role, persona, is_primary, model_tier, provider, endpoint, api_key_env, model, workspace, allowed_programs_json, allowed_hosts_json, connectors_json, read_only_connectors_json, daily_budget_usd, max_steps, active"
-
-fn upsert_bot(db: Sqlite.Database, bot: BotConfig) : Result(BotConfig, MotetError)
-  try db.run(
-    [
-      "INSERT INTO bots (name, role, persona, is_primary, model_tier, provider, endpoint, ",
-      "api_key_env, model, workspace, allowed_programs_json, allowed_hosts_json, ",
-      "connectors_json, read_only_connectors_json, daily_budget_usd, max_steps, active) ",
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ",
-      "ON CONFLICT(name) DO UPDATE SET role = excluded.role, persona = excluded.persona, ",
-      "is_primary = excluded.is_primary, model_tier = excluded.model_tier, ",
-      "provider = excluded.provider, endpoint = excluded.endpoint, ",
-      "api_key_env = excluded.api_key_env, model = excluded.model, workspace = excluded.workspace, ",
-      "allowed_programs_json = excluded.allowed_programs_json, ",
-      "allowed_hosts_json = excluded.allowed_hosts_json, connectors_json = excluded.connectors_json, ",
-      "read_only_connectors_json = excluded.read_only_connectors_json, ",
-      "daily_budget_usd = excluded.daily_budget_usd, max_steps = excluded.max_steps, ",
-      "active = excluded.active"
-    ].join(""),
-    [
-      Sqlite.String(bot.name),
-      Sqlite.String(bot.role),
-      Sqlite.String(bot.persona),
-      Sqlite.Integer(if bot.is_primary?: 1 else: 0),
-      Sqlite.String(bot.model_tier),
-      Sqlite.String(provider_to_text(bot.provider)),
-      Sqlite.String(bot.endpoint),
-      Sqlite.String(bot.api_key_env),
-      Sqlite.String(bot.model),
-      Sqlite.String(bot.workspace),
-      Sqlite.String(Json.encode(bot.allowed_programs)),
-      Sqlite.String(Json.encode(bot.allowed_hosts)),
-      Sqlite.String(Json.encode(bot.connectors)),
-      Sqlite.String(Json.encode(bot.read_only_connectors)),
-      Sqlite.String(bot.daily_budget_usd.to_fixed(6)),
-      Sqlite.Integer(bot.max_steps),
-      Sqlite.Integer(if bot.active?: 1 else: 0)
-    ]
-  ).map_error(db_err)
-  Ok(bot)
-end
-
-fn get_bot(db: Sqlite.Database, name: Text) : Result(Option(BotConfig), MotetError)
-  rows = try db.query("SELECT #{bot_select_cols} FROM bots WHERE name = ?", [Sqlite.String(name)])
-    .map_error(db_err)
-  Ok(rows.rows.first.map(fn(r) row_to_bot(r) end))
-end
-
-fn list_bots(db: Sqlite.Database) : Result(List(BotConfig), MotetError)
-  rows = try db.query(
-    "SELECT #{bot_select_cols} FROM bots ORDER BY active DESC, is_primary DESC, name ASC",
-    []
-  ).map_error(db_err)
-  Ok(rows.rows.map(fn(r) row_to_bot(r) end))
-end
-
-fn set_bot_active(db: Sqlite.Database, name: Text, active_opt: Option(Bool)) : Result(
-  BotConfig,
-  MotetError
+fn tx_delete_tokens(tx: WriteTx, bucket: Text, tokens: List(Text), id: Int) : Result(
+  WriteTx,
+  TableError
 )
-  cur = try (try get_bot(db, name)).or_fail(ItemNotFound(message: "unknown bot: #{name}"))
-  next_act = case active_opt
+  var cur = tx
+  for tok in tokens
+    cur = try Modb.tx_delete(cur, bucket, token_index_key(tok, id)).map_error(fn(e)
+      Table.Storage(e)
+    end)
+  end
+  Ok(cur)
+end
+
+fn scan_token_ids_desc(store: Modb.Store, bucket: Text, tok: Text) : Result(List(Int), TableError)
+  pairs = try Modb.prefix_scan(store, bucket, token_prefix(tok), 0).map_error(fn(e)
+    Table.Storage(e)
+  end)
+  var ids = []
+  for (comp, _val) in pairs
+    (_ik, pk) = try Table.decode_composite_key(comp)
+    id = try Table.decode_int_key(pk)
+    ids = ids.append(id)
+  end
+  Ok(ids.reverse)
+end
+
+fn tx_next_id(tx: WriteTx, seq_name: Text) : Result((WriteTx, Int), TableError)
+  tbl = seqs_table()
+  cur = (try Table.tx_get(tx, tbl, seq_name)) or 0
+  next = cur + 1
+  t1 = try Table.put(tx, tbl, seq_name, next)
+  Ok((t1, next))
+end
+
+fn json_arg_err(e: Json.JsonDecodeError) : Text
+  "bad_input: #{e.to_text}"
+end
+
+fn reply_decode_err(e: Json.JsonDecodeError) : MotetError
+  StorageFailed(message: "replay reply decode failed: #{e.to_text}")
+end
+
+fn wrap_t(res: Result(T, TableError)) : Result(T, Text)
+  res.map_error(fn(e) e.to_text end)
+end
+
+fn utc_day_prefix(ts: Text) : Text
+  Text.from_chars(ts.chars.take(10))
+end
+
+## Schema v1 with commit-time invariants across Motet's persistent state.
+fn motet_schema() : Schema
+  Ledger.schema(1).with_require_reason(true).with_migration(
+    Ledger.migration(1, "initialize motet v1 schema", fn(tx) Ok(tx) end)
+  ).with_invariant(
+    Ledger.row_invariant(
+      "bots_valid",
+      bots_table(),
+      fn(k, b)
+        if b.name.trim.empty?
+          Some("bot '#{k}' name cannot be empty")
+        else if b.daily_budget_usd < 0.0
+          Some("bot '#{k}' daily_budget_usd cannot be negative")
+        else if b.max_steps <= 0 or b.max_steps > 64
+          Some("bot '#{k}' max_steps must be in 1..64")
+        else
+          None
+        end
+      end
+    )
+  ).with_invariant(
+    Ledger.row_invariant(
+      "routines_valid",
+      routines_table(),
+      fn(id, r)
+        if r.bot_name.trim.empty? or r.name.trim.empty?
+          Some("routine ##{id} bot_name and name required")
+        else if r.interval_seconds < 10
+          Some("routine ##{id} interval_seconds must be >= 10")
+        else
+          None
+        end
+      end
+    )
+  ).with_invariant(
+    Ledger.row_invariant(
+      "budget_ledger_non_negative",
+      budget_ledger_table(),
+      fn(id, r)
+        if r.cost_usd < 0.0 or r.input_tokens < 0 or r.output_tokens < 0 or r.cached_input_tokens < 0
+          Some("budget_ledger ##{id} values must be non-negative")
+        else
+          None
+        end
+      end
+    )
+  ).with_invariant(
+    Ledger.row_invariant(
+      "memories_non_empty",
+      memories_table(),
+      fn(id, m)
+        if m.scope.trim.empty? or m.content.trim.empty?
+          Some("memory ##{id} scope and content cannot be empty")
+        else
+          None
+        end
+      end
+    )
+  )
+end
+
+## Phase 1-4 everyday starter bots, connectors, and routines.
+fn starter_bots() : List(BotConfig)
+  [
+    BotConfig(
+      name: "chief",
+      role: "Chief of Staff",
+      persona: "You are Chief, the user's primary Motet teammate. Coordinate walled specialist bots (work, personal, finance, researcher) via read-only delegation for unified morning briefs and daily triage, and route any external writes through the right walled specialist. Keep updates crisp, remember preferences, and escalate only real judgment calls.",
+      is_primary?: true,
+      model_tier: "smart",
+      provider: Anthropic,
+      endpoint: "https://api.anthropic.com/v1/messages",
+      api_key_env: "ANTHROPIC_API_KEY",
+      model: "claude-sonnet-5-5",
+      workspace: ".",
+      allowed_programs: [],
+      allowed_hosts: ["api.anthropic.com:443"],
+      connectors: ["qmd"],
+      read_only_connectors: ["qmd"],
+      daily_budget_usd: 5.00,
+      max_steps: 10,
+      active?: true
+    ),
+    BotConfig(
+      name: "work",
+      role: "Work Executive",
+      persona: "You are Work, the user's strictly walled professional executive assistant. Handle work Gmail triage, reply drafts, work Google Calendar prep, Notion docs/databases, and shareable work Google Docs. Never cross into personal accounts.",
+      is_primary?: false,
+      model_tier: "smart",
+      provider: Anthropic,
+      endpoint: "https://api.anthropic.com/v1/messages",
+      api_key_env: "ANTHROPIC_API_KEY",
+      model: "claude-sonnet-5-5",
+      workspace: ".",
+      allowed_programs: [],
+      allowed_hosts: ["api.anthropic.com:443"],
+      connectors: ["gmail-work", "gcal-work", "notion", "gdocs-work"],
+      read_only_connectors: [],
+      daily_budget_usd: 5.00,
+      max_steps: 10,
+      active?: true
+    ),
+    BotConfig(
+      name: "personal",
+      role: "Personal Life & Vault",
+      persona: "You are Personal, the user's strictly walled personal assistant. Manage personal Gmail, personal Google Calendar, Todoist tasks and reminders, Git-backed personal Markdown notes via qmd, and personal Google Docs.",
+      is_primary?: false,
+      model_tier: "smart",
+      provider: Anthropic,
+      endpoint: "https://api.anthropic.com/v1/messages",
+      api_key_env: "ANTHROPIC_API_KEY",
+      model: "claude-sonnet-5-5",
+      workspace: ".",
+      allowed_programs: ["git"],
+      allowed_hosts: ["api.anthropic.com:443"],
+      connectors: ["gmail-personal", "gcal-personal", "todoist", "qmd", "gdocs-personal"],
+      read_only_connectors: [],
+      daily_budget_usd: 5.00,
+      max_steps: 10,
+      active?: true
+    ),
+    BotConfig(
+      name: "finance",
+      role: "Household Finance",
+      persona: "You are Finance, a strictly walled household finance specialist connected to Hearth Arvo (with live Mercury sync and transactional Undo) and read-only personal Gmail receipt search. Track Safe-to-Spend, envelopes, upcoming paycheck bills, and subscription renewals; propose moves or categorizations clearly for owner approval.",
+      is_primary?: false,
+      model_tier: "gemini_flash",
+      provider: Gemini,
+      endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
+      api_key_env: "GEMINI_API_KEY",
+      model: "gemini-3-flash-preview",
+      workspace: ".",
+      allowed_programs: [],
+      allowed_hosts: ["generativelanguage.googleapis.com:443"],
+      connectors: ["hearth-arvo", "gmail-personal", "qmd"],
+      read_only_connectors: ["gmail-personal"],
+      daily_budget_usd: 3.00,
+      max_steps: 10,
+      active?: true
+    ),
+    BotConfig(
+      name: "researcher",
+      role: "Deep Research & Writing",
+      persona: "You are Researcher, a deep research and long-form synthesis specialist. Search the live web and personal Markdown vault via qmd, produce structured Pages and reports, and prepare clean Google Docs for sharing.",
+      is_primary?: false,
+      model_tier: "gemini_pro",
+      provider: Gemini,
+      endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
+      api_key_env: "GEMINI_API_KEY",
+      model: "gemini-3.1-pro-preview",
+      workspace: ".",
+      allowed_programs: [],
+      allowed_hosts: ["generativelanguage.googleapis.com:443"],
+      connectors: ["qmd", "gdocs-personal", "gdocs-work"],
+      read_only_connectors: [],
+      daily_budget_usd: 6.00,
+      max_steps: 12,
+      active?: true
+    ),
+    BotConfig(
+      name: "builder",
+      role: "Software Engineering Lead (Dormant)",
+      persona: "You are Builder, a software engineering lead for isolated T3 Code worktree threads and repo tasks. Currently dormant until re-enabled.",
+      is_primary?: false,
+      model_tier: "opus",
+      provider: Anthropic,
+      endpoint: "https://api.anthropic.com/v1/messages",
+      api_key_env: "ANTHROPIC_API_KEY",
+      model: "claude-opus-5-5",
+      workspace: ".",
+      allowed_programs: ["mo", "git"],
+      allowed_hosts: ["api.anthropic.com:443"],
+      connectors: ["t3code"],
+      read_only_connectors: [],
+      daily_budget_usd: 10.00,
+      max_steps: 14,
+      active?: false
+    ),
+    BotConfig(
+      name: "watcher",
+      role: "Engineering Monitor (Dormant)",
+      persona: "You are Watcher, a fast read-only sentinel for projects, PRs, CI, and T3 Code threads. Currently dormant until re-enabled.",
+      is_primary?: false,
+      model_tier: "fast",
+      provider: Anthropic,
+      endpoint: "https://api.anthropic.com/v1/messages",
+      api_key_env: "ANTHROPIC_API_KEY",
+      model: "claude-haiku-5-5",
+      workspace: ".",
+      allowed_programs: ["git", "mo"],
+      allowed_hosts: ["api.anthropic.com:443"],
+      connectors: ["t3code"],
+      read_only_connectors: ["t3code"],
+      daily_budget_usd: 2.00,
+      max_steps: 8,
+      active?: false
+    )
+  ]
+end
+
+fn starter_connectors() : List(ConnectorSpec)
+  [
+    ConnectorSpec(
+      name: "qmd",
+      kind: "mcp_stateless",
+      url: "http://127.0.0.1:8181/mcp",
+      auth_env: "",
+      allowed_host: "127.0.0.1:8181",
+      default_effect: Read,
+      enabled?: true
+    ),
+    ConnectorSpec(
+      name: "gmail-work",
+      kind: "google_gmail",
+      url: "https://gmail.googleapis.com/gmail/v1",
+      auth_env: "GMAIL_WORK_TOKEN",
+      allowed_host: "gmail.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "gcal-work",
+      kind: "google_gcal",
+      url: "https://www.googleapis.com/calendar/v3",
+      auth_env: "GCAL_WORK_TOKEN",
+      allowed_host: "www.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "gdocs-work",
+      kind: "google_gdocs",
+      url: "https://docs.googleapis.com/v1",
+      auth_env: "GDOCS_WORK_TOKEN",
+      allowed_host: "docs.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "notion",
+      kind: "mcp_http",
+      url: "https://mcp.notion.com/mcp",
+      auth_env: "NOTION_TOKEN",
+      allowed_host: "mcp.notion.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "gmail-personal",
+      kind: "google_gmail",
+      url: "https://gmail.googleapis.com/gmail/v1",
+      auth_env: "GMAIL_PERSONAL_TOKEN",
+      allowed_host: "gmail.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "gcal-personal",
+      kind: "google_gcal",
+      url: "https://www.googleapis.com/calendar/v3",
+      auth_env: "GCAL_PERSONAL_TOKEN",
+      allowed_host: "www.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "gdocs-personal",
+      kind: "google_gdocs",
+      url: "https://docs.googleapis.com/v1",
+      auth_env: "GDOCS_PERSONAL_TOKEN",
+      allowed_host: "docs.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "todoist",
+      kind: "todoist",
+      url: "https://api.todoist.com/api/v1",
+      auth_env: "TODOIST_API_TOKEN",
+      allowed_host: "api.todoist.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "hearth-arvo",
+      kind: "hearth_arvo",
+      url: "https://hearth.exe.xyz/api/v1/agent",
+      auth_env: "HEARTH_API_TOKEN",
+      allowed_host: "hearth.exe.xyz:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "t3code",
+      kind: "mcp_http",
+      url: "http://127.0.0.1:3773/mcp",
+      auth_env: "T3_MCP_TOKEN",
+      allowed_host: "127.0.0.1:3773",
+      default_effect: WriteExternal,
+      enabled?: false
+    )
+  ]
+end
+
+fn starter_routines(now_text: Text) : List(UpsertRoutineArgs)
+  [
+    UpsertRoutineArgs(
+      bot_name: "chief",
+      name: "morning-brief",
+      prompt: "Coordinate read-only summaries from work, personal, and finance for today's calendar, urgent emails, due Todoist items, and Hearth Arvo Safe-to-Spend + upcoming bills. Deliver one crisp morning brief.",
+      interval_seconds: 86400,
+      schedule_kind: "weekdays",
+      schedule_expr: "07:30",
+      timezone: "America/Los_Angeles",
+      read_only: true,
+      skip_memory: true,
+      precheck_kind: "",
+      next_due_at: now_text
+    ),
+    UpsertRoutineArgs(
+      bot_name: "chief",
+      name: "evening-wrap",
+      prompt: "Summarize today's completed items, pending Needs-You drafts, tomorrow's first meeting, and any overdue Todoist tasks in 5 concise bullets.",
+      interval_seconds: 86400,
+      schedule_kind: "weekdays",
+      schedule_expr: "18:00",
+      timezone: "America/Los_Angeles",
+      read_only: true,
+      skip_memory: true,
+      precheck_kind: "",
+      next_due_at: now_text
+    ),
+    UpsertRoutineArgs(
+      bot_name: "finance",
+      name: "receipt-renewal-sweep",
+      prompt: "Check recent Mercury transactions in Hearth Arvo and read-only personal Gmail receipts for upcoming subscription renewals or unusual charges. Queue any proposed envelope moves for approval; stay quiet if nothing changed.",
+      interval_seconds: 86400,
+      schedule_kind: "daily",
+      schedule_expr: "21:30",
+      timezone: "America/Los_Angeles",
+      read_only: true,
+      skip_memory: true,
+      precheck_kind: "unread_events",
+      next_due_at: now_text
+    ),
+    UpsertRoutineArgs(
+      bot_name: "chief",
+      name: "weekly-self-audit",
+      prompt: "Run the weekly anti-job self-audit: review routine run/skip noise ratio, unused bot-proposed skills, and repeated approval tools that could become narrow Allow rules. Deliver one concise Sunday scorecard.",
+      interval_seconds: 604800,
+      schedule_kind: "weekly",
+      schedule_expr: "sun@19:00",
+      timezone: "America/Los_Angeles",
+      read_only: true,
+      skip_memory: true,
+      precheck_kind: "",
+      next_due_at: now_text
+    )
+  ]
+end
+
+## Replay action implementations (every mutation to `motet.modb` domain buckets flows here).
+fn tx_upsert_routine_inner(tx: WriteTx, a: UpsertRoutineArgs) : Result((WriteTx, RoutineSpec), Text)
+  tbl = routines_table()
+  idx = routines_by_bot_name_index()
+  secs = if a.interval_seconds >= 10: a.interval_seconds else: 60
+  sk = if a.schedule_kind.trim.empty?: "interval" else: a.schedule_kind.trim.ascii_lowercase
+  tz = if a.timezone.trim.empty?: "America/Los_Angeles" else: a.timezone.trim
+  comp_key = "#{a.bot_name}\u{1f}#{a.name}"
+  case try wrap_t(Table.tx_lookup_unique(tx, tbl, idx, comp_key))
+    Some((_k, existing)):
+      next_r = RoutineSpec(
+        id: existing.id,
+        bot_name: a.bot_name,
+        name: a.name,
+        prompt: a.prompt,
+        interval_seconds: secs,
+        schedule_kind: sk,
+        schedule_expr: a.schedule_expr.trim,
+        timezone: tz,
+        read_only?: a.read_only,
+        skip_memory?: a.skip_memory,
+        precheck_kind: a.precheck_kind.trim,
+        enabled?: true,
+        next_due_at: a.next_due_at,
+        last_run_at: existing.last_run_at,
+        run_count: existing.run_count,
+        skip_count: existing.skip_count
+      )
+      t1 = try wrap_t(Table.put(tx, tbl, next_r.id, next_r))
+      Ok((t1, next_r))
+    None:
+      (t1, id) = try wrap_t(tx_next_id(tx, "routines"))
+      next_r = RoutineSpec(
+        id: id,
+        bot_name: a.bot_name,
+        name: a.name,
+        prompt: a.prompt,
+        interval_seconds: secs,
+        schedule_kind: sk,
+        schedule_expr: a.schedule_expr.trim,
+        timezone: tz,
+        read_only?: a.read_only,
+        skip_memory?: a.skip_memory,
+        precheck_kind: a.precheck_kind.trim,
+        enabled?: true,
+        next_due_at: a.next_due_at,
+        last_run_at: None,
+        run_count: 0,
+        skip_count: 0
+      )
+      t2 = try wrap_t(Table.put(t1, tbl, id, next_r))
+      Ok((t2, next_r))
+  end
+end
+
+fn action_seed_defaults(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[SeedDefaultsArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  var cur_tx = tx
+  btbl = bots_table()
+  existing_bots = try wrap_t(Table.tx_scan(cur_tx, btbl, None, None, 1))
+  if existing_bots.empty?
+    for b in starter_bots()
+      cur_tx = try wrap_t(Table.put(cur_tx, btbl, b.name, b))
+    end
+  end
+
+  ctbl = connectors_table()
+  existing_conns = try wrap_t(Table.tx_scan(cur_tx, ctbl, None, None, 1))
+  if existing_conns.empty?
+    for c in starter_connectors()
+      cur_tx = try wrap_t(Table.put(cur_tx, ctbl, c.name, c))
+    end
+  end
+
+  rtbl = routines_table()
+  existing_routines = try wrap_t(Table.tx_scan(cur_tx, rtbl, None, None, 1))
+  if existing_routines.empty?
+    for ra in starter_routines(a.now_text)
+      (t_r, _r) = try tx_upsert_routine_inner(cur_tx, ra)
+      cur_tx = t_r
+    end
+  end
+
+  cur_tx = try wrap_t(Table.put(cur_tx, seqs_table(), "_seeded", 1))
+  Ok((cur_tx, Json.Object({"seeded": Json.Boolean(true)})))
+end
+
+fn action_upsert_bot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  bot = try Json.decode[BotConfig](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.put(tx, bots_table(), bot.name, bot))
+  Ok((t1, bot.to_json))
+end
+
+fn action_set_bot_active(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[ToggleNameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bots_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.name))).or_fail(
+    "item_not_found: unknown bot: #{a.name}"
+  )
+  next_act = case a.enabled
     Some(v): v
     None: not cur.active?
   end
-  try db.run(
-    "UPDATE bots SET active = ? WHERE name = ?",
-    [Sqlite.Integer(if next_act: 1 else: 0), Sqlite.String(name)]
-  ).map_error(db_err)
-  Ok(
-    BotConfig(
-      name: cur.name,
-      role: cur.role,
-      persona: cur.persona,
-      is_primary?: cur.is_primary?,
-      model_tier: cur.model_tier,
-      provider: cur.provider,
-      endpoint: cur.endpoint,
-      api_key_env: cur.api_key_env,
-      model: cur.model,
-      workspace: cur.workspace,
-      allowed_programs: cur.allowed_programs,
-      allowed_hosts: cur.allowed_hosts,
-      connectors: cur.connectors,
-      read_only_connectors: cur.read_only_connectors,
-      daily_budget_usd: cur.daily_budget_usd,
-      max_steps: cur.max_steps,
-      active?: next_act
-    )
+  updated = BotConfig(
+    name: cur.name,
+    role: cur.role,
+    persona: cur.persona,
+    is_primary?: cur.is_primary?,
+    model_tier: cur.model_tier,
+    provider: cur.provider,
+    endpoint: cur.endpoint,
+    api_key_env: cur.api_key_env,
+    model: cur.model,
+    workspace: cur.workspace,
+    allowed_programs: cur.allowed_programs,
+    allowed_hosts: cur.allowed_hosts,
+    connectors: cur.connectors,
+    read_only_connectors: cur.read_only_connectors,
+    daily_budget_usd: cur.daily_budget_usd,
+    max_steps: cur.max_steps,
+    active?: next_act
   )
+  t1 = try wrap_t(Table.put(tx, tbl, updated.name, updated))
+  Ok((t1, updated.to_json))
 end
 
-fn clone_bot(
-  db: Sqlite.Database,
-  source_name: Text,
-  new_name: Text,
-  role_opt: Option(Text),
-  persona_opt: Option(Text),
-  connectors_opt: Option(List(Text)),
-  ro_connectors_opt: Option(List(Text))
-) : Result(BotConfig, MotetError)
-  clean_new = new_name.trim
-  return Error(BadInput(message: "new_name cannot be empty")) if clean_new.empty?
-  src = try (try get_bot(db, source_name)).or_fail(
-    ItemNotFound(message: "unknown source bot: #{source_name}")
+fn action_clone_bot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[CloneBotArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  clean_new = a.new_name.trim
+  return Error("bad_input: new_name cannot be empty") if clean_new.empty?
+  tbl = bots_table()
+  src = try (try wrap_t(Table.tx_get(tx, tbl, a.source_name))).or_fail(
+    "item_not_found: unknown source bot: #{a.source_name}"
   )
-  if (try get_bot(db, clean_new)) is Some(_)
-    return Error(Conflict(message: "bot '#{clean_new}' already exists"))
+  if (try wrap_t(Table.tx_get(tx, tbl, clean_new))) is Some(_)
+    return Error("conflict: bot '#{clean_new}' already exists")
   end
   cloned = BotConfig(
     name: clean_new,
-    role: role_opt or src.role,
-    persona: persona_opt or src.persona,
+    role: a.role or src.role,
+    persona: a.persona or src.persona,
     is_primary?: false,
     model_tier: src.model_tier,
     provider: src.provider,
@@ -1087,196 +1480,1858 @@ fn clone_bot(
     workspace: src.workspace,
     allowed_programs: src.allowed_programs,
     allowed_hosts: src.allowed_hosts,
-    connectors: connectors_opt or src.connectors,
-    read_only_connectors: ro_connectors_opt or src.read_only_connectors,
+    connectors: a.connectors or src.connectors,
+    read_only_connectors: a.read_only_connectors or src.read_only_connectors,
     daily_budget_usd: src.daily_budget_usd,
     max_steps: src.max_steps,
     active?: true
   )
-  upsert_bot(db, cloned)
+  t1 = try wrap_t(Table.put(tx, tbl, cloned.name, cloned))
+  Ok((t1, cloned.to_json))
 end
 
-fn delete_bot(db: Sqlite.Database, name: Text) : Result(Unit, MotetError)
-  cur = try (try get_bot(db, name)).or_fail(ItemNotFound(message: "unknown bot: #{name}"))
+fn action_delete_bot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[NameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bots_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.name))).or_fail(
+    "item_not_found: unknown bot: #{a.name}"
+  )
   if cur.is_primary?
-    return Error(Conflict(message: "cannot delete primary bot '#{name}'"))
+    return Error("conflict: cannot delete primary bot '#{a.name}'")
   end
-  db.run("DELETE FROM bots WHERE name = ?", [Sqlite.String(name)]).map_error(db_err)
+  t1 = try wrap_t(Table.delete(tx, tbl, a.name))
+  Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
 end
 
-fn row_to_connector(r: List(Sqlite.Value)) : ConnectorSpec
-  ConnectorSpec(
-    name: cell_str(r, 0),
-    kind: cell_str(r, 1),
-    url: cell_str(r, 2),
-    auth_env: cell_str(r, 3),
-    allowed_host: cell_str(r, 4),
-    default_effect: effect_from_text(cell_str(r, 5)),
-    enabled?: cell_bool(r, 6)
+fn action_upsert_connector(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  spec = try Json.decode[ConnectorSpec](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.put(tx, connectors_table(), spec.name, spec))
+  Ok((t1, spec.to_json))
+end
+
+fn action_set_connector_enabled(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[ToggleNameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = connectors_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.name))).or_fail(
+    "item_not_found: connector not found: #{a.name}"
   )
-end
-
-fn upsert_connector(db: Sqlite.Database, spec: ConnectorSpec) : Result(ConnectorSpec, MotetError)
-  try db.run(
-    [
-      "INSERT INTO connectors (name, kind, url, auth_env, allowed_host, default_effect, enabled) ",
-      "VALUES (?, ?, ?, ?, ?, ?, ?) ",
-      "ON CONFLICT(name) DO UPDATE SET kind = excluded.kind, url = excluded.url, ",
-      "auth_env = excluded.auth_env, allowed_host = excluded.allowed_host, ",
-      "default_effect = excluded.default_effect, enabled = excluded.enabled"
-    ].join(""),
-    [
-      Sqlite.String(spec.name),
-      Sqlite.String(spec.kind),
-      Sqlite.String(spec.url),
-      Sqlite.String(spec.auth_env),
-      Sqlite.String(spec.allowed_host),
-      Sqlite.String(effect_to_text(spec.default_effect)),
-      Sqlite.Integer(if spec.enabled?: 1 else: 0)
-    ]
-  ).map_error(db_err)
-  Ok(spec)
-end
-
-fn get_connector(db: Sqlite.Database, name: Text) : Result(Option(ConnectorSpec), MotetError)
-  rows = try db.query(
-    "SELECT name, kind, url, auth_env, allowed_host, default_effect, enabled FROM connectors WHERE name = ?",
-    [Sqlite.String(name)]
-  ).map_error(db_err)
-  Ok(rows.rows.first.map(fn(r) row_to_connector(r) end))
-end
-
-fn list_connectors(db: Sqlite.Database) : Result(List(ConnectorSpec), MotetError)
-  rows = try db.query(
-    "SELECT name, kind, url, auth_env, allowed_host, default_effect, enabled FROM connectors ORDER BY name ASC",
-    []
-  ).map_error(db_err)
-  Ok(rows.rows.map(fn(r) row_to_connector(r) end))
-end
-
-fn set_connector_enabled(db: Sqlite.Database, name: Text, enabled_opt: Option(Bool)) : Result(
-  ConnectorSpec,
-  MotetError
-)
-  cur = try (try get_connector(db, name)).or_fail(
-    ItemNotFound(message: "connector not found: #{name}")
-  )
-  next_en = case enabled_opt
+  next_en = case a.enabled
     Some(v): v
     None: not cur.enabled?
   end
-  try db.run(
-    "UPDATE connectors SET enabled = ? WHERE name = ?",
-    [Sqlite.Integer(if next_en: 1 else: 0), Sqlite.String(name)]
-  ).map_error(db_err)
-  Ok(
-    ConnectorSpec(
-      name: cur.name,
-      kind: cur.kind,
-      url: cur.url,
-      auth_env: cur.auth_env,
-      allowed_host: cur.allowed_host,
-      default_effect: cur.default_effect,
-      enabled?: next_en
-    )
+  updated = ConnectorSpec(
+    name: cur.name,
+    kind: cur.kind,
+    url: cur.url,
+    auth_env: cur.auth_env,
+    allowed_host: cur.allowed_host,
+    default_effect: cur.default_effect,
+    enabled?: next_en
   )
+  t1 = try wrap_t(Table.put(tx, tbl, updated.name, updated))
+  Ok((t1, updated.to_json))
 end
 
-fn delete_connector(db: Sqlite.Database, name: Text) : Result(Unit, MotetError)
-  try db.run("DELETE FROM connector_tokens WHERE connector_name = ?", [Sqlite.String(name)])
-    .map_error(db_err)
-  db.run("DELETE FROM connectors WHERE name = ?", [Sqlite.String(name)]).map_error(db_err)
+fn action_delete_connector(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[NameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.delete(tx, connectors_table(), a.name))
+  Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
 end
 
-struct OAuthPending
-  state: Text
-  connector_name: Text
-  client_id: Text
-  redirect_uri: Text
-  code_verifier: Text
-  token_endpoint: Text
-  resource: Text
-  created_at: Text
+fn action_add_rule(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[AddRuleArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  (t1, id) = try wrap_t(tx_next_id(tx, "policy_rules"))
+  rule = PolicyRule(
+    id: id,
+    bot_name: a.bot_name,
+    tool_pattern: a.tool_pattern,
+    decision: a.decision,
+    note: a.note
+  )
+  t2 = try wrap_t(Table.put(t1, policy_rules_table(), id, rule))
+  Ok((t2, rule.to_json))
 end
 
-fn save_oauth_pending(db: Sqlite.Database, pending: OAuthPending) : Result(Unit, MotetError)
-  db.run(
-    [
-      "INSERT INTO oauth_pending (state, connector_name, client_id, redirect_uri, code_verifier, token_endpoint, resource, created_at) ",
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ",
-      "ON CONFLICT(state) DO UPDATE SET connector_name = excluded.connector_name, client_id = excluded.client_id, ",
-      "redirect_uri = excluded.redirect_uri, code_verifier = excluded.code_verifier, ",
-      "token_endpoint = excluded.token_endpoint, resource = excluded.resource, created_at = excluded.created_at"
-    ].join(""),
-    [
-      Sqlite.String(pending.state),
-      Sqlite.String(pending.connector_name),
-      Sqlite.String(pending.client_id),
-      Sqlite.String(pending.redirect_uri),
-      Sqlite.String(pending.code_verifier),
-      Sqlite.String(pending.token_endpoint),
-      Sqlite.String(pending.resource),
-      Sqlite.String(pending.created_at)
-    ]
-  ).map_error(db_err)
+fn action_delete_rule(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.delete(tx, policy_rules_table(), a.id))
+  Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
 end
 
-fn take_oauth_pending(db: Sqlite.Database, state: Text) : Result(Option(OAuthPending), MotetError)
-  rows = try db.query(
-    "SELECT state, connector_name, client_id, redirect_uri, code_verifier, token_endpoint, resource, created_at FROM oauth_pending WHERE state = ?",
-    [Sqlite.String(state)]
-  ).map_error(db_err)
-  case rows.rows.first
-    None: Ok(None)
-    Some(r):
-      try db.run("DELETE FROM oauth_pending WHERE state = ?", [Sqlite.String(state)]).map_error(
-        db_err
+fn action_create_session(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[CreateSessionArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = sessions_table()
+  next_s = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(existing): SessionSummary(
+      id: existing.id,
+      bot_name: existing.bot_name,
+      title: existing.title,
+      trust: existing.trust,
+      canonical?: existing.canonical? or a.canonical,
+      compaction_seq: existing.compaction_seq,
+      created_at: existing.created_at,
+      updated_at: a.now_text,
+      event_count: existing.event_count
+    )
+    None: SessionSummary(
+      id: a.id,
+      bot_name: a.bot_name,
+      title: a.title,
+      trust: a.trust,
+      canonical?: a.canonical,
+      compaction_seq: 0,
+      created_at: a.now_text,
+      updated_at: a.now_text,
+      event_count: 0
+    )
+  end
+  t1 = try wrap_t(Table.put(tx, tbl, next_s.id, next_s))
+  Ok((t1, next_s.to_json))
+end
+
+fn action_set_session_compaction_seq(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[SetCompactionSeqArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = sessions_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.session_id))
+    Some(cur):
+      updated = SessionSummary(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        title: cur.title,
+        trust: cur.trust,
+        canonical?: cur.canonical?,
+        compaction_seq: a.compaction_seq,
+        created_at: cur.created_at,
+        updated_at: cur.updated_at,
+        event_count: cur.event_count
       )
-      Ok(
-        Some(
-          OAuthPending(
-            state: cell_str(r, 0),
-            connector_name: cell_str(r, 1),
-            client_id: cell_str(r, 2),
-            redirect_uri: cell_str(r, 3),
-            code_verifier: cell_str(r, 4),
-            token_endpoint: cell_str(r, 5),
-            resource: cell_str(r, 6),
-            created_at: cell_str(r, 7)
-          )
-        )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_append_event(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[AppendEventArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  (t1, ev_id) = try wrap_t(tx_next_id(tx, "events"))
+  (t2, next_seq) = try wrap_t(tx_next_id(t1, "event_seq:#{a.session_id}"))
+  ev = SessionEvent(
+    id: ev_id,
+    session_id: a.session_id,
+    seq: next_seq,
+    kind: a.kind,
+    role: a.role,
+    content: a.content,
+    tool_name: a.tool_name,
+    tool_call_id: a.tool_call_id,
+    tool_calls_json: a.tool_calls_json,
+    cost_usd: a.cost_usd,
+    created_at: a.now_text
+  )
+  t3 = try wrap_t(Table.put(t2, events_table(), ev_id, ev))
+  stbl = sessions_table()
+  t4 = case try wrap_t(Table.tx_get(t3, stbl, a.session_id))
+    Some(sess):
+      updated_sess = SessionSummary(
+        id: sess.id,
+        bot_name: sess.bot_name,
+        title: sess.title,
+        trust: sess.trust,
+        canonical?: sess.canonical?,
+        compaction_seq: sess.compaction_seq,
+        created_at: sess.created_at,
+        updated_at: a.now_text,
+        event_count: sess.event_count + 1
       )
+      try wrap_t(Table.put(t3, stbl, sess.id, updated_sess))
+    None: t3
+  end
+  tname = a.tool_name or ""
+  tokens = tokenize("#{a.kind} #{tname} #{a.content}").take(64)
+  t5 = try wrap_t(tx_index_tokens(t4, "event_tokens", tokens, ev_id))
+  Ok((t5, ev.to_json))
+end
+
+fn action_save_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[SaveMemoryArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  (t1, id) = try wrap_t(tx_next_id(tx, "memories"))
+  row = MemoryRow(
+    id: id,
+    scope: a.scope,
+    kind: a.kind,
+    content: a.content,
+    provenance: a.provenance,
+    origin: a.origin,
+    session_kind: a.session_kind,
+    staged: a.staged,
+    archived?: false,
+    created_at: a.now_text
+  )
+  t2 = try wrap_t(Table.put(t1, memories_table(), id, row))
+  tokens = tokenize("#{a.scope} #{a.kind} #{a.content}").take(64)
+  t3 = try wrap_t(tx_index_tokens(t2, "memory_tokens", tokens, id))
+  Ok((t3, mem_row_to_entry(row).to_json))
+end
+
+fn action_promote_staged_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = memories_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.id))).or_fail(
+    "item_not_found: memory ##{a.id} not found"
+  )
+  next_row = if cur.archived?
+    cur
+  else
+    MemoryRow(
+      id: cur.id,
+      scope: cur.scope,
+      kind: cur.kind,
+      content: cur.content,
+      provenance: cur.provenance,
+      origin: "owner",
+      session_kind: cur.session_kind,
+      staged: false,
+      archived?: cur.archived?,
+      created_at: cur.created_at
+    )
+  end
+  t1 = try wrap_t(Table.put(tx, tbl, a.id, next_row))
+  Ok((t1, mem_row_to_entry(next_row).to_json))
+end
+
+fn action_update_memory_content(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[UpdateMemoryContentArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = memories_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.id))).or_fail(
+    "item_not_found: memory ##{a.id} not found"
+  )
+  clean = a.content.trim
+  old_toks = tokenize("#{cur.scope} #{cur.kind} #{cur.content}").take(64)
+  t1 = try wrap_t(tx_delete_tokens(tx, "memory_tokens", old_toks, a.id))
+  updated = MemoryRow(
+    id: cur.id,
+    scope: cur.scope,
+    kind: cur.kind,
+    content: clean,
+    provenance: cur.provenance,
+    origin: cur.origin,
+    session_kind: cur.session_kind,
+    staged: cur.staged,
+    archived?: cur.archived?,
+    created_at: cur.created_at
+  )
+  t2 = try wrap_t(Table.put(t1, tbl, a.id, updated))
+  new_toks = tokenize("#{cur.scope} #{cur.kind} #{clean}").take(64)
+  t3 = try wrap_t(tx_index_tokens(t2, "memory_tokens", new_toks, a.id))
+  Ok((t3, mem_row_to_entry(updated).to_json))
+end
+
+fn set_memory_archived_tx(tx: WriteTx, id: Int, archived?: Bool) : Result((WriteTx, Json), Text)
+  tbl = memories_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, id))
+    Some(cur):
+      updated = MemoryRow(
+        id: cur.id,
+        scope: cur.scope,
+        kind: cur.kind,
+        content: cur.content,
+        provenance: cur.provenance,
+        origin: cur.origin,
+        session_kind: cur.session_kind,
+        staged: cur.staged,
+        archived?: archived?,
+        created_at: cur.created_at
+      )
+      try wrap_t(Table.put(tx, tbl, id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_archive_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  set_memory_archived_tx(tx, a.id, true)
+end
+
+fn action_restore_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  set_memory_archived_tx(tx, a.id, false)
+end
+
+fn action_delete_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = memories_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(m):
+      tokens = tokenize("#{m.scope} #{m.kind} #{m.content}").take(64)
+      t_tok = try wrap_t(tx_delete_tokens(tx, "memory_tokens", tokens, a.id))
+      try wrap_t(Table.delete(t_tok, tbl, a.id))
+    None: tx
+  end
+  Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
+end
+
+fn action_record_dreaming_run(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[RecordDreamingArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  (t1, id) = try wrap_t(tx_next_id(tx, "dreaming_runs"))
+  row = DreamingRunRow(
+    id: id,
+    run_at: a.run_at,
+    summary: a.summary,
+    promoted_count: a.promoted_count,
+    pruned_count: a.pruned_count,
+    rollback_snapshot_json: a.rollback_snapshot_json,
+    rolled_back?: false
+  )
+  t2 = try wrap_t(Table.put(t1, dreaming_runs_table(), id, row))
+  Ok((t2, dream_row_to_digest(row).to_json))
+end
+
+fn action_mark_dreaming_rolled_back(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = dreaming_runs_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      updated = DreamingRunRow(
+        id: cur.id,
+        run_at: cur.run_at,
+        summary: cur.summary,
+        promoted_count: cur.promoted_count,
+        pruned_count: cur.pruned_count,
+        rollback_snapshot_json: cur.rollback_snapshot_json,
+        rolled_back?: true
+      )
+      try wrap_t(Table.put(tx, tbl, cur.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_create_intent(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[CreateIntentArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  (t1, id) = try wrap_t(tx_next_id(tx, "standing_intents"))
+  it = StandingIntent(
+    id: id,
+    bot_name: a.bot_name,
+    name: a.name,
+    watch_terms: a.watch_terms,
+    instruction: a.instruction,
+    cooldown_seconds: a.cooldown_seconds,
+    max_fires: a.max_fires,
+    fire_count: 0,
+    expires_at: a.expires_at,
+    active?: true,
+    last_fired_at: None
+  )
+  t2 = try wrap_t(Table.put(t1, intents_table(), id, it))
+  Ok((t2, it.to_json))
+end
+
+fn action_cancel_intent(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = intents_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      updated = StandingIntent(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        name: cur.name,
+        watch_terms: cur.watch_terms,
+        instruction: cur.instruction,
+        cooldown_seconds: cur.cooldown_seconds,
+        max_fires: cur.max_fires,
+        fire_count: cur.fire_count,
+        expires_at: cur.expires_at,
+        active?: false,
+        last_fired_at: cur.last_fired_at
+      )
+      try wrap_t(Table.put(tx, tbl, cur.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_record_intent_fired(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[RecordIntentFiredArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = intents_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      updated = StandingIntent(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        name: cur.name,
+        watch_terms: cur.watch_terms,
+        instruction: cur.instruction,
+        cooldown_seconds: cur.cooldown_seconds,
+        max_fires: cur.max_fires,
+        fire_count: cur.fire_count + 1,
+        expires_at: cur.expires_at,
+        active?: cur.active?,
+        last_fired_at: Some(a.now_text)
+      )
+      try wrap_t(Table.put(tx, tbl, cur.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_record_skill_usage(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[RecordSkillUsageArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  clean = a.skill_name.trim
+  tbl = skill_usage_table()
+  next_row = case try wrap_t(Table.tx_get(tx, tbl, clean))
+    Some(cur): SkillUsageRow(
+      skill_name: clean,
+      read_count: cur.read_count + 1,
+      last_used_at: a.now_text
+    )
+    None: SkillUsageRow(skill_name: clean, read_count: 1, last_used_at: a.now_text)
+  end
+  t1 = try wrap_t(Table.put(tx, tbl, clean, next_row))
+  Ok((t1, next_row.to_json))
+end
+
+fn action_upsert_routine(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[UpsertRoutineArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  (t1, r) = try tx_upsert_routine_inner(tx, a)
+  Ok((t1, r.to_json))
+end
+
+fn action_claim_routine_slot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[ClaimRoutineSlotArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  comp = "#{a.routine_id}\u{1f}#{a.slot_key}"
+  tbl = routine_runs_table()
+  case try wrap_t(Table.tx_get(tx, tbl, comp))
+    Some(_): Ok((tx, Json.Boolean(false)))
+    None:
+      (t1, id) = try wrap_t(tx_next_id(tx, "routine_runs"))
+      row = RoutineRunRow(
+        key: comp,
+        id: id,
+        routine_id: a.routine_id,
+        slot_key: a.slot_key,
+        status: "claimed",
+        detail: "",
+        created_at: a.now_text
+      )
+      t2 = try wrap_t(Table.put(t1, tbl, comp, row))
+      Ok((t2, Json.Boolean(true)))
   end
 end
 
+fn action_mark_routine_ran(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[MarkRoutineRanArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = routines_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      updated = RoutineSpec(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        name: cur.name,
+        prompt: cur.prompt,
+        interval_seconds: cur.interval_seconds,
+        schedule_kind: cur.schedule_kind,
+        schedule_expr: cur.schedule_expr,
+        timezone: cur.timezone,
+        read_only?: cur.read_only?,
+        skip_memory?: cur.skip_memory?,
+        precheck_kind: cur.precheck_kind,
+        enabled?: cur.enabled?,
+        next_due_at: a.next_due_at,
+        last_run_at: Some(a.now_text),
+        run_count: cur.run_count + 1,
+        skip_count: cur.skip_count
+      )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_mark_routine_skipped(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[MarkRoutineSkippedArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = routines_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      updated = RoutineSpec(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        name: cur.name,
+        prompt: cur.prompt,
+        interval_seconds: cur.interval_seconds,
+        schedule_kind: cur.schedule_kind,
+        schedule_expr: cur.schedule_expr,
+        timezone: cur.timezone,
+        read_only?: cur.read_only?,
+        skip_memory?: cur.skip_memory?,
+        precheck_kind: cur.precheck_kind,
+        enabled?: cur.enabled?,
+        next_due_at: a.next_due_at,
+        last_run_at: cur.last_run_at,
+        run_count: cur.run_count,
+        skip_count: cur.skip_count + 1
+      )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_set_routine_enabled(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[ToggleIdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = routines_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.id))).or_fail(
+    "item_not_found: routine ##{a.id} not found"
+  )
+  next_en = case a.enabled
+    Some(v): v
+    None: not cur.enabled?
+  end
+  updated = RoutineSpec(
+    id: cur.id,
+    bot_name: cur.bot_name,
+    name: cur.name,
+    prompt: cur.prompt,
+    interval_seconds: cur.interval_seconds,
+    schedule_kind: cur.schedule_kind,
+    schedule_expr: cur.schedule_expr,
+    timezone: cur.timezone,
+    read_only?: cur.read_only?,
+    skip_memory?: cur.skip_memory?,
+    precheck_kind: cur.precheck_kind,
+    enabled?: next_en,
+    next_due_at: cur.next_due_at,
+    last_run_at: cur.last_run_at,
+    run_count: cur.run_count,
+    skip_count: cur.skip_count
+  )
+  t1 = try wrap_t(Table.put(tx, tbl, updated.id, updated))
+  Ok((t1, updated.to_json))
+end
+
+fn action_delete_routine(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  rtbl = routine_runs_table()
+  rrows = try wrap_t(Table.tx_lookup(tx, rtbl, routine_runs_by_routine_index(), a.id))
+  var cur_tx = tx
+  for (rkey, _rr) in rrows
+    cur_tx = try wrap_t(Table.delete(cur_tx, rtbl, rkey))
+  end
+  t1 = try wrap_t(Table.delete(cur_tx, routines_table(), a.id))
+  Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
+end
+
+fn action_create_approval(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[CreateApprovalArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = approvals_table()
+  pending = try wrap_t(Table.tx_lookup(tx, tbl, approvals_by_status_index(), "pending"))
+  for (_id, ex) in pending.reverse
+    if ex.bot_name == a.bot_name and
+      ex.tool_name == a.tool_name and
+      ex.arguments_json == a.arguments_json
+      return Ok((tx, ex.to_json))
+    end
+  end
+  if a.reason.starts_with?("read-only routine")
+    for (_id, ex) in pending.reverse
+      if ex.bot_name == a.bot_name and ex.tool_name == a.tool_name and ex.reason == a.reason
+        updated = ApprovalItem(
+          id: ex.id,
+          bot_name: ex.bot_name,
+          session_id: a.session_id,
+          tool_name: ex.tool_name,
+          arguments_json: a.arguments_json,
+          effect_class: ex.effect_class,
+          reason: ex.reason,
+          status: Pending,
+          result_text: None,
+          created_at: a.now_text
+        )
+        t1 = try wrap_t(Table.put(tx, tbl, updated.id, updated))
+        return Ok((t1, updated.to_json))
+      end
+    end
+  end
+  (t1, id) = try wrap_t(tx_next_id(tx, "approvals"))
+  item = ApprovalItem(
+    id: id,
+    bot_name: a.bot_name,
+    session_id: a.session_id,
+    tool_name: a.tool_name,
+    arguments_json: a.arguments_json,
+    effect_class: a.effect_class,
+    reason: a.reason,
+    status: Pending,
+    result_text: None,
+    created_at: a.now_text
+  )
+  t2 = try wrap_t(Table.put(t1, tbl, id, item))
+  Ok((t2, item.to_json))
+end
+
+fn action_update_approval(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[UpdateApprovalArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = approvals_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      res_opt = if a.result_text.empty?: None else: Some(a.result_text)
+      updated = ApprovalItem(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        session_id: cur.session_id,
+        tool_name: cur.tool_name,
+        arguments_json: cur.arguments_json,
+        effect_class: cur.effect_class,
+        reason: cur.reason,
+        status: a.status,
+        result_text: res_opt,
+        created_at: cur.created_at
+      )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_update_approval_args(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[UpdateApprovalJsonArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = approvals_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      updated = ApprovalItem(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        session_id: cur.session_id,
+        tool_name: cur.tool_name,
+        arguments_json: a.arguments_json,
+        effect_class: cur.effect_class,
+        reason: cur.reason,
+        status: cur.status,
+        result_text: cur.result_text,
+        created_at: cur.created_at
+      )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_dismiss_all_pending_approvals(tx: WriteTx, _args: Json) : Result((WriteTx, Json), Text)
+  tbl = approvals_table()
+  pending = try wrap_t(Table.tx_lookup(tx, tbl, approvals_by_status_index(), "pending"))
+  var cur_tx = tx
+  var count = 0
+  for (_id, cur) in pending
+    updated = ApprovalItem(
+      id: cur.id,
+      bot_name: cur.bot_name,
+      session_id: cur.session_id,
+      tool_name: cur.tool_name,
+      arguments_json: cur.arguments_json,
+      effect_class: cur.effect_class,
+      reason: cur.reason,
+      status: Denied,
+      result_text: Some("dismissed in bulk by owner"),
+      created_at: cur.created_at
+    )
+    cur_tx = try wrap_t(Table.put(cur_tx, tbl, updated.id, updated))
+    count += 1
+  end
+  Ok((cur_tx, count.to_json))
+end
+
+fn action_save_artifact(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[SaveArtifactArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  (t1, id) = try wrap_t(tx_next_id(tx, "artifacts"))
+  art = ArtifactItem(
+    id: id,
+    bot_name: a.bot_name,
+    session_id: a.session_id,
+    kind: a.kind,
+    title: a.title,
+    content: a.content,
+    created_at: a.now_text
+  )
+  t2 = try wrap_t(Table.put(t1, artifacts_table(), id, art))
+  Ok((t2, art.to_json))
+end
+
+fn action_record_spend_ledger(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[RecordSpendArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  (t1, id) = try wrap_t(tx_next_id(tx, "budget_ledger"))
+  row = BudgetLedgerRow(
+    id: id,
+    bot_name: a.bot_name,
+    session_id: a.session_id,
+    input_tokens: a.input_tokens,
+    output_tokens: a.output_tokens,
+    cached_input_tokens: a.cached_input_tokens,
+    cost_usd: a.cost_usd,
+    created_at: a.now_text,
+    day: utc_day_prefix(a.now_text)
+  )
+  t2 = try wrap_t(Table.put(t1, budget_ledger_table(), id, row))
+  Ok((t2, row.to_json))
+end
+
+fn action_enqueue_run(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[EnqueueRunArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  row = BotRunRow(
+    id: a.run_id,
+    bot_name: a.bot_name,
+    session_id: a.session_id,
+    trust: a.trust,
+    routine_read_only?: a.routine_read_only,
+    status: "queued",
+    prompt: a.prompt,
+    steer_queue_json: "[]",
+    steps: 0,
+    spent_usd: 0.0,
+    reply: "",
+    error: None,
+    created_at: a.now_text,
+    updated_at: a.now_text
+  )
+  t1 = try wrap_t(Table.put(tx, bot_runs_table(), row.id, row))
+  Ok((t1, bot_run_row_to_public(row).to_json))
+end
+
+fn action_claim_run(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[ClaimRunArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bot_runs_table()
+  case try wrap_t(Table.tx_get(tx, tbl, a.run_id))
+    Some(cur) if cur.status == "queued":
+      updated = BotRunRow(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        session_id: cur.session_id,
+        trust: cur.trust,
+        routine_read_only?: cur.routine_read_only?,
+        status: "running",
+        prompt: cur.prompt,
+        steer_queue_json: cur.steer_queue_json,
+        steps: cur.steps,
+        spent_usd: cur.spent_usd,
+        reply: cur.reply,
+        error: cur.error,
+        created_at: cur.created_at,
+        updated_at: a.now_text
+      )
+      t1 = try wrap_t(Table.put(tx, tbl, updated.id, updated))
+      Ok((t1, bot_run_row_to_public(updated).to_json))
+    Some(_) | None:
+      Ok((tx, Json.Null))
+  end
+end
+
+fn action_append_run_steer(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[AppendRunSteerArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bot_runs_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.run_id))).or_fail(
+    "item_not_found: run not found: #{a.run_id}"
+  )
+  if cur.status != "queued" and cur.status != "running"
+    return Error("conflict: run #{a.run_id} is already #{cur.status}")
+  end
+  cur_arr = case Json.parse(cur.steer_queue_json)
+    Ok(Json.Array(items)): items
+    Ok(_) | Error(_): []
+  end
+  entry = Json.Object({
+    "mode": Json.String(a.mode.trim.ascii_lowercase),
+    "message": Json.String(a.message.trim)
+  })
+  next_json = Json.Array(cur_arr.append(entry)).to_text
+  updated = BotRunRow(
+    id: cur.id,
+    bot_name: cur.bot_name,
+    session_id: cur.session_id,
+    trust: cur.trust,
+    routine_read_only?: cur.routine_read_only?,
+    status: cur.status,
+    prompt: cur.prompt,
+    steer_queue_json: next_json,
+    steps: cur.steps,
+    spent_usd: cur.spent_usd,
+    reply: cur.reply,
+    error: cur.error,
+    created_at: cur.created_at,
+    updated_at: a.now_text
+  )
+  t1 = try wrap_t(Table.put(tx, tbl, updated.id, updated))
+  Ok((t1, bot_run_row_to_public(updated).to_json))
+end
+
+fn action_take_run_steers(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[NameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bot_runs_table()
+  case try wrap_t(Table.tx_get(tx, tbl, a.name))
+    None: Ok((tx, Json.String("[]")))
+    Some(cur):
+      raw = cur.steer_queue_json
+      if raw == "[]" or raw.trim.empty?
+        Ok((tx, Json.String("[]")))
+      else
+        updated = BotRunRow(
+          id: cur.id,
+          bot_name: cur.bot_name,
+          session_id: cur.session_id,
+          trust: cur.trust,
+          routine_read_only?: cur.routine_read_only?,
+          status: cur.status,
+          prompt: cur.prompt,
+          steer_queue_json: "[]",
+          steps: cur.steps,
+          spent_usd: cur.spent_usd,
+          reply: cur.reply,
+          error: cur.error,
+          created_at: cur.created_at,
+          updated_at: cur.updated_at
+        )
+        t1 = try wrap_t(Table.put(tx, tbl, updated.id, updated))
+        Ok((t1, Json.String(raw)))
+      end
+  end
+end
+
+fn action_update_run_progress(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[UpdateRunProgressArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bot_runs_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.run_id))
+    Some(cur):
+      updated = BotRunRow(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        session_id: cur.session_id,
+        trust: cur.trust,
+        routine_read_only?: cur.routine_read_only?,
+        status: cur.status,
+        prompt: cur.prompt,
+        steer_queue_json: cur.steer_queue_json,
+        steps: a.steps,
+        spent_usd: a.spent_usd,
+        reply: cur.reply,
+        error: cur.error,
+        created_at: cur.created_at,
+        updated_at: a.now_text
+      )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_finish_run(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[FinishRunArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bot_runs_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.run_id))
+    Some(cur):
+      err_opt = if a.error_text.empty?: None else: Some(a.error_text)
+      updated = BotRunRow(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        session_id: cur.session_id,
+        trust: cur.trust,
+        routine_read_only?: cur.routine_read_only?,
+        status: a.status,
+        prompt: cur.prompt,
+        steer_queue_json: cur.steer_queue_json,
+        steps: a.steps,
+        spent_usd: a.spent_usd,
+        reply: a.reply,
+        error: err_opt,
+        created_at: cur.created_at,
+        updated_at: a.now_text
+      )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_upsert_webhook_config(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  cfg = try Json.decode[WebhookConfig](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.put(tx, webhook_configs_table(), cfg.source, cfg))
+  Ok((t1, cfg.to_json))
+end
+
+fn action_delete_webhook_config(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[NameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.delete(tx, webhook_configs_table(), a.name))
+  Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
+end
+
+fn action_set_setting_val(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[SetSettingArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.put(tx, app_settings_table(), a.key, a.value))
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_save_settings(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  s = try Json.decode[AppSettings](Json.encode(args).bytes).map_error(json_arg_err)
+  stbl = app_settings_table()
+  prev_raw = (try wrap_t(Table.tx_get(tx, stbl, "timezone"))) or "America/Los_Angeles"
+  prev_tz = if prev_raw.trim.empty?: "America/Los_Angeles" else: prev_raw.trim
+  next_tz = s.timezone.trim
+
+  var cur_tx = tx
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "timezone", next_tz))
+  if not next_tz.empty? and next_tz != prev_tz
+    rtbl = routines_table()
+    rrows = try wrap_t(Table.tx_scan(cur_tx, rtbl, None, None, 0))
+    for (_rid, r) in rrows
+      if r.timezone == prev_tz
+        updated_r = RoutineSpec(
+          id: r.id,
+          bot_name: r.bot_name,
+          name: r.name,
+          prompt: r.prompt,
+          interval_seconds: r.interval_seconds,
+          schedule_kind: r.schedule_kind,
+          schedule_expr: r.schedule_expr,
+          timezone: next_tz,
+          read_only?: r.read_only?,
+          skip_memory?: r.skip_memory?,
+          precheck_kind: r.precheck_kind,
+          enabled?: r.enabled?,
+          next_due_at: r.next_due_at,
+          last_run_at: r.last_run_at,
+          run_count: r.run_count,
+          skip_count: r.skip_count
+        )
+        cur_tx = try wrap_t(Table.put(cur_tx, rtbl, updated_r.id, updated_r))
+      end
+    end
+  end
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "quiet_hours_start", s.quiet_hours_start.trim))
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "quiet_hours_end", s.quiet_hours_end.trim))
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "public_url", s.public_url.trim))
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "vault_path", s.vault_path.trim))
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "vault_git_remote", s.vault_git_remote.trim))
+  cur_tx = try wrap_t(
+    Table.put(cur_tx, stbl, "telegram_enabled", if s.telegram_enabled?: "1" else: "0")
+  )
+  cur_tx = try wrap_t(
+    Table.put(cur_tx, stbl, "telegram_allowed_user_id", s.telegram_allowed_user_id.trim)
+  )
+  cur_tx = try wrap_t(
+    Table.put(cur_tx, stbl, "telegram_default_bot", s.telegram_default_bot.trim)
+  )
+  Ok((cur_tx, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_save_push_subscription(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[SavePushSubArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  ep = a.sub.endpoint.trim
+  return Error("bad_input: push endpoint required") if ep.empty?
+  sub = PushSubscription(
+    endpoint: ep,
+    p256dh: a.sub.p256dh.trim,
+    auth: a.sub.auth.trim,
+    user_agent: a.sub.user_agent.trim,
+    created_at: a.now_text
+  )
+  t1 = try wrap_t(Table.put(tx, push_subscriptions_table(), ep, sub))
+  Ok((t1, sub.to_json))
+end
+
+fn action_delete_push_subscription(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[NameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.delete(tx, push_subscriptions_table(), a.name.trim))
+  Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
+end
+
+fn max_int_val(a: Int, b: Int) : Int
+  if a >= b: a else: b
+end
+
+fn action_import_snapshot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  snap = try Json.decode[MigrationSnapshot](Json.encode(args).bytes).map_error(json_arg_err)
+  var cur_tx = tx
+
+  for b in snap.bots
+    cur_tx = try wrap_t(Table.put(cur_tx, bots_table(), b.name, b))
+  end
+  for c in snap.connectors
+    cur_tx = try wrap_t(Table.put(cur_tx, connectors_table(), c.name, c))
+  end
+
+  var max_rule_id = 0
+  for r in snap.policy_rules
+    max_rule_id = max_int_val(max_rule_id, r.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, policy_rules_table(), r.id, r))
+  end
+
+  var ev_counts = {}
+  var max_seqs = {}
+  var max_ev_id = 0
+  for ev in snap.events
+    max_ev_id = max_int_val(max_ev_id, ev.id)
+    cur_cnt = ev_counts.get(ev.session_id) or 0
+    ev_counts = ev_counts.set(ev.session_id, cur_cnt + 1)
+    prev_seq = max_seqs.get(ev.session_id) or 0
+    max_seqs = max_seqs.set(ev.session_id, max_int_val(prev_seq, ev.seq))
+    cur_tx = try wrap_t(Table.put(cur_tx, events_table(), ev.id, ev))
+    tname = ev.tool_name or ""
+    tokens = tokenize("#{ev.kind} #{tname} #{ev.content}").take(64)
+    cur_tx = try wrap_t(tx_index_tokens(cur_tx, "event_tokens", tokens, ev.id))
+  end
+
+  for s in snap.sessions
+    cnt = max_int_val(s.event_count, ev_counts.get(s.id) or 0)
+    fixed_s = SessionSummary(
+      id: s.id,
+      bot_name: s.bot_name,
+      title: s.title,
+      trust: s.trust,
+      canonical?: s.canonical?,
+      compaction_seq: s.compaction_seq,
+      created_at: s.created_at,
+      updated_at: s.updated_at,
+      event_count: cnt
+    )
+    cur_tx = try wrap_t(Table.put(cur_tx, sessions_table(), fixed_s.id, fixed_s))
+  end
+
+  var max_mem_id = 0
+  for m in snap.memories
+    max_mem_id = max_int_val(max_mem_id, m.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, memories_table(), m.id, m))
+    tokens = tokenize("#{m.scope} #{m.kind} #{m.content}").take(64)
+    cur_tx = try wrap_t(tx_index_tokens(cur_tx, "memory_tokens", tokens, m.id))
+  end
+
+  var max_dream_id = 0
+  for dr in snap.dreaming_runs
+    max_dream_id = max_int_val(max_dream_id, dr.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, dreaming_runs_table(), dr.id, dr))
+  end
+
+  var max_intent_id = 0
+  for it in snap.standing_intents
+    max_intent_id = max_int_val(max_intent_id, it.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, intents_table(), it.id, it))
+  end
+
+  for su in snap.skill_usage
+    cur_tx = try wrap_t(Table.put(cur_tx, skill_usage_table(), su.skill_name, su))
+  end
+
+  var max_routine_id = 0
+  for rt in snap.routines
+    max_routine_id = max_int_val(max_routine_id, rt.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, routines_table(), rt.id, rt))
+  end
+
+  var max_rrun_id = 0
+  for rr in snap.routine_runs
+    max_rrun_id = max_int_val(max_rrun_id, rr.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, routine_runs_table(), rr.key, rr))
+  end
+
+  for (sk, sv) in snap.app_settings.entries
+    cur_tx = try wrap_t(Table.put(cur_tx, app_settings_table(), sk, sv))
+  end
+  for ps in snap.push_subscriptions
+    cur_tx = try wrap_t(Table.put(cur_tx, push_subscriptions_table(), ps.endpoint, ps))
+  end
+
+  var max_app_id = 0
+  for ap in snap.approvals
+    max_app_id = max_int_val(max_app_id, ap.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, approvals_table(), ap.id, ap))
+  end
+
+  var max_art_id = 0
+  for ar in snap.artifacts
+    max_art_id = max_int_val(max_art_id, ar.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, artifacts_table(), ar.id, ar))
+  end
+
+  var max_bud_id = 0
+  for bl in snap.budget_ledger
+    max_bud_id = max_int_val(max_bud_id, bl.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, budget_ledger_table(), bl.id, bl))
+  end
+
+  for br in snap.bot_runs
+    cur_tx = try wrap_t(Table.put(cur_tx, bot_runs_table(), br.id, br))
+  end
+  for wc in snap.webhook_configs
+    cur_tx = try wrap_t(Table.put(cur_tx, webhook_configs_table(), wc.source, wc))
+  end
+
+  seqtbl = seqs_table()
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "policy_rules", max_rule_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "events", max_ev_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "memories", max_mem_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "dreaming_runs", max_dream_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "standing_intents", max_intent_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "routines", max_routine_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "routine_runs", max_rrun_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "approvals", max_app_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "artifacts", max_art_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "budget_ledger", max_bud_id))
+  for (sid, mseq) in max_seqs.entries
+    cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "event_seq:#{sid}", mseq))
+  end
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "_seeded", 1))
+  Ok((cur_tx, Json.Object({"imported": Json.Boolean(true)})))
+end
+
+## Complete lossless ReplayCatalog covering every domain write in `motet.modb`.
+fn motet_replay_catalog() : ReplayCatalog
+  Replay.catalog().with_action("seed_defaults", action_seed_defaults).with_action(
+    "upsert_bot",
+    action_upsert_bot
+  ).with_action("set_bot_active", action_set_bot_active).with_action(
+    "clone_bot",
+    action_clone_bot
+  ).with_action("delete_bot", action_delete_bot).with_action(
+    "upsert_connector",
+    action_upsert_connector
+  ).with_action("set_connector_enabled", action_set_connector_enabled).with_action(
+    "delete_connector",
+    action_delete_connector
+  ).with_action("add_rule", action_add_rule).with_action("delete_rule", action_delete_rule)
+    .with_action("create_session", action_create_session).with_action(
+      "set_session_compaction_seq",
+      action_set_session_compaction_seq
+    ).with_action("append_event", action_append_event).with_action("save_memory", action_save_memory)
+    .with_action("promote_staged_memory", action_promote_staged_memory).with_action(
+      "update_memory_content",
+      action_update_memory_content
+    ).with_action("archive_memory", action_archive_memory).with_action(
+      "restore_memory",
+      action_restore_memory
+    ).with_action("delete_memory", action_delete_memory).with_action(
+      "record_dreaming_run",
+      action_record_dreaming_run
+    ).with_action("mark_dreaming_rolled_back", action_mark_dreaming_rolled_back).with_action(
+      "create_intent",
+      action_create_intent
+    ).with_action("cancel_intent", action_cancel_intent).with_action(
+      "record_intent_fired",
+      action_record_intent_fired
+    ).with_action("record_skill_usage", action_record_skill_usage).with_action(
+      "upsert_routine",
+      action_upsert_routine
+    ).with_action("claim_routine_slot", action_claim_routine_slot).with_action(
+      "mark_routine_ran",
+      action_mark_routine_ran
+    ).with_action("mark_routine_skipped", action_mark_routine_skipped).with_action(
+      "set_routine_enabled",
+      action_set_routine_enabled
+    ).with_action("delete_routine", action_delete_routine).with_action(
+      "create_approval",
+      action_create_approval
+    ).with_action("update_approval", action_update_approval).with_action(
+      "update_approval_args",
+      action_update_approval_args
+    ).with_action("dismiss_all_pending_approvals", action_dismiss_all_pending_approvals)
+    .with_action("save_artifact", action_save_artifact).with_action(
+      "record_spend_ledger",
+      action_record_spend_ledger
+    ).with_action("enqueue_run", action_enqueue_run).with_action("claim_run", action_claim_run)
+    .with_action("append_run_steer", action_append_run_steer).with_action(
+      "take_run_steers",
+      action_take_run_steers
+    ).with_action("update_run_progress", action_update_run_progress).with_action(
+      "finish_run",
+      action_finish_run
+    ).with_action("upsert_webhook_config", action_upsert_webhook_config).with_action(
+      "delete_webhook_config",
+      action_delete_webhook_config
+    ).with_action("set_setting_val", action_set_setting_val).with_action(
+      "save_settings",
+      action_save_settings
+    ).with_action("save_push_subscription", action_save_push_subscription).with_action(
+      "delete_push_subscription",
+      action_delete_push_subscription
+    ).with_action("import_snapshot", action_import_snapshot)
+end
+
+## Grant-scoped ViewCatalog + k-anonymous Release catalog (secrets excluded physically).
+fn motet_view_catalog() : ViewCatalog
+  Views.catalog().with_view(
+    ViewDef(
+      name: "bots",
+      description: "Active and paused bot configurations (omits API credentials and internal headers)",
+      source_buckets: ["bots"],
+      fields: [
+        ViewField(name: "name", field_type: "text", description: "Unique bot slug"),
+        ViewField(name: "role", field_type: "text", description: "Role title"),
+        ViewField(name: "model_tier", field_type: "text", description: "Pricing/capability tier"),
+        ViewField(name: "model", field_type: "text", description: "Configured LLM model"),
+        ViewField(name: "workspace", field_type: "text", description: "Confined workspace folder"),
+        ViewField(
+          name: "daily_budget_usd",
+          field_type: "text",
+          description: "Configured daily USD budget cap"
+        ),
+        ViewField(name: "max_steps", field_type: "int", description: "Max turns per user request"),
+        ViewField(name: "active", field_type: "bool", description: "Whether bot is enabled")
+      ],
+      narrows: None,
+      load: fn(st)
+        rows = try Table.all(st, bots_table()).map_error(fn(e) e.to_text end)
+        Ok(
+          rows.map(fn(p)
+            b = p.1
+            {
+              "name": Json.String(b.name),
+              "role": Json.String(b.role),
+              "model_tier": Json.String(b.model_tier),
+              "model": Json.String(b.model),
+              "workspace": Json.String(b.workspace),
+              "daily_budget_usd": Json.String(b.daily_budget_usd.to_fixed(2)),
+              "max_steps": Json.int(b.max_steps),
+              "active": Json.Boolean(b.active?)
+            }
+          end)
+        )
+      end
+    )
+  ).with_view(
+    ViewDef(
+      name: "memories",
+      description: "Persistent shared and per-bot memory entries",
+      source_buckets: ["memories"],
+      fields: [
+        ViewField(name: "id", field_type: "int", description: "Memory ID"),
+        ViewField(name: "scope", field_type: "text", description: "'shared' or bot name"),
+        ViewField(name: "kind", field_type: "text", description: "profile | rule | fact | work_log"),
+        ViewField(name: "content", field_type: "text", description: "Memory text"),
+        ViewField(name: "provenance", field_type: "text", description: "Originating principal"),
+        ViewField(name: "staged", field_type: "bool", description: "Whether awaiting owner approval"),
+        ViewField(name: "created_at", field_type: "text", description: "Creation timestamp")
+      ],
+      narrows: None,
+      load: fn(st)
+        rows = try Table.all(st, memories_table()).map_error(fn(e) e.to_text end)
+        Ok(
+          rows.filter(fn(p) not p.1.archived? end).map(fn(p)
+            m = p.1
+            {
+              "id": Json.int(m.id),
+              "scope": Json.String(m.scope),
+              "kind": Json.String(m.kind),
+              "content": Json.String(m.content),
+              "provenance": Json.String(m.provenance),
+              "staged": Json.Boolean(m.staged),
+              "created_at": Json.String(m.created_at)
+            }
+          end)
+        )
+      end
+    )
+  ).with_view(
+    ViewDef(
+      name: "sessions",
+      description: "Bot conversation sessions with trust level and event count",
+      source_buckets: ["sessions"],
+      fields: [
+        ViewField(name: "id", field_type: "text", description: "Session ID"),
+        ViewField(name: "bot_name", field_type: "text", description: "Owning bot name"),
+        ViewField(name: "title", field_type: "text", description: "Session summary title"),
+        ViewField(name: "trust", field_type: "text", description: "owner | routine | external"),
+        ViewField(name: "canonical", field_type: "bool", description: "Canonical forever-chat flag"),
+        ViewField(name: "created_at", field_type: "text", description: "Creation timestamp"),
+        ViewField(name: "updated_at", field_type: "text", description: "Last activity timestamp"),
+        ViewField(
+          name: "event_count",
+          field_type: "int",
+          description: "Persisted events in session"
+        )
+      ],
+      narrows: None,
+      load: fn(st)
+        rows = try Table.all(st, sessions_table()).map_error(fn(e) e.to_text end)
+        Ok(
+          rows.map(fn(p)
+            s = p.1
+            {
+              "id": Json.String(s.id),
+              "bot_name": Json.String(s.bot_name),
+              "title": Json.String(s.title),
+              "trust": Json.String(Types.trust_to_text(s.trust)),
+              "canonical": Json.Boolean(s.canonical?),
+              "created_at": Json.String(s.created_at),
+              "updated_at": Json.String(s.updated_at),
+              "event_count": Json.int(s.event_count)
+            }
+          end)
+        )
+      end
+    )
+  ).with_view(
+    ViewDef(
+      name: "artifacts",
+      description: "Durable artifacts saved by bots",
+      source_buckets: ["artifacts"],
+      fields: [
+        ViewField(name: "id", field_type: "int", description: "Artifact ID"),
+        ViewField(name: "bot_name", field_type: "text", description: "Author bot"),
+        ViewField(name: "session_id", field_type: "text", description: "Originating session"),
+        ViewField(name: "kind", field_type: "text", description: "report | plan | diff | note"),
+        ViewField(name: "title", field_type: "text", description: "Short title"),
+        ViewField(name: "created_at", field_type: "text", description: "Creation timestamp")
+      ],
+      narrows: None,
+      load: fn(st)
+        rows = try Table.all(st, artifacts_table()).map_error(fn(e) e.to_text end)
+        Ok(
+          rows.map(fn(p)
+            a = p.1
+            {
+              "id": Json.int(a.id),
+              "bot_name": Json.String(a.bot_name),
+              "session_id": Json.String(a.session_id),
+              "kind": Json.String(a.kind),
+              "title": Json.String(a.title),
+              "created_at": Json.String(a.created_at)
+            }
+          end)
+        )
+      end
+    )
+  ).with_release(
+    ReleaseDef(
+      name: "bot_activity_summary",
+      description: "Aggregate counts across bots, sessions, memories, artifacts, and ledger spend",
+      source_buckets: ["bots", "sessions", "memories", "artifacts", "budget_ledger"],
+      min_group_size: 1,
+      args_description: "{}",
+      run: fn(st, _args)
+        bs = try Table.all(st, bots_table()).map_error(fn(e) e.to_text end)
+        ss = try Table.all(st, sessions_table()).map_error(fn(e) e.to_text end)
+        ms = try Table.all(st, memories_table()).map_error(fn(e) e.to_text end)
+        arts = try Table.all(st, artifacts_table()).map_error(fn(e) e.to_text end)
+        bls = try Table.all(st, budget_ledger_table()).map_error(fn(e) e.to_text end)
+        var total_spend = 0.0
+        for (_id, row) in bls
+          total_spend = (total_spend + row.cost_usd).round(6)
+        end
+        Ok((
+          bs.size,
+          Json.Object({
+            "bots": Json.int(bs.size),
+            "sessions": Json.int(ss.size),
+            "memories": Json.int(ms.filter(fn(p) not p.1.archived? end).size),
+            "artifacts": Json.int(arts.size),
+            "total_spend_usd": Json.String(total_spend.to_fixed(6))
+          })
+        ))
+      end
+    )
+  ).with_action_doc(
+    "save_memory",
+    "Save a durable shared or bot-scoped memory entry",
+    "{\"scope\":\"shared\",\"kind\":\"fact\",\"content\":\"...\"}"
+  ).with_action_doc(
+    "add_rule",
+    "Add a host-enforced Allow/AskFirst/Deny policy rule",
+    "{\"bot_name\":\"*\",\"tool_pattern\":\"...\",\"decision\":\"allow\"}"
+  ).with_action_doc(
+    "save_artifact",
+    "Persist a bot artifact (report/plan/diff/note)",
+    "{\"kind\":\"report\",\"title\":\"...\",\"content\":\"...\"}"
+  ).with_invariant_doc(
+    "bots_valid",
+    "Every bot has a non-empty name, non-negative budget, and max_steps in 1..64"
+  ).with_invariant_doc("routines_valid", "Every standing routine has interval_seconds >= 10")
+    .with_invariant_doc(
+      "budget_ledger_non_negative",
+      "Every recorded spend ledger row has cost_usd >= 0 and non-negative token counts"
+    ).with_invariant_doc("memories_non_empty", "Every memory entry has non-empty scope and content")
+end
+
+## Execution wrappers for `motet.modb`.
+fn with_db_read(db: DbHandle, work: fn(Ledger.Db) : Result(R, MotetError)) : Result(R, MotetError)
+  Ledger.read_locked(db.files.read_only, db.path, motet_schema(), ledger_err, work)
+end
+
+fn exec_replay_on(ldb: Ledger.Db, principal: Text, action: Text, reason: Text, at: Time, args: Json) : Result(
+  (Ledger.Db, Json),
+  MotetError
+)
+  meta = WriteMeta(principal: principal, action: action, reason: reason, at: at)
+  (next_ldb, rep, _rec) = try Replay.execute(ldb, motet_replay_catalog(), meta, args).map_error(
+    replay_err
+  )
+  Ok((next_ldb, rep))
+end
+
+fn exec_replay(db: DbHandle, principal: Text, action: Text, reason: Text, args: Json) : Result(
+  Json,
+  MotetError
+)
+  now = db.clock.now
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (_next_ldb, rep) = try exec_replay_on(ldb, principal, action, reason, now, args)
+      Ok(rep)
+    end
+  )
+end
+
+## Grant management helpers inside an open `Ledger.Db` and via `DbHandle`.
+fn bot_root_grant_id(bot_name: Text) : Text
+  "bot:#{bot_name}"
+end
+
+fn ensure_bot_root_grant_on(ldb: Ledger.Db, bot_name: Text, now: Time) : Result(
+  (Ledger.Db, Grants.Grant),
+  MotetError
+)
+  gid = bot_root_grant_id(bot_name)
+  st = Ledger.store(ldb)
+  case try Grants.get(st, gid).map_error(grant_err)
+    Some(existing) if not existing.revoked and now <= existing.expires_at: Ok((ldb, existing))
+    Some(_) | None:
+      meta = WriteMeta(
+        principal: "system:motet",
+        action: "issue_bot_grant",
+        reason: "provision root grant for #{bot_name}",
+        at: now
+      )
+      spec = GrantSpec(
+        id: gid,
+        principal: "bot:#{bot_name}",
+        allowed_actions: ["read", "write_local", "write_external", "delegate"],
+        max_calls: 10000,
+        expires_at: now + (365 * 86400).seconds
+      )
+      Grants.issue_root_scoped(
+        ldb,
+        meta,
+        spec,
+        Some(["bots", "memories", "sessions", "artifacts"]),
+        Some(["bot_activity_summary"])
+      ).map_error(grant_err)
+  end
+end
+
+fn ensure_bot_root_grant(db: DbHandle, bot_name: Text, now: Time) : Result(Grants.Grant, MotetError)
+  gid = bot_root_grant_id(bot_name)
+  if db.files.read_only.exists?(db.path)
+    case with_db_read(db, fn(ldb) Grants.get(Ledger.store(ldb), gid).map_error(grant_err) end)
+      Ok(Some(existing)) if not existing.revoked and now <= existing.expires_at: return Ok(existing)
+      Ok(_) | Error(_): Unit
+    end
+  end
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (_next, g) = try ensure_bot_root_grant_on(ldb, bot_name, now)
+      Ok(g)
+    end
+  )
+end
+
+fn delegate_bot_grant(
+  db: DbHandle,
+  caller_bot: Text,
+  parent_grant_id: Text,
+  child_grant_id: Text,
+  target_bot: Text,
+  read_only?: Bool,
+  max_calls: Int,
+  now: Time
+) : Result(Grants.Grant, MotetError)
+  clamped = if max_calls < 1: 1 else if max_calls > 64: 64 else: max_calls
+  actions = if read_only?
+    ["read"]
+  else
+    ["read", "write_local", "write_external", "delegate"]
+  end
+  exp = now + 3600.seconds
+  meta = WriteMeta(
+    principal: "bot:#{caller_bot}",
+    action: "grant_delegate",
+    reason: "delegate #{caller_bot} -> #{target_bot}",
+    at: now
+  )
+  spec = GrantSpec(
+    id: child_grant_id,
+    principal: "bot:#{target_bot}",
+    allowed_actions: actions,
+    max_calls: clamped,
+    expires_at: exp
+  )
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (ldb1, _parent) = try ensure_bot_root_grant_on(ldb, caller_bot, now)
+      (_ldb2, child) = try Grants.delegate_scoped(
+        ldb1,
+        meta,
+        parent_grant_id,
+        spec,
+        Some(["bots", "memories", "sessions", "artifacts"]),
+        Some(["bot_activity_summary"]),
+        Views.view_narrows_map(motet_view_catalog())
+      ).map_error(grant_err)
+      Ok(child)
+    end
+  )
+end
+
+fn authorize_grant_action(db: DbHandle, grant_id: Text, action: Text, now: Time) : Result(
+  Grants.Grant,
+  MotetError
+)
+  meta = WriteMeta(
+    principal: grant_id,
+    action: "grant_authorize:#{action}",
+    reason: "authorize delegated tool execution",
+    at: now
+  )
+  Ledger.transact_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    meta,
+    "authorize #{action} on grant #{grant_id}",
+    Json.Object({"grant_id": grant_id.to_json, "action": action.to_json}),
+    ledger_err,
+    fn(tx) Grants.tx_authorize(tx, grant_id, action, now).map_error(grant_err) end
+  )
+end
+
+fn list_grants(db: DbHandle) : Result(List(Grants.Grant), MotetError)
+  with_db_read(db, fn(ldb) Grants.list_all(Ledger.store(ldb)).map_error(grant_err) end)
+end
+
+fn revoke_grant(db: DbHandle, grant_id: Text, principal: Text, reason: Text, now: Time) : Result(
+  Grants.Grant,
+  MotetError
+)
+  eff_reason = if reason.trim.empty?: "revoked by operator" else: reason.trim
+  meta = WriteMeta(principal: principal, action: "grant_revoke", reason: eff_reason, at: now)
+  Grants.revoke_locked(db.files, db.path, motet_schema(), meta, grant_id).map_error(grant_err)
+end
+
+## Schema init & fast-path seeding.
+fn init_schema(db: DbHandle) : Result(Unit, MotetError)
+  _res = try Ledger.init_locked(db.files, db.path, motet_schema(), db.clock.now).map_error(
+    ledger_err
+  )
+  Ok(Unit)
+end
+
+fn ensure_seeded(db: DbHandle, now_text: Text) : Result(Unit, MotetError)
+  if db.files.read_only.exists?(db.path)
+    fast = with_db_read(
+      db,
+      fn(ldb)
+        Table.get(Ledger.store(ldb), seqs_table(), "_seeded").map_error(table_err)
+      end
+    )
+    if fast == Ok(Some(1))
+      return Ok(Unit)
+    end
+  end
+  now = parse_time(now_text)
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      seeded_opt = try Table.get(Ledger.store(ldb), seqs_table(), "_seeded").map_error(table_err)
+      var cur_ldb = ldb
+      if seeded_opt != Some(1)
+        (next_ldb, _ok) = try exec_replay_on(
+          cur_ldb,
+          "system:motet",
+          "seed_defaults",
+          "seed default bots, connectors, and routines",
+          now,
+          SeedDefaultsArgs(now_text: now_text).to_json
+        )
+        cur_ldb = next_ldb
+      end
+      bots = try Table.all(Ledger.store(cur_ldb), bots_table()).map_error(table_err)
+      for (_k, b) in bots
+        (next_ldb, _g) = try ensure_bot_root_grant_on(cur_ldb, b.name, now)
+        cur_ldb = next_ldb
+      end
+      Ok(Unit)
+    end
+  )
+end
+
+fn seed_defaults(db: DbHandle, now_text: Text) : Result(Unit, MotetError)
+  ensure_seeded(db, now_text)
+end
+
+## Bots.
+fn upsert_bot(db: DbHandle, bot: BotConfig) : Result(BotConfig, MotetError)
+  now = db.clock.now
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (ldb1, rep) = try exec_replay_on(
+        ldb,
+        "operator",
+        "upsert_bot",
+        "upsert bot #{bot.name}",
+        now,
+        bot.to_json
+      )
+      saved = try Json.decode[BotConfig](Json.encode(rep).bytes).map_error(reply_decode_err)
+      (_ldb2, _g) = try ensure_bot_root_grant_on(ldb1, saved.name, now)
+      Ok(saved)
+    end
+  )
+end
+
+fn get_bot(db: DbHandle, name: Text) : Result(Option(BotConfig), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) Table.get(Ledger.store(ldb), bots_table(), name).map_error(table_err) end
+  )
+end
+
+fn list_bots(db: DbHandle) : Result(List(BotConfig), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), bots_table()).map_error(table_err)
+      bots = rows.map(fn(p) p.1 end)
+      Ok(
+        bots.sort_by(fn(b)
+          act = if b.active?: "0" else: "1"
+          pri = if b.is_primary?: "0" else: "1"
+          "#{act}:#{pri}:#{b.name}"
+        end)
+      )
+    end
+  )
+end
+
+fn set_bot_active(db: DbHandle, name: Text, active_opt: Option(Bool)) : Result(
+  BotConfig,
+  MotetError
+)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "set_bot_active",
+    "toggle bot #{name}",
+    ToggleNameArgs(name: name, enabled: active_opt).to_json
+  )
+  Json.decode[BotConfig](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn clone_bot(
+  db: DbHandle,
+  source_name: Text,
+  new_name: Text,
+  role_opt: Option(Text),
+  persona_opt: Option(Text),
+  connectors_opt: Option(List(Text)),
+  ro_connectors_opt: Option(List(Text))
+) : Result(BotConfig, MotetError)
+  now = db.clock.now
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (ldb1, rep) = try exec_replay_on(
+        ldb,
+        "operator",
+        "clone_bot",
+        "clone bot #{source_name} -> #{new_name.trim}",
+        now,
+        CloneBotArgs(
+          source_name: source_name,
+          new_name: new_name,
+          role: role_opt,
+          persona: persona_opt,
+          connectors: connectors_opt,
+          read_only_connectors: ro_connectors_opt
+        ).to_json
+      )
+      saved = try Json.decode[BotConfig](Json.encode(rep).bytes).map_error(reply_decode_err)
+      (_ldb2, _g) = try ensure_bot_root_grant_on(ldb1, saved.name, now)
+      Ok(saved)
+    end
+  )
+end
+
+fn delete_bot(db: DbHandle, name: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "delete_bot",
+    "delete bot #{name}",
+    NameArgs(name: name).to_json
+  )
+  Ok(Unit)
+end
+
+## Connectors & physically isolated secrets (`motet-secrets.modb`).
+fn upsert_connector(db: DbHandle, spec: ConnectorSpec) : Result(ConnectorSpec, MotetError)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "upsert_connector",
+    "upsert connector #{spec.name}",
+    spec.to_json
+  )
+  Json.decode[ConnectorSpec](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn get_connector(db: DbHandle, name: Text) : Result(Option(ConnectorSpec), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) Table.get(Ledger.store(ldb), connectors_table(), name).map_error(table_err) end
+  )
+end
+
+fn list_connectors(db: DbHandle) : Result(List(ConnectorSpec), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), connectors_table()).map_error(table_err)
+      Ok(rows.map(fn(p) p.1 end))
+    end
+  )
+end
+
+fn set_connector_enabled(db: DbHandle, name: Text, enabled_opt: Option(Bool)) : Result(
+  ConnectorSpec,
+  MotetError
+)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "set_connector_enabled",
+    "toggle connector #{name}",
+    ToggleNameArgs(name: name, enabled: enabled_opt).to_json
+  )
+  Json.decode[ConnectorSpec](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn delete_connector_token(db: DbHandle, connector_name: Text) : Result(Unit, MotetError)
+  if not db.files.read_only.exists?(db.secrets_path)
+    return Ok(Unit)
+  end
+  Modb.with_exclusive_lock(
+    db.files,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      tx0 = Modb.begin_write(st)
+      tx1 = try Table.delete(tx0, connector_tokens_table(), connector_name).map_error(table_err)
+      _s1 = try Modb.commit(tx1).map_error(modb_err)
+      Ok(Unit)
+    end
+  )
+end
+
+fn delete_connector(db: DbHandle, name: Text) : Result(Unit, MotetError)
+  try delete_connector_token(db, name)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "delete_connector",
+    "delete connector #{name}",
+    NameArgs(name: name).to_json
+  )
+  Ok(Unit)
+end
+
+fn save_oauth_pending(db: DbHandle, pending: OAuthPending) : Result(Unit, MotetError)
+  Modb.with_exclusive_lock(
+    db.files,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      tx0 = Modb.begin_write(st)
+      tx1 = try Table.put(tx0, oauth_pending_table(), pending.state, pending).map_error(table_err)
+      _s1 = try Modb.commit(tx1).map_error(modb_err)
+      Ok(Unit)
+    end
+  )
+end
+
+fn take_oauth_pending(db: DbHandle, state: Text) : Result(Option(OAuthPending), MotetError)
+  if not db.files.read_only.exists?(db.secrets_path)
+    return Ok(None)
+  end
+  Modb.with_exclusive_lock(
+    db.files,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      tbl = oauth_pending_table()
+      case try Table.get(st, tbl, state).map_error(table_err)
+        None: Ok(None)
+        Some(p):
+          tx0 = Modb.begin_write(st)
+          tx1 = try Table.delete(tx0, tbl, state).map_error(table_err)
+          _s1 = try Modb.commit(tx1).map_error(modb_err)
+          Ok(Some(p))
+      end
+    end
+  )
+end
+
 fn save_connector_token(
-  db: Sqlite.Database,
+  db: DbHandle,
   connector_name: Text,
   access_token: Text,
   scope: Text,
   expires_at: Text,
   now_text: Text
 ) : Result(Unit, MotetError)
-  db.run(
-    [
-      "INSERT INTO connector_tokens (connector_name, access_token, scope, expires_at, updated_at) ",
-      "VALUES (?, ?, ?, ?, ?) ",
-      "ON CONFLICT(connector_name) DO UPDATE SET access_token = excluded.access_token, ",
-      "scope = excluded.scope, expires_at = excluded.expires_at, updated_at = excluded.updated_at"
-    ].join(""),
-    [
-      Sqlite.String(connector_name),
-      Sqlite.String(access_token),
-      Sqlite.String(scope),
-      Sqlite.String(expires_at),
-      Sqlite.String(now_text)
-    ]
-  ).map_error(db_err)
+  Modb.with_exclusive_lock(
+    db.files,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      row = ConnectorTokenRow(
+        connector_name: connector_name,
+        access_token: access_token,
+        scope: scope,
+        expires_at: expires_at,
+        updated_at: now_text
+      )
+      tx0 = Modb.begin_write(st)
+      tx1 = try Table.put(tx0, connector_tokens_table(), connector_name, row).map_error(table_err)
+      _s1 = try Modb.commit(tx1).map_error(modb_err)
+      Ok(Unit)
+    end
+  )
 end
 
-## Encrypts an OAuth access token with AES-256-GCM before persisting in SQLite.
+## Encrypts an OAuth access token with AES-256-GCM before persisting in isolated `motet-secrets.modb`.
 fn save_connector_token_sealed(
-  db: Sqlite.Database,
+  db: DbHandle,
   env: Env,
   srng: SecureRandom,
   connector_name: Text,
@@ -1289,20 +3344,25 @@ fn save_connector_token_sealed(
   save_connector_token(db, connector_name, sealed, scope, expires_at, now_text)
 end
 
-fn get_connector_token(db: Sqlite.Database, connector_name: Text) : Result(Option(Text), MotetError)
-  rows = try db.query(
-    "SELECT access_token FROM connector_tokens WHERE connector_name = ?",
-    [Sqlite.String(connector_name)]
-  ).map_error(db_err)
-  tok = case rows.rows.first
-    Some(r): cell_opt_str(r, 0)
-    None: None
+fn get_connector_token(db: DbHandle, connector_name: Text) : Result(Option(Text), MotetError)
+  if not db.files.read_only.exists?(db.secrets_path)
+    return Ok(None)
   end
-  Ok(tok)
+  Modb.with_shared_lock(
+    db.files.read_only,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      case try Table.get(st, connector_tokens_table(), connector_name).map_error(table_err)
+        Some(r): Ok(if r.access_token.empty?: None else: Some(r.access_token))
+        None: Ok(None)
+      end
+    end
+  )
 end
 
 ## Reads and decrypts a stored OAuth token (transparently supporting legacy plaintext rows).
-fn get_connector_token_opened(db: Sqlite.Database, env: Env, connector_name: Text) : Result(
+fn get_connector_token_opened(db: DbHandle, env: Env, connector_name: Text) : Result(
   Option(Text),
   MotetError
 )
@@ -1314,25 +3374,29 @@ fn get_connector_token_opened(db: Sqlite.Database, env: Env, connector_name: Tex
   end
 end
 
-fn get_connector_token_meta(db: Sqlite.Database, connector_name: Text) : Result(
+fn get_connector_token_meta(db: DbHandle, connector_name: Text) : Result(
   Option((Text, Text)),
   MotetError
 )
-  rows = try db.query(
-    "SELECT scope, expires_at FROM connector_tokens WHERE connector_name = ?",
-    [Sqlite.String(connector_name)]
-  ).map_error(db_err)
-  Ok(rows.rows.first.map(fn(r) (cell_str(r, 0), cell_str(r, 1)) end))
+  if not db.files.read_only.exists?(db.secrets_path)
+    return Ok(None)
+  end
+  Modb.with_shared_lock(
+    db.files.read_only,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      case try Table.get(st, connector_tokens_table(), connector_name).map_error(table_err)
+        Some(r): Ok(Some((r.scope, r.expires_at)))
+        None: Ok(None)
+      end
+    end
+  )
 end
 
-fn delete_connector_token(db: Sqlite.Database, connector_name: Text) : Result(Unit, MotetError)
-  db.run("DELETE FROM connector_tokens WHERE connector_name = ?", [Sqlite.String(connector_name)])
-    .map_error(db_err)
-end
-
-## Write-only AES-256-GCM Vault secret storage (never returned to APIs or prompts).
+## Write-only AES-256-GCM Vault secret storage in isolated `motet-secrets.modb`.
 fn save_vault_secret(
-  db: Sqlite.Database,
+  db: DbHandle,
   env: Env,
   srng: SecureRandom,
   name: Text,
@@ -1345,38 +3409,50 @@ fn save_vault_secret(
   return Error(BadInput(message: "secret value cannot be empty")) if plaintext.trim.empty?
   clean_scope = if scope.trim.empty?: "global" else: scope.trim
   sealed = try Vault.seal_text(env, srng, "secret:#{clean_name}", plaintext.trim)
-  try db.run(
-    [
-      "INSERT INTO vault_secrets (name, scope, ciphertext, updated_at) VALUES (?, ?, ?, ?) ",
-      "ON CONFLICT(name) DO UPDATE SET scope = excluded.scope, ciphertext = excluded.ciphertext, ",
-      "updated_at = excluded.updated_at"
-    ].join(""),
-    [
-      Sqlite.String(clean_name),
-      Sqlite.String(clean_scope),
-      Sqlite.String(sealed),
-      Sqlite.String(now_text)
-    ]
-  ).map_error(db_err)
+  try Modb.with_exclusive_lock(
+    db.files,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      row = VaultSecretRow(
+        name: clean_name,
+        scope: clean_scope,
+        ciphertext: sealed,
+        updated_at: now_text
+      )
+      tx0 = Modb.begin_write(st)
+      tx1 = try Table.put(tx0, vault_secrets_table(), clean_name, row).map_error(table_err)
+      _s1 = try Modb.commit(tx1).map_error(modb_err)
+      Ok(Unit)
+    end
+  )
   Ok(VaultSecretMeta(name: clean_name, scope: clean_scope, updated_at: now_text, source: "vault"))
 end
 
-fn get_vault_secret(db: Sqlite.Database, env: Env, name: Text) : Result(Option(Text), MotetError)
+fn get_vault_secret(db: DbHandle, env: Env, name: Text) : Result(Option(Text), MotetError)
   clean = name.trim
-  return Ok(None) if clean.empty?
-  rows = try db.query("SELECT ciphertext FROM vault_secrets WHERE name = ?", [Sqlite.String(clean)])
-    .map_error(db_err)
-  case rows.rows.first
+  return Ok(None) if clean.empty? or not db.files.read_only.exists?(db.secrets_path)
+  ct_opt = try Modb.with_shared_lock(
+    db.files.read_only,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      case try Table.get(st, vault_secrets_table(), clean).map_error(table_err)
+        Some(r): Ok(Some(r.ciphertext))
+        None: Ok(None)
+      end
+    end
+  )
+  case ct_opt
     None: Ok(None)
-    Some(r):
-      ct = cell_str(r, 0)
+    Some(ct):
       plain = try Vault.open_text(env, "secret:#{clean}", ct)
       Ok(Some(plain))
   end
 end
 
 ## Resolves a named secret: checks AES-256-GCM Vault first, falling back to host Env.
-fn resolve_secret(db: Sqlite.Database, env: Env, name: Text) : Result(Option(Text), MotetError)
+fn resolve_secret(db: DbHandle, env: Env, name: Text) : Result(Option(Text), MotetError)
   clean = name.trim
   return Ok(None) if clean.empty?
   case try get_vault_secret(db, env, clean)
@@ -1390,18 +3466,30 @@ fn resolve_secret(db: Sqlite.Database, env: Env, name: Text) : Result(Option(Tex
 end
 
 ## Lists write-only Vault secret metadata (NEVER includes plaintext values).
-fn list_vault_secrets(db: Sqlite.Database, env: Env) : Result(List(VaultSecretMeta), MotetError)
-  rows = try db.query("SELECT name, scope, updated_at FROM vault_secrets ORDER BY name ASC", [])
-    .map_error(db_err)
-  var out = rows.rows.map(fn(r)
-    VaultSecretMeta(
-      name: cell_str(r, 0),
-      scope: cell_str(r, 1),
-      updated_at: cell_str(r, 2),
-      source: "vault"
+fn list_vault_secrets(db: DbHandle, env: Env) : Result(List(VaultSecretMeta), MotetError)
+  var out = if not db.files.read_only.exists?(db.secrets_path)
+    []
+  else
+    try Modb.with_shared_lock(
+      db.files.read_only,
+      db.secrets_path,
+      modb_err,
+      fn(st)
+        rows = try Table.all(st, vault_secrets_table()).map_error(table_err)
+        Ok(
+          rows.map(fn(p)
+            r = p.1
+            VaultSecretMeta(
+              name: r.name,
+              scope: r.scope,
+              updated_at: r.updated_at,
+              source: "vault"
+            )
+          end)
+        )
+      end
     )
-  end)
-  # Also report well-known env keys that are active via host Env (not yet overridden in Vault)
+  end
   known_env = [
     ("ANTHROPIC_API_KEY", "llm"),
     ("GEMINI_API_KEY", "llm"),
@@ -1426,187 +3514,154 @@ fn list_vault_secrets(db: Sqlite.Database, env: Env) : Result(List(VaultSecretMe
   Ok(out)
 end
 
-fn delete_vault_secret(db: Sqlite.Database, name: Text) : Result(Unit, MotetError)
-  db.run("DELETE FROM vault_secrets WHERE name = ?", [Sqlite.String(name.trim)]).map_error(db_err)
+fn delete_vault_secret(db: DbHandle, name: Text) : Result(Unit, MotetError)
+  if not db.files.read_only.exists?(db.secrets_path)
+    return Ok(Unit)
+  end
+  Modb.with_exclusive_lock(
+    db.files,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      tx0 = Modb.begin_write(st)
+      tx1 = try Table.delete(tx0, vault_secrets_table(), name.trim).map_error(table_err)
+      _s1 = try Modb.commit(tx1).map_error(modb_err)
+      Ok(Unit)
+    end
+  )
 end
 
+## Policy Rules.
 fn add_rule(
-  db: Sqlite.Database,
+  db: DbHandle,
   bot_name: Text,
   tool_pattern: Text,
   decision: ApprovalDecision,
   note: Text
 ) : Result(PolicyRule, MotetError)
-  try db.run(
-    "INSERT INTO policy_rules (bot_name, tool_pattern, decision, note) VALUES (?, ?, ?, ?)",
-    [
-      Sqlite.String(bot_name),
-      Sqlite.String(tool_pattern),
-      Sqlite.String(decision_to_text(decision)),
-      Sqlite.String(note)
-    ]
-  ).map_error(db_err)
-  id = try last_id(db)
-  Ok(
-    PolicyRule(
-      id: id,
-      bot_name: bot_name,
-      tool_pattern: tool_pattern,
-      decision: decision,
-      note: note
-    )
+  rep = try exec_replay(
+    db,
+    "operator",
+    "add_rule",
+    "add #{decision} rule #{bot_name}:#{tool_pattern}",
+    AddRuleArgs(bot_name: bot_name, tool_pattern: tool_pattern, decision: decision, note: note)
+      .to_json
+  )
+  Json.decode[PolicyRule](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn list_rules(db: DbHandle) : Result(List(PolicyRule), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), policy_rules_table()).map_error(table_err)
+      Ok(rows.map(fn(p) p.1 end).reverse)
+    end
   )
 end
 
-fn list_rules(db: Sqlite.Database) : Result(List(PolicyRule), MotetError)
-  rows = try db.query(
-    "SELECT id, bot_name, tool_pattern, decision, note FROM policy_rules ORDER BY id DESC",
-    []
-  ).map_error(db_err)
-  Ok(
-    rows.rows.map(fn(r)
-      PolicyRule(
-        id: cell_int(r, 0),
-        bot_name: cell_str(r, 1),
-        tool_pattern: cell_str(r, 2),
-        decision: decision_from_text(cell_str(r, 3)),
-        note: cell_str(r, 4)
-      )
-    end)
+fn delete_rule(db: DbHandle, id: Int) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "delete_rule",
+    "delete policy rule ##{id}",
+    IdArgs(id: id).to_json
   )
+  Ok(Unit)
 end
 
-fn delete_rule(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
-  db.run("DELETE FROM policy_rules WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
-end
-
-fn row_to_session(r: List(Sqlite.Value)) : SessionSummary
-  SessionSummary(
-    id: cell_str(r, 0),
-    bot_name: cell_str(r, 1),
-    title: cell_str(r, 2),
-    trust: trust_from_text(cell_str(r, 3)),
-    canonical?: cell_bool(r, 4),
-    compaction_seq: cell_int(r, 5),
-    created_at: cell_str(r, 6),
-    updated_at: cell_str(r, 7),
-    event_count: cell_int(r, 8)
-  )
-end
-
+## Sessions & append-only events + inverted FTS search.
 fn create_session(
-  db: Sqlite.Database,
+  db: DbHandle,
   session_id: Text,
   bot_name: Text,
   title: Text,
   trust: TrustLevel,
   now_text: Text
 ) : Result(SessionSummary, MotetError)
-  try db.run(
-    [
-      "INSERT INTO sessions (id, bot_name, title, trust, canonical, compaction_seq, created_at, updated_at) ",
-      "VALUES (?, ?, ?, ?, 0, 0, ?, ?) ",
-      "ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at"
-    ].join(""),
-    [
-      Sqlite.String(session_id),
-      Sqlite.String(bot_name),
-      Sqlite.String(title),
-      Sqlite.String(trust_to_text(trust)),
-      Sqlite.String(now_text),
-      Sqlite.String(now_text)
-    ]
-  ).map_error(db_err)
-  case try get_session(db, session_id)
-    Some(s): Ok(s)
-    None: Ok(
-      SessionSummary(
-        id: session_id,
-        bot_name: bot_name,
-        title: title,
-        trust: trust,
-        canonical?: false,
-        compaction_seq: 0,
-        created_at: now_text,
-        updated_at: now_text,
-        event_count: 0
-      )
-    )
-  end
+  rep = try exec_replay(
+    db,
+    "bot:#{bot_name}",
+    "create_session",
+    "open session #{session_id}",
+    CreateSessionArgs(
+      id: session_id,
+      bot_name: bot_name,
+      title: title,
+      trust: trust,
+      canonical: false,
+      now_text: now_text
+    ).to_json
+  )
+  Json.decode[SessionSummary](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
-## Returns (or creates) the persistent canonical forever-chat session for one bot.
-fn get_or_create_canonical_session(db: Sqlite.Database, bot_name: Text, now_text: Text) : Result(
+fn get_or_create_canonical_session(db: DbHandle, bot_name: Text, now_text: Text) : Result(
   SessionSummary,
   MotetError
 )
   cid = "#{bot_name}-main"
-  try db.run(
-    [
-      "INSERT INTO sessions (id, bot_name, title, trust, canonical, compaction_seq, created_at, updated_at) ",
-      "VALUES (?, ?, ?, 'owner', 1, 0, ?, ?) ",
-      "ON CONFLICT(id) DO UPDATE SET canonical = 1, updated_at = excluded.updated_at"
-    ].join(""),
-    [
-      Sqlite.String(cid),
-      Sqlite.String(bot_name),
-      Sqlite.String("#{bot_name} · Main Chat"),
-      Sqlite.String(now_text),
-      Sqlite.String(now_text)
-    ]
-  ).map_error(db_err)
-  (try get_session(db, cid)).or_fail(StorageFailed(message: "canonical session lookup failed"))
+  rep = try exec_replay(
+    db,
+    "bot:#{bot_name}",
+    "create_session",
+    "open canonical session #{cid}",
+    CreateSessionArgs(
+      id: cid,
+      bot_name: bot_name,
+      title: "#{bot_name} · Main Chat",
+      trust: Owner,
+      canonical: true,
+      now_text: now_text
+    ).to_json
+  )
+  Json.decode[SessionSummary](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
-fn get_session(db: Sqlite.Database, session_id: Text) : Result(Option(SessionSummary), MotetError)
-  rows = try db.query(
-    [
-      "SELECT s.id, s.bot_name, s.title, s.trust, s.canonical, s.compaction_seq, s.created_at, s.updated_at, ",
-      "(SELECT COUNT(*) FROM events e WHERE e.session_id = s.id) ",
-      "FROM sessions s WHERE s.id = ?"
-    ].join(""),
-    [Sqlite.String(session_id)]
-  ).map_error(db_err)
-  Ok(rows.rows.first.map(fn(r) row_to_session(r) end))
+fn get_session(db: DbHandle, session_id: Text) : Result(Option(SessionSummary), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) Table.get(Ledger.store(ldb), sessions_table(), session_id).map_error(table_err) end
+  )
 end
 
-fn set_session_compaction_seq(db: Sqlite.Database, session_id: Text, compaction_seq: Int) : Result(
+fn set_session_compaction_seq(db: DbHandle, session_id: Text, compaction_seq: Int) : Result(
   Unit,
   MotetError
 )
-  db.run(
-    "UPDATE sessions SET compaction_seq = ? WHERE id = ?",
-    [Sqlite.Integer(compaction_seq), Sqlite.String(session_id)]
-  ).map_error(db_err)
+  _res = try exec_replay(
+    db,
+    "session:#{session_id}",
+    "set_session_compaction_seq",
+    "checkpoint compaction @#{compaction_seq} on #{session_id}",
+    SetCompactionSeqArgs(session_id: session_id, compaction_seq: compaction_seq).to_json
+  )
+  Ok(Unit)
 end
 
-fn list_sessions(db: Sqlite.Database, bot_filter: Option(Text)) : Result(
-  List(SessionSummary),
-  MotetError
-)
-  rows = case bot_filter
-    Some(bot): try db.query(
-      [
-        "SELECT s.id, s.bot_name, s.title, s.trust, s.canonical, s.compaction_seq, s.created_at, s.updated_at, ",
-        "(SELECT COUNT(*) FROM events e WHERE e.session_id = s.id) ",
-        "FROM sessions s WHERE s.bot_name = ? ORDER BY s.canonical DESC, s.updated_at DESC LIMIT 50"
-      ].join(""),
-      [Sqlite.String(bot)]
-    ).map_error(db_err)
-    None: try db.query(
-      [
-        "SELECT s.id, s.bot_name, s.title, s.trust, s.canonical, s.compaction_seq, s.created_at, s.updated_at, ",
-        "(SELECT COUNT(*) FROM events e WHERE e.session_id = s.id) ",
-        "FROM sessions s ORDER BY s.canonical DESC, s.updated_at DESC LIMIT 50"
-      ].join(""),
-      []
-    ).map_error(db_err)
-  end
-  Ok(rows.rows.map(fn(r) row_to_session(r) end))
+fn list_sessions(db: DbHandle, bot_filter: Option(Text)) : Result(List(SessionSummary), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      rows = case bot_filter
+        Some(bot): try Table.lookup(st, sessions_table(), sessions_by_bot_index(), bot).map_error(
+          table_err
+        )
+        None: try Table.all(st, sessions_table()).map_error(table_err)
+      end
+      sorted = rows.map(fn(p) p.1 end).sort_by(fn(s)
+        cflag = if s.canonical?: "1" else: "0"
+        "#{cflag}:#{s.updated_at}:#{s.id}"
+      end).reverse
+      Ok(sorted.take(50))
+    end
+  )
 end
 
 fn append_event_full(
-  db: Sqlite.Database,
+  db: DbHandle,
   session_id: Text,
   kind: Text,
   role: Text,
@@ -1617,48 +3672,13 @@ fn append_event_full(
   cost_usd: Decimal,
   now_text: Text
 ) : Result(SessionEvent, MotetError)
-  seq_rows = try db.query(
-    "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?",
-    [Sqlite.String(session_id)]
-  ).map_error(db_err)
-  next_seq = cell_int(seq_rows.rows.first or [], 0) + 1
-  tname = tool_name or ""
-  tcid = tool_call_id or ""
-  tcalls = tool_calls_json or ""
-  try db.run(
-    [
-      "INSERT INTO events (session_id, seq, kind, role, content, tool_name, tool_call_id, tool_calls_json, cost_usd, created_at) ",
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ].join(""),
-    [
-      Sqlite.String(session_id),
-      Sqlite.Integer(next_seq),
-      Sqlite.String(kind),
-      Sqlite.String(role),
-      Sqlite.String(content),
-      Sqlite.String(tname),
-      Sqlite.String(tcid),
-      Sqlite.String(tcalls),
-      Sqlite.String(cost_usd.to_fixed(6)),
-      Sqlite.String(now_text)
-    ]
-  ).map_error(db_err)
-  ev_id = try last_id(db)
-  try db.run(
-    "UPDATE sessions SET updated_at = ? WHERE id = ?",
-    [Sqlite.String(now_text), Sqlite.String(session_id)]
-  ).map_error(db_err)
-  for tok in tokenize("#{kind} #{tname} #{content}").take(64)
-    try db.run(
-      "INSERT INTO event_tokens (token, event_id) VALUES (?, ?) ON CONFLICT(token, event_id) DO NOTHING",
-      [Sqlite.String(tok), Sqlite.Integer(ev_id)]
-    ).map_error(db_err)
-  end
-  Ok(
-    SessionEvent(
-      id: ev_id,
+  rep = try exec_replay(
+    db,
+    "session:#{session_id}",
+    "append_event",
+    "append #{kind} (#{role}) to #{session_id}",
+    AppendEventArgs(
       session_id: session_id,
-      seq: next_seq,
       kind: kind,
       role: role,
       content: content,
@@ -1666,13 +3686,14 @@ fn append_event_full(
       tool_call_id: tool_call_id,
       tool_calls_json: tool_calls_json,
       cost_usd: cost_usd,
-      created_at: now_text
-    )
+      now_text: now_text
+    ).to_json
   )
+  Json.decode[SessionEvent](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
 fn append_event(
-  db: Sqlite.Database,
+  db: DbHandle,
   session_id: Text,
   kind: Text,
   role: Text,
@@ -1696,103 +3717,134 @@ fn append_event(
   )
 end
 
-fn row_to_event(r: List(Sqlite.Value)) : SessionEvent
-  SessionEvent(
-    id: cell_int(r, 0),
-    session_id: cell_str(r, 1),
-    seq: cell_int(r, 2),
-    kind: cell_str(r, 3),
-    role: cell_str(r, 4),
-    content: cell_str(r, 5),
-    tool_name: cell_opt_str(r, 6),
-    tool_call_id: cell_opt_str(r, 7),
-    tool_calls_json: cell_opt_str(r, 8),
-    cost_usd: cell_decimal(r, 9),
-    created_at: cell_str(r, 10)
+fn list_events(db: DbHandle, session_id: Text, limit: Int) : Result(List(SessionEvent), MotetError)
+  cap = if limit > 0 and limit <= 500: limit else: 100
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.lookup(
+        Ledger.store(ldb),
+        events_table(),
+        events_by_session_index(),
+        session_id
+      ).map_error(table_err)
+      sorted = rows.map(fn(p) p.1 end).sort_by(fn(ev) ev.seq end)
+      Ok(sorted.take(cap))
+    end
   )
 end
 
-event_select_cols = "id, session_id, seq, kind, role, content, tool_name, tool_call_id, tool_calls_json, cost_usd, created_at"
-
-fn list_events(db: Sqlite.Database, session_id: Text, limit: Int) : Result(
-  List(SessionEvent),
-  MotetError
-)
-  cap = if limit > 0 and limit <= 500: limit else: 100
-  rows = try db.query(
-    "SELECT #{event_select_cols} FROM events WHERE session_id = ? ORDER BY seq ASC LIMIT ?",
-    [Sqlite.String(session_id), Sqlite.Integer(cap)]
-  ).map_error(db_err)
-  Ok(rows.rows.map(fn(r) row_to_event(r) end))
-end
-
-## Incremental event tailing (`seq > after_seq`) for live UI progress and compaction windows.
-fn list_events_after(db: Sqlite.Database, session_id: Text, after_seq: Int, limit: Int) : Result(
+fn list_events_after(db: DbHandle, session_id: Text, after_seq: Int, limit: Int) : Result(
   List(SessionEvent),
   MotetError
 )
   cap = if limit > 0 and limit <= 500: limit else: 200
-  rows = try db.query(
-    "SELECT #{event_select_cols} FROM events WHERE session_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
-    [Sqlite.String(session_id), Sqlite.Integer(after_seq), Sqlite.Integer(cap)]
-  ).map_error(db_err)
-  Ok(rows.rows.map(fn(r) row_to_event(r) end))
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.lookup(
+        Ledger.store(ldb),
+        events_table(),
+        events_by_session_index(),
+        session_id
+      ).map_error(table_err)
+      filtered = rows.map(fn(p) p.1 end).filter(fn(ev) ev.seq > after_seq end).sort_by(fn(ev)
+        ev.seq
+      end)
+      Ok(filtered.take(cap))
+    end
+  )
 end
 
-fn search_events(db: Sqlite.Database, query: Text, limit: Int) : Result(
-  List(SessionEvent),
-  MotetError
-)
+fn search_events(db: DbHandle, query: Text, limit: Int) : Result(List(SessionEvent), MotetError)
   terms = tokenize(query)
   return Ok([]) if terms.empty?
   cap = if limit > 0 and limit <= 100: limit else: 20
   first_term = terms.first or ""
-  rows = try db.query(
-    [
-      "SELECT e.id, e.session_id, e.seq, e.kind, e.role, e.content, e.tool_name, e.tool_call_id, e.tool_calls_json, e.cost_usd, e.created_at ",
-      "FROM events e JOIN event_tokens t ON e.id = t.event_id ",
-      "WHERE t.token = ? ORDER BY e.id DESC LIMIT ?"
-    ].join(""),
-    [Sqlite.String(first_term), Sqlite.Integer(cap * 4)]
-  ).map_error(db_err)
   rest = terms.drop(1)
-  hits = rows.rows.map(fn(r) row_to_event(r) end).filter(fn(ev)
-    doc = tokenize("#{ev.kind} #{ev.tool_name or ""} #{ev.content}")
-    rest.all?(fn(t) doc.contains?(t) end)
-  end).take(cap)
-  Ok(hits)
-end
-
-## Counts owner denials in a session for a tool (used by the 3-denial circuit breaker).
-fn count_session_tool_denials(db: Sqlite.Database, session_id: Text, tool_name: Text) : Result(
-  Int,
-  MotetError
-)
-  rows = try db.query(
-    "SELECT COUNT(*) FROM events WHERE session_id = ? AND kind = 'approval_denied' AND (tool_name = ? OR ? = '')",
-    [Sqlite.String(session_id), Sqlite.String(tool_name), Sqlite.String(tool_name)]
-  ).map_error(db_err)
-  Ok(cell_int(rows.rows.first or [], 0))
-end
-
-memory_select_cols = "id, scope, kind, content, provenance, origin, session_kind, staged, created_at"
-
-fn row_to_memory(r: List(Sqlite.Value)) : MemoryEntry
-  MemoryEntry(
-    id: cell_int(r, 0),
-    scope: cell_str(r, 1),
-    kind: cell_str(r, 2),
-    content: cell_str(r, 3),
-    provenance: cell_str(r, 4),
-    origin: cell_str(r, 5),
-    session_kind: cell_str(r, 6),
-    staged: cell_bool(r, 7),
-    created_at: cell_str(r, 8)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      ids = try scan_token_ids_desc(st, "event_tokens", first_term).map_error(table_err)
+      var hits = []
+      for eid in ids
+        break if hits.size >= cap
+        case try Table.get(st, events_table(), eid).map_error(table_err)
+          Some(ev):
+            doc = tokenize("#{ev.kind} #{ev.tool_name or ""} #{ev.content}")
+            if rest.all?(fn(t) doc.contains?(t) end)
+              hits = hits.append(ev)
+            end
+          None: Unit
+        end
+      end
+      Ok(hits)
+    end
   )
 end
 
+fn count_session_tool_denials(db: DbHandle, session_id: Text, tool_name: Text) : Result(
+  Int,
+  MotetError
+)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.lookup(
+        Ledger.store(ldb),
+        events_table(),
+        events_by_session_index(),
+        session_id
+      ).map_error(table_err)
+      cnt = rows.filter(fn(p)
+        ev = p.1
+        ev.kind == "approval_denied" and (tool_name == "" or (ev.tool_name or "") == tool_name)
+      end).size
+      Ok(cnt)
+    end
+  )
+end
+
+fn has_events_since(db: DbHandle, since: Text) : Result(Bool, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), events_table()).map_error(table_err)
+      Ok(rows.any?(fn(p) p.1.created_at > since end))
+    end
+  )
+end
+
+fn list_recent_owner_user_messages(db: DbHandle, limit: Int) : Result(List(Text), MotetError)
+  cap = if limit > 0 and limit <= 200: limit else: 40
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      srows = try Table.all(st, sessions_table()).map_error(table_err)
+      var owner_sessions = {}
+      for (sid, s) in srows
+        if s.trust == Owner
+          owner_sessions = owner_sessions.set(sid, true)
+        end
+      end
+      erows = try Table.all(st, events_table()).map_error(table_err)
+      var out = []
+      for (_id, ev) in erows.reverse
+        break if out.size >= cap
+        if ev.kind == "message" and ev.role == "user" and (owner_sessions.get(ev.session_id) or false)
+          out = out.append(ev.content)
+        end
+      end
+      Ok(out)
+    end
+  )
+end
+
+## Durable Memories (taint-gated, staging, archive/restore) + Dreaming + inverted FTS search.
 fn save_memory_full(
-  db: Sqlite.Database,
+  db: DbHandle,
   scope: Text,
   kind: Text,
   content: Text,
@@ -1802,29 +3854,12 @@ fn save_memory_full(
   staged?: Bool,
   now_text: Text
 ) : Result(MemoryEntry, MotetError)
-  try db.run(
-    "INSERT INTO memories (scope, kind, content, provenance, origin, session_kind, staged, archived, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
-    [
-      Sqlite.String(scope),
-      Sqlite.String(kind),
-      Sqlite.String(content),
-      Sqlite.String(provenance),
-      Sqlite.String(origin),
-      Sqlite.String(session_kind),
-      Sqlite.Integer(if staged?: 1 else: 0),
-      Sqlite.String(now_text)
-    ]
-  ).map_error(db_err)
-  id = try last_id(db)
-  for tok in tokenize("#{scope} #{kind} #{content}").take(64)
-    try db.run(
-      "INSERT INTO memory_tokens (token, memory_id) VALUES (?, ?) ON CONFLICT(token, memory_id) DO NOTHING",
-      [Sqlite.String(tok), Sqlite.Integer(id)]
-    ).map_error(db_err)
-  end
-  Ok(
-    MemoryEntry(
-      id: id,
+  rep = try exec_replay(
+    db,
+    provenance,
+    "save_memory",
+    "save #{scope}/#{kind} memory",
+    SaveMemoryArgs(
       scope: scope,
       kind: kind,
       content: content,
@@ -1832,13 +3867,14 @@ fn save_memory_full(
       origin: origin,
       session_kind: session_kind,
       staged: staged?,
-      created_at: now_text
-    )
+      now_text: now_text
+    ).to_json
   )
+  Json.decode[MemoryEntry](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
 fn save_memory(
-  db: Sqlite.Database,
+  db: DbHandle,
   scope: Text,
   kind: Text,
   content: Text,
@@ -1848,170 +3884,290 @@ fn save_memory(
   save_memory_full(db, scope, kind, content, provenance, "owner", "direct", false, now_text)
 end
 
-fn list_memories(db: Sqlite.Database, scope_opt: Option(Text), limit: Int) : Result(
+fn list_memories(db: DbHandle, scope_opt: Option(Text), limit: Int) : Result(
   List(MemoryEntry),
   MotetError
 )
   cap = if limit > 0 and limit <= 200: limit else: 50
-  rows = case scope_opt
-    Some(scope): try db.query(
-      "SELECT #{memory_select_cols} FROM memories WHERE staged = 0 AND archived = 0 AND scope = ? ORDER BY id DESC LIMIT ?",
-      [Sqlite.String(scope), Sqlite.Integer(cap)]
-    ).map_error(db_err)
-    None: try db.query(
-      "SELECT #{memory_select_cols} FROM memories WHERE staged = 0 AND archived = 0 ORDER BY id DESC LIMIT ?",
-      [Sqlite.Integer(cap)]
-    ).map_error(db_err)
-  end
-  Ok(rows.rows.map(fn(r) row_to_memory(r) end))
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      rows = case scope_opt
+        Some(scope): try Table.lookup(st, memories_table(), memories_by_scope_index(), scope)
+          .map_error(table_err)
+        None: try Table.all(st, memories_table()).map_error(table_err)
+      end
+      active = rows.map(fn(p) p.1 end).filter(fn(m) not m.staged and not m.archived? end)
+        .reverse
+        .take(cap)
+      Ok(active.map(mem_row_to_entry))
+    end
+  )
 end
 
-fn list_staged_memories(db: Sqlite.Database, limit: Int) : Result(List(MemoryEntry), MotetError)
+fn list_staged_memories(db: DbHandle, limit: Int) : Result(List(MemoryEntry), MotetError)
   cap = if limit > 0 and limit <= 200: limit else: 50
-  rows = try db.query(
-    "SELECT #{memory_select_cols} FROM memories WHERE staged = 1 AND archived = 0 ORDER BY id DESC LIMIT ?",
-    [Sqlite.Integer(cap)]
-  ).map_error(db_err)
-  Ok(rows.rows.map(fn(r) row_to_memory(r) end))
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), memories_table()).map_error(table_err)
+      staged = rows.map(fn(p) p.1 end).filter(fn(m) m.staged and not m.archived? end)
+        .reverse
+        .take(cap)
+      Ok(staged.map(mem_row_to_entry))
+    end
+  )
 end
 
-fn promote_staged_memory(db: Sqlite.Database, id: Int) : Result(MemoryEntry, MotetError)
-  try db.run(
-    "UPDATE memories SET staged = 0, origin = 'owner' WHERE id = ? AND archived = 0",
-    [Sqlite.Integer(id)]
-  ).map_error(db_err)
-  rows = try db.query(
-    "SELECT #{memory_select_cols} FROM memories WHERE id = ?",
-    [Sqlite.Integer(id)]
-  ).map_error(db_err)
-  row = try rows.rows.first.or_fail(ItemNotFound(message: "memory ##{id} not found"))
-  Ok(row_to_memory(row))
+fn promote_staged_memory(db: DbHandle, id: Int) : Result(MemoryEntry, MotetError)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "promote_staged_memory",
+    "promote staged memory ##{id}",
+    IdArgs(id: id).to_json
+  )
+  Json.decode[MemoryEntry](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
-fn update_memory_content(db: Sqlite.Database, id: Int, new_content: Text) : Result(
+fn update_memory_content(db: DbHandle, id: Int, new_content: Text) : Result(
   MemoryEntry,
   MotetError
 )
-  rows0 = try db.query(
-    "SELECT #{memory_select_cols} FROM memories WHERE id = ?",
-    [Sqlite.Integer(id)]
-  ).map_error(db_err)
-  r0 = try rows0.rows.first.or_fail(ItemNotFound(message: "memory ##{id} not found"))
-  cur = row_to_memory(r0)
-  try db.run(
-    "UPDATE memories SET content = ? WHERE id = ?",
-    [Sqlite.String(new_content.trim), Sqlite.Integer(id)]
-  ).map_error(db_err)
-  try db.run("DELETE FROM memory_tokens WHERE memory_id = ?", [Sqlite.Integer(id)]).map_error(
-    db_err
+  rep = try exec_replay(
+    db,
+    "operator",
+    "update_memory_content",
+    "patch memory ##{id}",
+    UpdateMemoryContentArgs(id: id, content: new_content.trim).to_json
   )
-  for tok in tokenize("#{cur.scope} #{cur.kind} #{new_content.trim}").take(64)
-    try db.run(
-      "INSERT INTO memory_tokens (token, memory_id) VALUES (?, ?) ON CONFLICT(token, memory_id) DO NOTHING",
-      [Sqlite.String(tok), Sqlite.Integer(id)]
-    ).map_error(db_err)
-  end
-  Ok(
-    MemoryEntry(
-      id: cur.id,
-      scope: cur.scope,
-      kind: cur.kind,
-      content: new_content.trim,
-      provenance: cur.provenance,
-      origin: cur.origin,
-      session_kind: cur.session_kind,
-      staged: cur.staged,
-      created_at: cur.created_at
-    )
+  Json.decode[MemoryEntry](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn archive_memory(db: DbHandle, id: Int) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:dreaming",
+    "archive_memory",
+    "archive memory ##{id}",
+    IdArgs(id: id).to_json
   )
+  Ok(Unit)
 end
 
-fn archive_memory(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
-  db.run("UPDATE memories SET archived = 1 WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
+fn restore_memory(db: DbHandle, id: Int) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "restore_memory",
+    "restore archived memory ##{id}",
+    IdArgs(id: id).to_json
+  )
+  Ok(Unit)
 end
 
-fn restore_memory(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
-  db.run("UPDATE memories SET archived = 0 WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
-end
-
-fn search_memories(db: Sqlite.Database, scope_opt: Option(Text), query: Text) : Result(
+fn search_memories(db: DbHandle, scope_opt: Option(Text), query: Text) : Result(
   List(MemoryEntry),
   MotetError
 )
   terms = tokenize(query)
   return list_memories(db, scope_opt, 20) if terms.empty?
   first_term = terms.first or ""
-  rows = try db.query(
-    [
-      "SELECT m.id, m.scope, m.kind, m.content, m.provenance, m.origin, m.session_kind, m.staged, m.created_at ",
-      "FROM memories m JOIN memory_tokens t ON m.id = t.memory_id ",
-      "WHERE t.token = ? AND m.staged = 0 AND m.archived = 0 ORDER BY m.id DESC LIMIT 80"
-    ].join(""),
-    [Sqlite.String(first_term)]
-  ).map_error(db_err)
   rest = terms.drop(1)
-  hits = rows.rows.map(fn(r) row_to_memory(r) end).filter(fn(m)
-    scope_ok = case scope_opt
-      Some(s): m.scope == s or m.scope == "shared"
-      None: true
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      ids = try scan_token_ids_desc(st, "memory_tokens", first_term).map_error(table_err)
+      var hits = []
+      for mid in ids
+        break if hits.size >= 20
+        case try Table.get(st, memories_table(), mid).map_error(table_err)
+          Some(m) if not m.staged and not m.archived?:
+            scope_ok = case scope_opt
+              Some(s): m.scope == s or m.scope == "shared"
+              None: true
+            end
+            if scope_ok
+              doc = tokenize("#{m.scope} #{m.kind} #{m.content}")
+              if rest.all?(fn(t) doc.contains?(t) end)
+                hits = hits.append(mem_row_to_entry(m))
+              end
+            end
+          Some(_) | None: Unit
+        end
+      end
+      Ok(hits)
     end
-    doc = tokenize("#{m.scope} #{m.kind} #{m.content}")
-    scope_ok and rest.all?(fn(t) doc.contains?(t) end)
-  end).take(20)
-  Ok(hits)
-end
-
-fn delete_memory(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
-  try db.run("DELETE FROM memory_tokens WHERE memory_id = ?", [Sqlite.Integer(id)]).map_error(
-    db_err
-  )
-  db.run("DELETE FROM memories WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
-end
-
-fn record_skill_usage(db: Sqlite.Database, skill_name: Text, now_text: Text) : Result(
-  Unit,
-  MotetError
-)
-  db.run(
-    "INSERT INTO skill_usage (skill_name, read_count, last_used_at) VALUES (?, 1, ?) ON CONFLICT(skill_name) DO UPDATE SET read_count = read_count + 1, last_used_at = excluded.last_used_at",
-    [Sqlite.String(skill_name.trim), Sqlite.String(now_text)]
-  ).map_error(db_err)
-end
-
-fn get_skill_usage_map(db: Sqlite.Database) : Result(Map(Text, Int), MotetError)
-  rows = try db.query("SELECT skill_name, read_count FROM skill_usage", []).map_error(db_err)
-  var m = {}
-  for r in rows.rows
-    m = m.set(cell_str(r, 0), cell_int(r, 1))
-  end
-  Ok(m)
-end
-
-routine_select_cols = "id, bot_name, name, prompt, interval_seconds, schedule_kind, schedule_expr, timezone, read_only, skip_memory, precheck_kind, enabled, next_due_at, last_run_at, run_count, skip_count"
-
-fn row_to_routine(r: List(Sqlite.Value)) : RoutineSpec
-  RoutineSpec(
-    id: cell_int(r, 0),
-    bot_name: cell_str(r, 1),
-    name: cell_str(r, 2),
-    prompt: cell_str(r, 3),
-    interval_seconds: cell_int(r, 4),
-    schedule_kind: cell_str(r, 5),
-    schedule_expr: cell_str(r, 6),
-    timezone: cell_str(r, 7),
-    read_only?: cell_bool(r, 8),
-    skip_memory?: cell_bool(r, 9),
-    precheck_kind: cell_str(r, 10),
-    enabled?: cell_bool(r, 11),
-    next_due_at: cell_str(r, 12),
-    last_run_at: cell_opt_str(r, 13),
-    run_count: cell_int(r, 14),
-    skip_count: cell_int(r, 15)
   )
 end
 
+fn delete_memory(db: DbHandle, id: Int) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "delete_memory",
+    "delete memory ##{id}",
+    IdArgs(id: id).to_json
+  )
+  Ok(Unit)
+end
+
+fn record_dreaming_run(
+  db: DbHandle,
+  run_at: Text,
+  summary: Text,
+  promoted_count: Int,
+  pruned_count: Int,
+  rollback_snapshot_json: Text
+) : Result(DreamingDigest, MotetError)
+  rep = try exec_replay(
+    db,
+    "system:dreaming",
+    "record_dreaming_run",
+    "record dreaming digest (+#{promoted_count}/-#{pruned_count})",
+    RecordDreamingArgs(
+      run_at: run_at,
+      summary: summary,
+      promoted_count: promoted_count,
+      pruned_count: pruned_count,
+      rollback_snapshot_json: rollback_snapshot_json
+    ).to_json
+  )
+  Json.decode[DreamingDigest](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn list_dreaming_runs(db: DbHandle, limit: Int) : Result(List(DreamingRunRow), MotetError)
+  cap = if limit > 0 and limit <= 50: limit else: 15
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), dreaming_runs_table()).map_error(table_err)
+      Ok(rows.map(fn(p) p.1 end).reverse.take(cap))
+    end
+  )
+end
+
+fn get_dreaming_run(db: DbHandle, id: Int) : Result(Option(DreamingRunRow), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) Table.get(Ledger.store(ldb), dreaming_runs_table(), id).map_error(table_err) end
+  )
+end
+
+fn mark_dreaming_rolled_back(db: DbHandle, id: Int) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "mark_dreaming_rolled_back",
+    "rollback dreaming run ##{id}",
+    IdArgs(id: id).to_json
+  )
+  Ok(Unit)
+end
+
+fn has_dreamed_today(db: DbHandle, day_prefix: Text) : Result(Bool, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), dreaming_runs_table()).map_error(table_err)
+      Ok(rows.any?(fn(p) not p.1.rolled_back? and p.1.run_at.starts_with?(day_prefix) end))
+    end
+  )
+end
+
+## Standing Intents.
+fn create_intent(
+  db: DbHandle,
+  bot_name: Text,
+  name: Text,
+  watch_terms: Text,
+  instruction: Text,
+  cooldown_seconds: Int,
+  max_fires: Int,
+  expires_at: Text
+) : Result(StandingIntent, MotetError)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "create_intent",
+    "create standing intent #{bot_name}:#{name}",
+    CreateIntentArgs(
+      bot_name: bot_name,
+      name: name,
+      watch_terms: watch_terms,
+      instruction: instruction,
+      cooldown_seconds: cooldown_seconds,
+      max_fires: max_fires,
+      expires_at: expires_at
+    ).to_json
+  )
+  Json.decode[StandingIntent](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn list_intents(db: DbHandle, only_active?: Bool) : Result(List(StandingIntent), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), intents_table()).map_error(table_err)
+      items = rows.map(fn(p) p.1 end).reverse
+      Ok(if only_active?: items.filter(fn(i) i.active? end) else: items)
+    end
+  )
+end
+
+fn cancel_intent(db: DbHandle, id: Int) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "cancel_intent",
+    "cancel standing intent ##{id}",
+    IdArgs(id: id).to_json
+  )
+  Ok(Unit)
+end
+
+fn record_intent_fired(db: DbHandle, id: Int, now_text: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:intents",
+    "record_intent_fired",
+    "record fire on intent ##{id}",
+    RecordIntentFiredArgs(id: id, now_text: now_text).to_json
+  )
+  Ok(Unit)
+end
+
+## Skill usage tracking.
+fn record_skill_usage(db: DbHandle, skill_name: Text, now_text: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:skills",
+    "record_skill_usage",
+    "record usage of skill #{skill_name.trim}",
+    RecordSkillUsageArgs(skill_name: skill_name, now_text: now_text).to_json
+  )
+  Ok(Unit)
+end
+
+fn get_skill_usage_map(db: DbHandle) : Result(Map(Text, Int), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), skill_usage_table()).map_error(table_err)
+      var m = {}
+      for (sname, row) in rows
+        m = m.set(sname, row.read_count)
+      end
+      Ok(m)
+    end
+  )
+end
+
+## Standing Routines + at-most-once slot claims.
 fn upsert_routine_full(
-  db: Sqlite.Database,
+  db: DbHandle,
   bot_name: Text,
   name: Text,
   prompt: Text,
@@ -2024,43 +4180,30 @@ fn upsert_routine_full(
   precheck_kind: Text,
   next_due_at: Text
 ) : Result(RoutineSpec, MotetError)
-  secs = if interval_seconds >= 10: interval_seconds else: 60
-  sk = if schedule_kind.trim.empty?: "interval" else: schedule_kind.trim.ascii_lowercase
-  tz = if timezone.trim.empty?: "America/Los_Angeles" else: timezone.trim
-  try db.run(
-    [
-      "INSERT INTO routines (bot_name, name, prompt, interval_seconds, schedule_kind, schedule_expr, timezone, read_only, skip_memory, precheck_kind, enabled, next_due_at, last_run_at, run_count, skip_count) ",
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, '', 0, 0) ",
-      "ON CONFLICT(bot_name, name) DO UPDATE SET prompt = excluded.prompt, ",
-      "interval_seconds = excluded.interval_seconds, schedule_kind = excluded.schedule_kind, ",
-      "schedule_expr = excluded.schedule_expr, timezone = excluded.timezone, ",
-      "read_only = excluded.read_only, skip_memory = excluded.skip_memory, ",
-      "precheck_kind = excluded.precheck_kind, enabled = 1, next_due_at = excluded.next_due_at"
-    ].join(""),
-    [
-      Sqlite.String(bot_name),
-      Sqlite.String(name),
-      Sqlite.String(prompt),
-      Sqlite.Integer(secs),
-      Sqlite.String(sk),
-      Sqlite.String(schedule_expr.trim),
-      Sqlite.String(tz),
-      Sqlite.Integer(if read_only?: 1 else: 0),
-      Sqlite.Integer(if skip_memory?: 1 else: 0),
-      Sqlite.String(precheck_kind.trim),
-      Sqlite.String(next_due_at)
-    ]
-  ).map_error(db_err)
-  rows = try db.query(
-    "SELECT #{routine_select_cols} FROM routines WHERE bot_name = ? AND name = ?",
-    [Sqlite.String(bot_name), Sqlite.String(name)]
-  ).map_error(db_err)
-  row = try rows.rows.first.or_fail(StorageFailed(message: "routine upsert did not return row"))
-  Ok(row_to_routine(row))
+  rep = try exec_replay(
+    db,
+    "bot:#{bot_name}",
+    "upsert_routine",
+    "schedule routine #{bot_name}:#{name}",
+    UpsertRoutineArgs(
+      bot_name: bot_name,
+      name: name,
+      prompt: prompt,
+      interval_seconds: interval_seconds,
+      schedule_kind: schedule_kind,
+      schedule_expr: schedule_expr,
+      timezone: timezone,
+      read_only: read_only?,
+      skip_memory: skip_memory?,
+      precheck_kind: precheck_kind,
+      next_due_at: next_due_at
+    ).to_json
+  )
+  Json.decode[RoutineSpec](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
 fn upsert_routine(
-  db: Sqlite.Database,
+  db: DbHandle,
   bot_name: Text,
   name: Text,
   prompt: Text,
@@ -2084,121 +4227,106 @@ fn upsert_routine(
   )
 end
 
-fn list_routines(db: Sqlite.Database) : Result(List(RoutineSpec), MotetError)
-  rows = try db.query("SELECT #{routine_select_cols} FROM routines ORDER BY id ASC", []).map_error(
-    db_err
+fn list_routines(db: DbHandle) : Result(List(RoutineSpec), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), routines_table()).map_error(table_err)
+      Ok(rows.map(fn(p) p.1 end))
+    end
   )
-  Ok(rows.rows.map(fn(r) row_to_routine(r) end))
 end
 
-fn list_due_routines(db: Sqlite.Database, now_text: Text) : Result(List(RoutineSpec), MotetError)
-  rows = try db.query(
-    "SELECT #{routine_select_cols} FROM routines WHERE enabled = 1 AND (schedule_kind != 'interval' OR next_due_at <= ?) ORDER BY id ASC",
-    [Sqlite.String(now_text)]
-  ).map_error(db_err)
-  Ok(rows.rows.map(fn(r) row_to_routine(r) end))
+fn list_due_routines(db: DbHandle, now_text: Text) : Result(List(RoutineSpec), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), routines_table()).map_error(table_err)
+      due = rows.map(fn(p) p.1 end).filter(fn(r)
+        r.enabled? and (r.schedule_kind != "interval" or r.next_due_at <= now_text)
+      end)
+      Ok(due)
+    end
+  )
 end
 
-## At-most-once occurrence ledger: returns `true` only the first time `(routine_id, slot_key)` is claimed.
-fn claim_routine_slot(db: Sqlite.Database, routine_id: Int, slot_key: Text, now_text: Text) : Result(
+fn claim_routine_slot(db: DbHandle, routine_id: Int, slot_key: Text, now_text: Text) : Result(
   Bool,
   MotetError
 )
-  existing = try db.query(
-    "SELECT id FROM routine_runs WHERE routine_id = ? AND slot_key = ?",
-    [Sqlite.Integer(routine_id), Sqlite.String(slot_key)]
-  ).map_error(db_err)
-  if existing.rows.first is Some(_)
-    return Ok(false)
+  comp = "#{routine_id}\u{1f}#{slot_key}"
+  if db.files.read_only.exists?(db.path)
+    fast = with_db_read(
+      db,
+      fn(ldb) Table.get(Ledger.store(ldb), routine_runs_table(), comp).map_error(table_err) end
+    )
+    if fast is Ok(Some(_))
+      return Ok(false)
+    end
   end
-  try db.run(
-    "INSERT OR IGNORE INTO routine_runs (routine_id, slot_key, status, detail, created_at) VALUES (?, ?, 'claimed', '', ?)",
-    [Sqlite.Integer(routine_id), Sqlite.String(slot_key), Sqlite.String(now_text)]
-  ).map_error(db_err)
-  Ok(true)
+  rep = try exec_replay(
+    db,
+    "system:scheduler",
+    "claim_routine_slot",
+    "claim routine ##{routine_id} slot #{slot_key}",
+    ClaimRoutineSlotArgs(routine_id: routine_id, slot_key: slot_key, now_text: now_text).to_json
+  )
+  Json.decode[Bool](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
-fn mark_routine_ran(db: Sqlite.Database, id: Int, now_text: Text, next_due_at: Text) : Result(
+fn mark_routine_ran(db: DbHandle, id: Int, now_text: Text, next_due_at: Text) : Result(
   Unit,
   MotetError
 )
-  db.run(
-    "UPDATE routines SET last_run_at = ?, next_due_at = ?, run_count = run_count + 1 WHERE id = ?",
-    [Sqlite.String(now_text), Sqlite.String(next_due_at), Sqlite.Integer(id)]
-  ).map_error(db_err)
+  _res = try exec_replay(
+    db,
+    "system:scheduler",
+    "mark_routine_ran",
+    "mark routine ##{id} ran",
+    MarkRoutineRanArgs(id: id, now_text: now_text, next_due_at: next_due_at).to_json
+  )
+  Ok(Unit)
 end
 
-fn mark_routine_skipped(db: Sqlite.Database, id: Int, next_due_at: Text) : Result(Unit, MotetError)
-  db.run(
-    "UPDATE routines SET next_due_at = ?, skip_count = skip_count + 1 WHERE id = ?",
-    [Sqlite.String(next_due_at), Sqlite.Integer(id)]
-  ).map_error(db_err)
+fn mark_routine_skipped(db: DbHandle, id: Int, next_due_at: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:scheduler",
+    "mark_routine_skipped",
+    "mark routine ##{id} skipped",
+    MarkRoutineSkippedArgs(id: id, next_due_at: next_due_at).to_json
+  )
+  Ok(Unit)
 end
 
-fn set_routine_enabled(db: Sqlite.Database, id: Int, enabled_opt: Option(Bool)) : Result(
+fn set_routine_enabled(db: DbHandle, id: Int, enabled_opt: Option(Bool)) : Result(
   RoutineSpec,
   MotetError
 )
-  rows = try db.query(
-    "SELECT #{routine_select_cols} FROM routines WHERE id = ?",
-    [Sqlite.Integer(id)]
-  ).map_error(db_err)
-  row = try rows.rows.first.or_fail(ItemNotFound(message: "routine ##{id} not found"))
-  cur = row_to_routine(row)
-  next_en = case enabled_opt
-    Some(v): v
-    None: not cur.enabled?
-  end
-  try db.run(
-    "UPDATE routines SET enabled = ? WHERE id = ?",
-    [Sqlite.Integer(if next_en: 1 else: 0), Sqlite.Integer(id)]
-  ).map_error(db_err)
-  Ok(
-    RoutineSpec(
-      id: cur.id,
-      bot_name: cur.bot_name,
-      name: cur.name,
-      prompt: cur.prompt,
-      interval_seconds: cur.interval_seconds,
-      schedule_kind: cur.schedule_kind,
-      schedule_expr: cur.schedule_expr,
-      timezone: cur.timezone,
-      read_only?: cur.read_only?,
-      skip_memory?: cur.skip_memory?,
-      precheck_kind: cur.precheck_kind,
-      enabled?: next_en,
-      next_due_at: cur.next_due_at,
-      last_run_at: cur.last_run_at,
-      run_count: cur.run_count,
-      skip_count: cur.skip_count
-    )
+  rep = try exec_replay(
+    db,
+    "operator",
+    "set_routine_enabled",
+    "toggle routine ##{id}",
+    ToggleIdArgs(id: id, enabled: enabled_opt).to_json
   )
+  Json.decode[RoutineSpec](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
-fn delete_routine(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
-  try db.run("DELETE FROM routine_runs WHERE routine_id = ?", [Sqlite.Integer(id)]).map_error(
-    db_err
+fn delete_routine(db: DbHandle, id: Int) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "delete_routine",
+    "delete routine ##{id}",
+    IdArgs(id: id).to_json
   )
-  db.run("DELETE FROM routines WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
+  Ok(Unit)
 end
 
-fn row_to_approval(r: List(Sqlite.Value)) : ApprovalItem
-  ApprovalItem(
-    id: cell_int(r, 0),
-    bot_name: cell_str(r, 1),
-    session_id: cell_str(r, 2),
-    tool_name: cell_str(r, 3),
-    arguments_json: cell_str(r, 4),
-    effect_class: effect_from_text(cell_str(r, 5)),
-    reason: cell_str(r, 6),
-    status: approval_status_from_text(cell_str(r, 7)),
-    result_text: cell_opt_str(r, 8),
-    created_at: cell_str(r, 9)
-  )
-end
-
+## Needs-You Approvals.
 fn create_approval(
-  db: Sqlite.Database,
+  db: DbHandle,
   bot_name: Text,
   session_id: Text,
   tool_name: Text,
@@ -2207,135 +4335,162 @@ fn create_approval(
   reason: Text,
   now_text: Text
 ) : Result(ApprovalItem, MotetError)
-  exact_rows = try db.query(
-    "SELECT id, bot_name, session_id, tool_name, arguments_json, effect_class, reason, status, result_text, created_at FROM approvals WHERE status = 'pending' AND bot_name = ? AND tool_name = ? AND arguments_json = ? ORDER BY id DESC LIMIT 1",
-    [Sqlite.String(bot_name), Sqlite.String(tool_name), Sqlite.String(arguments_json)]
-  ).map_error(db_err)
-  if exact_rows.rows.first is Some(existing_row)
-    return Ok(row_to_approval(existing_row))
-  end
-
-  if reason.starts_with?("read-only routine")
-    routine_rows = try db.query(
-      "SELECT id, bot_name, session_id, tool_name, arguments_json, effect_class, reason, status, result_text, created_at FROM approvals WHERE status = 'pending' AND bot_name = ? AND tool_name = ? AND reason = ? ORDER BY id DESC LIMIT 1",
-      [Sqlite.String(bot_name), Sqlite.String(tool_name), Sqlite.String(reason)]
-    ).map_error(db_err)
-    if routine_rows.rows.first is Some(rrow)
-      existing = row_to_approval(rrow)
-      try db.run(
-        "UPDATE approvals SET session_id = ?, arguments_json = ?, created_at = ? WHERE id = ?",
-        [
-          Sqlite.String(session_id),
-          Sqlite.String(arguments_json),
-          Sqlite.String(now_text),
-          Sqlite.Integer(existing.id)
-        ]
-      ).map_error(db_err)
-      return Ok(
-        ApprovalItem(
-          id: existing.id,
-          bot_name: existing.bot_name,
+  now = parse_time(now_text)
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      pending = try Table.lookup(st, approvals_table(), approvals_by_status_index(), "pending")
+        .map_error(table_err)
+      for (_id, ex) in pending.reverse
+        if ex.bot_name == bot_name and
+          ex.tool_name == tool_name and
+          ex.arguments_json == arguments_json
+          return Ok(ex)
+        end
+      end
+      (_next_ldb, rep) = try exec_replay_on(
+        ldb,
+        "bot:#{bot_name}",
+        "create_approval",
+        "pause #{tool_name} for approval",
+        now,
+        CreateApprovalArgs(
+          bot_name: bot_name,
           session_id: session_id,
-          tool_name: existing.tool_name,
+          tool_name: tool_name,
           arguments_json: arguments_json,
-          effect_class: existing.effect_class,
-          reason: existing.reason,
-          status: Pending,
-          result_text: None,
-          created_at: now_text
-        )
+          effect_class: effect_class,
+          reason: reason,
+          now_text: now_text
+        ).to_json
       )
+      Json.decode[ApprovalItem](Json.encode(rep).bytes).map_error(reply_decode_err)
     end
-  end
-
-  try db.run(
-    [
-      "INSERT INTO approvals (bot_name, session_id, tool_name, arguments_json, effect_class, reason, status, result_text, created_at) ",
-      "VALUES (?, ?, ?, ?, ?, ?, 'pending', '', ?)"
-    ].join(""),
-    [
-      Sqlite.String(bot_name),
-      Sqlite.String(session_id),
-      Sqlite.String(tool_name),
-      Sqlite.String(arguments_json),
-      Sqlite.String(effect_to_text(effect_class)),
-      Sqlite.String(reason),
-      Sqlite.String(now_text)
-    ]
-  ).map_error(db_err)
-  id = try last_id(db)
-  Ok(
-    ApprovalItem(
-      id: id,
-      bot_name: bot_name,
-      session_id: session_id,
-      tool_name: tool_name,
-      arguments_json: arguments_json,
-      effect_class: effect_class,
-      reason: reason,
-      status: Pending,
-      result_text: None,
-      created_at: now_text
-    )
   )
 end
 
-fn get_approval(db: Sqlite.Database, id: Int) : Result(Option(ApprovalItem), MotetError)
-  rows = try db.query(
-    "SELECT id, bot_name, session_id, tool_name, arguments_json, effect_class, reason, status, result_text, created_at FROM approvals WHERE id = ?",
-    [Sqlite.Integer(id)]
-  ).map_error(db_err)
-  Ok(rows.rows.first.map(fn(r) row_to_approval(r) end))
+fn get_approval(db: DbHandle, id: Int) : Result(Option(ApprovalItem), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) Table.get(Ledger.store(ldb), approvals_table(), id).map_error(table_err) end
+  )
 end
 
-fn list_approvals(db: Sqlite.Database, only_pending?: Bool) : Result(List(ApprovalItem), MotetError)
-  rows = if only_pending?
-    try db.query(
-      "SELECT id, bot_name, session_id, tool_name, arguments_json, effect_class, reason, status, result_text, created_at FROM approvals WHERE status = 'pending' ORDER BY id ASC",
-      []
-    ).map_error(db_err)
-  else
-    try db.query(
-      "SELECT id, bot_name, session_id, tool_name, arguments_json, effect_class, reason, status, result_text, created_at FROM approvals ORDER BY id DESC LIMIT 100",
-      []
-    ).map_error(db_err)
-  end
-  Ok(rows.rows.map(fn(r) row_to_approval(r) end))
+fn list_approvals(db: DbHandle, only_pending?: Bool) : Result(List(ApprovalItem), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      if only_pending?
+        rows = try Table.lookup(st, approvals_table(), approvals_by_status_index(), "pending")
+          .map_error(table_err)
+        Ok(rows.map(fn(p) p.1 end))
+      else
+        rows = try Table.all(st, approvals_table()).map_error(table_err)
+        Ok(rows.map(fn(p) p.1 end).reverse.take(100))
+      end
+    end
+  )
 end
 
-fn update_approval(db: Sqlite.Database, id: Int, status: ApprovalStatus, result_text: Text) : Result(
+fn update_approval(db: DbHandle, id: Int, status: ApprovalStatus, result_text: Text) : Result(
   Unit,
   MotetError
 )
-  db.run(
-    "UPDATE approvals SET status = ?, result_text = ? WHERE id = ?",
-    [Sqlite.String(approval_status_to_text(status)), Sqlite.String(result_text), Sqlite.Integer(id)]
-  ).map_error(db_err)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "update_approval",
+    "resolve approval ##{id} -> #{approval_status_to_text(status)}",
+    UpdateApprovalArgs(id: id, status: status, result_text: result_text).to_json
+  )
+  Ok(Unit)
 end
 
-fn update_approval_args(db: Sqlite.Database, id: Int, arguments_json: Text) : Result(
-  Unit,
+fn update_approval_args(db: DbHandle, id: Int, arguments_json: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "update_approval_args",
+    "edit draft args for approval ##{id}",
+    UpdateApprovalJsonArgs(id: id, arguments_json: arguments_json).to_json
+  )
+  Ok(Unit)
+end
+
+fn dismiss_all_pending_approvals(db: DbHandle) : Result(Int, MotetError)
+  now = db.clock.now
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      pending = try Table.lookup(
+        Ledger.store(ldb),
+        approvals_table(),
+        approvals_by_status_index(),
+        "pending"
+      ).map_error(table_err)
+      return Ok(0) if pending.empty?
+      (_next, rep) = try exec_replay_on(
+        ldb,
+        "operator",
+        "dismiss_all_pending_approvals",
+        "dismiss #{pending.size} pending approval(s)",
+        now,
+        Json.Object({})
+      )
+      Json.decode[Int](Json.encode(rep).bytes).map_error(reply_decode_err)
+    end
+  )
+end
+
+fn list_repeated_executed_approvals(db: DbHandle, min_count: Int, limit: Int) : Result(
+  List((Text, Text, Int)),
   MotetError
 )
-  db.run(
-    "UPDATE approvals SET arguments_json = ? WHERE id = ?",
-    [Sqlite.String(arguments_json), Sqlite.Integer(id)]
-  ).map_error(db_err)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.lookup(
+        Ledger.store(ldb),
+        approvals_table(),
+        approvals_by_status_index(),
+        "executed"
+      ).map_error(table_err)
+      var counts = {}
+      var labels = {}
+      for (_id, a) in rows
+        k = "#{a.bot_name}\u{1f}#{a.tool_name}"
+        cur = counts.get(k) or 0
+        counts = counts.set(k, cur + 1)
+        labels = labels.set(k, (a.bot_name, a.tool_name))
+      end
+      var items = []
+      for (k, c) in counts.entries
+        if c >= min_count
+          case labels.get(k)
+            Some((bn, tn)): items = items.append((bn, tn, c))
+            None: Unit
+          end
+        end
+      end
+      sorted = items.sort_by(fn(it) it.2 end).reverse
+      Ok(sorted.take(limit))
+    end
+  )
 end
 
-fn dismiss_all_pending_approvals(db: Sqlite.Database) : Result(Int, MotetError)
-  pending_count = try count_table(db, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'")
-  if pending_count > 0
-    try db.run(
-      "UPDATE approvals SET status = 'denied', result_text = 'dismissed in bulk by owner' WHERE status = 'pending'",
-      []
-    ).map_error(db_err)
-  end
-  Ok(pending_count)
-end
-
+## Artifacts.
 fn save_artifact(
-  db: Sqlite.Database,
+  db: DbHandle,
   bot_name: Text,
   session_id: Text,
   kind: Text,
@@ -2343,62 +4498,42 @@ fn save_artifact(
   content: Text,
   now_text: Text
 ) : Result(ArtifactItem, MotetError)
-  try db.run(
-    "INSERT INTO artifacts (bot_name, session_id, kind, title, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    [
-      Sqlite.String(bot_name),
-      Sqlite.String(session_id),
-      Sqlite.String(kind),
-      Sqlite.String(title),
-      Sqlite.String(content),
-      Sqlite.String(now_text)
-    ]
-  ).map_error(db_err)
-  id = try last_id(db)
-  Ok(
-    ArtifactItem(
-      id: id,
+  rep = try exec_replay(
+    db,
+    "bot:#{bot_name}",
+    "save_artifact",
+    "save artifact '#{title}'",
+    SaveArtifactArgs(
       bot_name: bot_name,
       session_id: session_id,
       kind: kind,
       title: title,
       content: content,
-      created_at: now_text
-    )
+      now_text: now_text
+    ).to_json
+  )
+  Json.decode[ArtifactItem](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn list_artifacts(db: DbHandle, bot_filter: Option(Text)) : Result(List(ArtifactItem), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      rows = case bot_filter
+        Some(bot): try Table.lookup(st, artifacts_table(), artifacts_by_bot_index(), bot).map_error(
+          table_err
+        )
+        None: try Table.all(st, artifacts_table()).map_error(table_err)
+      end
+      Ok(rows.map(fn(p) p.1 end).reverse.take(50))
+    end
   )
 end
 
-fn list_artifacts(db: Sqlite.Database, bot_filter: Option(Text)) : Result(
-  List(ArtifactItem),
-  MotetError
-)
-  rows = case bot_filter
-    Some(bot): try db.query(
-      "SELECT id, bot_name, session_id, kind, title, content, created_at FROM artifacts WHERE bot_name = ? ORDER BY id DESC LIMIT 50",
-      [Sqlite.String(bot)]
-    ).map_error(db_err)
-    None: try db.query(
-      "SELECT id, bot_name, session_id, kind, title, content, created_at FROM artifacts ORDER BY id DESC LIMIT 50",
-      []
-    ).map_error(db_err)
-  end
-  Ok(
-    rows.rows.map(fn(r)
-      ArtifactItem(
-        id: cell_int(r, 0),
-        bot_name: cell_str(r, 1),
-        session_id: cell_str(r, 2),
-        kind: cell_str(r, 3),
-        title: cell_str(r, 4),
-        content: cell_str(r, 5),
-        created_at: cell_str(r, 6)
-      )
-    end)
-  )
-end
-
+## Exact Decimal USD spend ledger.
 fn record_spend_ledger_full(
-  db: Sqlite.Database,
+  db: DbHandle,
   bot_name: Text,
   session_id: Text,
   input_tokens: Int,
@@ -2407,22 +4542,26 @@ fn record_spend_ledger_full(
   cost_usd: Decimal,
   now_text: Text
 ) : Result(Unit, MotetError)
-  db.run(
-    "INSERT INTO budget_ledger (bot_name, session_id, input_tokens, output_tokens, cached_input_tokens, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    [
-      Sqlite.String(bot_name),
-      Sqlite.String(session_id),
-      Sqlite.Integer(input_tokens),
-      Sqlite.Integer(output_tokens),
-      Sqlite.Integer(cached_input_tokens),
-      Sqlite.String(cost_usd.to_fixed(6)),
-      Sqlite.String(now_text)
-    ]
-  ).map_error(db_err)
+  _res = try exec_replay(
+    db,
+    "bot:#{bot_name}",
+    "record_spend_ledger",
+    "record $#{cost_usd.to_fixed(6)} spend for #{bot_name}",
+    RecordSpendArgs(
+      bot_name: bot_name,
+      session_id: session_id,
+      input_tokens: input_tokens,
+      output_tokens: output_tokens,
+      cached_input_tokens: cached_input_tokens,
+      cost_usd: cost_usd,
+      now_text: now_text
+    ).to_json
+  )
+  Ok(Unit)
 end
 
 fn record_spend_ledger(
-  db: Sqlite.Database,
+  db: DbHandle,
   bot_name: Text,
   session_id: Text,
   input_tokens: Int,
@@ -2442,103 +4581,97 @@ fn record_spend_ledger(
   )
 end
 
-fn utc_day_prefix(ts: Text) : Text
-  Text.from_chars(ts.chars.take(10))
-end
-
-fn bot_spend_total(db: Sqlite.Database, bot_name: Text) : Result(Decimal, MotetError)
-  rows = try db.query(
-    "SELECT cost_usd FROM budget_ledger WHERE bot_name = ?",
-    [Sqlite.String(bot_name)]
-  ).map_error(db_err)
-  var sum = 0.0
-  for r in rows.rows
-    sum = (sum + cell_decimal(r, 0)).round(6)
-  end
-  Ok(sum)
-end
-
-fn bot_daily_spend(db: Sqlite.Database, bot_name: Text, day_prefix: Text) : Result(
-  Decimal,
-  MotetError
-)
-  rows = try db.query(
-    "SELECT cost_usd FROM budget_ledger WHERE bot_name = ? AND created_at LIKE ?",
-    [Sqlite.String(bot_name), Sqlite.String("#{day_prefix}%")]
-  ).map_error(db_err)
-  var sum = 0.0
-  for r in rows.rows
-    sum = (sum + cell_decimal(r, 0)).round(6)
-  end
-  Ok(sum)
-end
-
-fn daily_budget_snapshots(db: Sqlite.Database, day_prefix: Text) : Result(
-  List(BudgetSnapshot),
-  MotetError
-)
-  bots = try list_bots(db)
-  like_pat = "#{day_prefix}%"
-  var out = []
-  for b in bots
-    rows = try db.query(
-      "SELECT input_tokens, output_tokens, cached_input_tokens, cost_usd FROM budget_ledger WHERE bot_name = ? AND created_at LIKE ?",
-      [Sqlite.String(b.name), Sqlite.String(like_pat)]
-    ).map_error(db_err)
-    var spent = 0.0
-    var in_toks = 0
-    var out_toks = 0
-    var cached_toks = 0
-    var turns = 0
-    for r in rows.rows
-      in_toks = in_toks.saturating_add(cell_int(r, 0))
-      out_toks = out_toks.saturating_add(cell_int(r, 1))
-      cached_toks = cached_toks.saturating_add(cell_int(r, 2))
-      spent = (spent + cell_decimal(r, 3)).round(6)
-      turns += 1
+fn bot_spend_total(db: DbHandle, bot_name: Text) : Result(Decimal, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.lookup(
+        Ledger.store(ldb),
+        budget_ledger_table(),
+        budget_by_bot_index(),
+        bot_name
+      ).map_error(table_err)
+      var sum = 0.0
+      for (_k, r) in rows
+        sum = (sum + r.cost_usd).round(6)
+      end
+      Ok(sum)
     end
-    rem = if b.daily_budget_usd > spent: (b.daily_budget_usd - spent).round(6) else: 0.0
-    out = out.append(
-      BudgetSnapshot(
-        bot_name: b.name,
-        limit_usd: b.daily_budget_usd,
-        spent_usd: spent,
-        remaining_usd: rem,
-        turns: turns,
-        input_tokens: in_toks,
-        output_tokens: out_toks,
-        cached_input_tokens: cached_toks
-      )
-    )
-  end
-  Ok(out)
-end
-
-# ==============================================================================
-# Async Bot Runs & Live Steering Queue
-# ==============================================================================
-fn row_to_run(r: List(Sqlite.Value)) : BotRun
-  BotRun(
-    id: cell_str(r, 0),
-    bot_name: cell_str(r, 1),
-    session_id: cell_str(r, 2),
-    trust: trust_from_text(cell_str(r, 3)),
-    routine_read_only?: cell_bool(r, 4),
-    status: cell_str(r, 5),
-    prompt: cell_str(r, 6),
-    steps: cell_int(r, 8),
-    spent_usd: cell_decimal(r, 9),
-    reply: cell_str(r, 10),
-    error: cell_opt_str(r, 11),
-    created_at: cell_str(r, 12),
-    updated_at: cell_str(r, 13)
   )
 end
 
-run_select_cols = "id, bot_name, session_id, trust, routine_read_only, status, prompt, steer_queue_json, steps, spent_usd, reply, error, created_at, updated_at"
+fn bot_daily_spend(db: DbHandle, bot_name: Text, day_prefix: Text) : Result(Decimal, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.lookup(
+        Ledger.store(ldb),
+        budget_ledger_table(),
+        budget_by_bot_day_index(),
+        "#{bot_name}:#{day_prefix}"
+      ).map_error(table_err)
+      var sum = 0.0
+      for (_k, r) in rows
+        sum = (sum + r.cost_usd).round(6)
+      end
+      Ok(sum)
+    end
+  )
+end
 
+fn daily_budget_snapshots(db: DbHandle, day_prefix: Text) : Result(List(BudgetSnapshot), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      bot_rows = try Table.all(st, bots_table()).map_error(table_err)
+      bots = bot_rows.map(fn(p) p.1 end).sort_by(fn(b)
+        act = if b.active?: "0" else: "1"
+        pri = if b.is_primary?: "0" else: "1"
+        "#{act}:#{pri}:#{b.name}"
+      end)
+      var out = []
+      for b in bots
+        rows = try Table.lookup(
+          st,
+          budget_ledger_table(),
+          budget_by_bot_day_index(),
+          "#{b.name}:#{day_prefix}"
+        ).map_error(table_err)
+        var spent = 0.0
+        var in_toks = 0
+        var out_toks = 0
+        var cached_toks = 0
+        var turns = 0
+        for (_id, r) in rows
+          in_toks = in_toks.saturating_add(r.input_tokens)
+          out_toks = out_toks.saturating_add(r.output_tokens)
+          cached_toks = cached_toks.saturating_add(r.cached_input_tokens)
+          spent = (spent + r.cost_usd).round(6)
+          turns += 1
+        end
+        rem = if b.daily_budget_usd > spent: (b.daily_budget_usd - spent).round(6) else: 0.0
+        out = out.append(
+          BudgetSnapshot(
+            bot_name: b.name,
+            limit_usd: b.daily_budget_usd,
+            spent_usd: spent,
+            remaining_usd: rem,
+            turns: turns,
+            input_tokens: in_toks,
+            output_tokens: out_toks,
+            cached_input_tokens: cached_toks
+          )
+        )
+      end
+      Ok(out)
+    end
+  )
+end
+
+## Async Bot Runs & Live Steering Queue.
 fn enqueue_run(
-  db: Sqlite.Database,
+  db: DbHandle,
   run_id: Text,
   bot_name: Text,
   session_id: Text,
@@ -2547,147 +4680,171 @@ fn enqueue_run(
   prompt: Text,
   now_text: Text
 ) : Result(BotRun, MotetError)
-  try db.run(
-    [
-      "INSERT INTO bot_runs (id, bot_name, session_id, trust, routine_read_only, status, prompt, steer_queue_json, steps, spent_usd, reply, error, created_at, updated_at) ",
-      "VALUES (?, ?, ?, ?, ?, 'queued', ?, '[]', 0, '0.000000', '', '', ?, ?)"
-    ].join(""),
-    [
-      Sqlite.String(run_id),
-      Sqlite.String(bot_name),
-      Sqlite.String(session_id),
-      Sqlite.String(trust_to_text(trust)),
-      Sqlite.Integer(if routine_read_only?: 1 else: 0),
-      Sqlite.String(prompt),
-      Sqlite.String(now_text),
-      Sqlite.String(now_text)
-    ]
-  ).map_error(db_err)
-  (try get_run(db, run_id)).or_fail(StorageFailed(message: "failed to read enqueued run"))
+  rep = try exec_replay(
+    db,
+    "bot:#{bot_name}",
+    "enqueue_run",
+    "enqueue async run #{run_id}",
+    EnqueueRunArgs(
+      run_id: run_id,
+      bot_name: bot_name,
+      session_id: session_id,
+      trust: trust,
+      routine_read_only: routine_read_only?,
+      prompt: prompt,
+      now_text: now_text
+    ).to_json
+  )
+  Json.decode[BotRun](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
-fn get_run(db: Sqlite.Database, run_id: Text) : Result(Option(BotRun), MotetError)
-  rows = try db.query(
-    "SELECT #{run_select_cols} FROM bot_runs WHERE id = ?",
-    [Sqlite.String(run_id)]
-  ).map_error(db_err)
-  Ok(rows.rows.first.map(fn(r) row_to_run(r) end))
+fn get_run(db: DbHandle, run_id: Text) : Result(Option(BotRun), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      row_opt = try Table.get(Ledger.store(ldb), bot_runs_table(), run_id).map_error(table_err)
+      Ok(row_opt.map(bot_run_row_to_public))
+    end
+  )
 end
 
-fn list_runs(db: Sqlite.Database, bot_filter: Option(Text), limit: Int) : Result(
-  List(BotRun),
-  MotetError
-)
+fn list_runs(db: DbHandle, bot_filter: Option(Text), limit: Int) : Result(List(BotRun), MotetError)
   cap = if limit > 0 and limit <= 100: limit else: 30
-  rows = case bot_filter
-    Some(b): try db.query(
-      "SELECT #{run_select_cols} FROM bot_runs WHERE bot_name = ? ORDER BY created_at DESC LIMIT ?",
-      [Sqlite.String(b), Sqlite.Integer(cap)]
-    ).map_error(db_err)
-    None: try db.query(
-      "SELECT #{run_select_cols} FROM bot_runs ORDER BY created_at DESC LIMIT ?",
-      [Sqlite.Integer(cap)]
-    ).map_error(db_err)
-  end
-  Ok(rows.rows.map(fn(r) row_to_run(r) end))
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      rows = case bot_filter
+        Some(b): try Table.lookup(st, bot_runs_table(), bot_runs_by_bot_index(), b).map_error(
+          table_err
+        )
+        None: try Table.all(st, bot_runs_table()).map_error(table_err)
+      end
+      sorted = rows.map(fn(p) bot_run_row_to_public(p.1) end).sort_by(fn(r)
+        "#{r.created_at}:#{r.id}"
+      end).reverse
+      Ok(sorted.take(cap))
+    end
+  )
 end
 
-## Atomically claims the oldest queued run across concurrent server/watch workers.
-fn claim_next_queued_run(db: Sqlite.Database, now_text: Text) : Result(Option(BotRun), MotetError)
-  rows = try db.query(
-    "SELECT id FROM bot_runs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1",
-    []
-  ).map_error(db_err)
-  rid = case rows.rows.first
-    Some(r): cell_str(r, 0)
-    None: return Ok(None)
+fn claim_next_queued_run(db: DbHandle, now_text: Text) : Result(Option(BotRun), MotetError)
+  if db.files.read_only.exists?(db.path)
+    fast = with_db_read(
+      db,
+      fn(ldb)
+        Table.lookup(Ledger.store(ldb), bot_runs_table(), bot_runs_by_status_index(), "queued")
+          .map_error(table_err)
+      end
+    )
+    if fast is Ok(qs) and qs.empty?
+      return Ok(None)
+    end
   end
-  try db.run(
-    "UPDATE bot_runs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'queued'",
-    [Sqlite.String(now_text), Sqlite.String(rid)]
-  ).map_error(db_err)
-  claimed = try get_run(db, rid)
-  case claimed
-    Some(run) if run.status == "running": Ok(Some(run))
-    Some(_) | None: Ok(None)
-  end
+  now = parse_time(now_text)
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      queued = try Table.lookup(
+        Ledger.store(ldb),
+        bot_runs_table(),
+        bot_runs_by_status_index(),
+        "queued"
+      ).map_error(table_err)
+      return Ok(None) if queued.empty?
+      oldest = (queued.map(fn(p) p.1 end).sort_by(fn(r) "#{r.created_at}:#{r.id}" end)).first
+      case oldest
+        None: Ok(None)
+        Some(target):
+          (_next_ldb, rep) = try exec_replay_on(
+            ldb,
+            "system:worker",
+            "claim_run",
+            "claim queued run #{target.id}",
+            now,
+            ClaimRunArgs(run_id: target.id, now_text: now_text).to_json
+          )
+          Json.decode[Option(BotRun)](Json.encode(rep).bytes).map_error(reply_decode_err)
+      end
+    end
+  )
 end
 
-fn append_run_steer(db: Sqlite.Database, run_id: Text, mode: Text, message: Text, now_text: Text) : Result(
+fn append_run_steer(db: DbHandle, run_id: Text, mode: Text, message: Text, now_text: Text) : Result(
   BotRun,
   MotetError
 )
-  rows = try db.query(
-    "SELECT steer_queue_json, status FROM bot_runs WHERE id = ?",
-    [Sqlite.String(run_id)]
-  ).map_error(db_err)
-  row = try rows.rows.first.or_fail(ItemNotFound(message: "run not found: #{run_id}"))
-  st = cell_str(row, 1)
-  if st != "queued" and st != "running"
-    return Error(Conflict(message: "run #{run_id} is already #{st}"))
-  end
-  cur_arr = case Json.parse(cell_str(row, 0))
-    Ok(Json.Array(items)): items
-    Ok(_) | Error(_): []
-  end
-  entry = Json.Object({
-    "mode": Json.String(mode.trim.ascii_lowercase),
-    "message": Json.String(message.trim)
-  })
-  next_json = Json.Array(cur_arr.append(entry)).to_text
-  try db.run(
-    "UPDATE bot_runs SET steer_queue_json = ?, updated_at = ? WHERE id = ?",
-    [Sqlite.String(next_json), Sqlite.String(now_text), Sqlite.String(run_id)]
-  ).map_error(db_err)
-  (try get_run(db, run_id)).or_fail(StorageFailed(message: "run vanished after steer"))
+  rep = try exec_replay(
+    db,
+    "operator",
+    "append_run_steer",
+    "steer #{mode} on #{run_id}",
+    AppendRunSteerArgs(run_id: run_id, mode: mode, message: message, now_text: now_text).to_json
+  )
+  Json.decode[BotRun](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
-## Atomically drains pending steer/interrupt instructions for an active run.
-fn take_run_steers(db: Sqlite.Database, run_id: Text) : Result(List((Text, Text)), MotetError)
-  rows = try db.query("SELECT steer_queue_json FROM bot_runs WHERE id = ?", [Sqlite.String(run_id)])
-    .map_error(db_err)
-  raw = case rows.rows.first
-    Some(r): cell_str(r, 0)
-    None: return Ok([])
-  end
-  if raw == "[]" or raw.trim.empty?
-    return Ok([])
-  end
-  try db.run("UPDATE bot_runs SET steer_queue_json = '[]' WHERE id = ?", [Sqlite.String(run_id)])
-    .map_error(db_err)
+fn parse_steer_json(raw: Text) : List((Text, Text))
+  return [] if raw == "[]" or raw.trim.empty?
   items = case Json.parse(raw)
     Ok(Json.Array(arr)): arr
     Ok(_) | Error(_): []
   end
-  parsed = items.filter_map(fn(v)
+  items.filter_map(fn(v)
     case v.text_at("mode")
       Some(m): Some((m, v.text_at("message") or ""))
       None: None
     end
   end)
-  Ok(parsed)
+end
+
+fn take_run_steers(db: DbHandle, run_id: Text) : Result(List((Text, Text)), MotetError)
+  if db.files.read_only.exists?(db.path)
+    fast = with_db_read(
+      db,
+      fn(ldb) Table.get(Ledger.store(ldb), bot_runs_table(), run_id).map_error(table_err) end
+    )
+    case fast
+      Ok(Some(r)) if r.steer_queue_json == "[]" or r.steer_queue_json.trim.empty?: return Ok([])
+      Ok(None): return Ok([])
+      Ok(_) | Error(_): Unit
+    end
+  end
+  rep = try exec_replay(
+    db,
+    "system:worker",
+    "take_run_steers",
+    "drain steers for #{run_id}",
+    NameArgs(name: run_id).to_json
+  )
+  raw = try Json.decode[Text](Json.encode(rep).bytes).map_error(reply_decode_err)
+  Ok(parse_steer_json(raw))
 end
 
 fn update_run_progress(
-  db: Sqlite.Database,
+  db: DbHandle,
   run_id: Text,
   steps: Int,
   spent_usd: Decimal,
   now_text: Text
 ) : Result(Unit, MotetError)
-  db.run(
-    "UPDATE bot_runs SET steps = ?, spent_usd = ?, updated_at = ? WHERE id = ?",
-    [
-      Sqlite.Integer(steps),
-      Sqlite.String(spent_usd.to_fixed(6)),
-      Sqlite.String(now_text),
-      Sqlite.String(run_id)
-    ]
-  ).map_error(db_err)
+  _res = try exec_replay(
+    db,
+    "system:worker",
+    "update_run_progress",
+    "progress #{run_id} step #{steps}",
+    UpdateRunProgressArgs(run_id: run_id, steps: steps, spent_usd: spent_usd, now_text: now_text)
+      .to_json
+  )
+  Ok(Unit)
 end
 
 fn finish_run(
-  db: Sqlite.Database,
+  db: DbHandle,
   run_id: Text,
   status: Text,
   steps: Int,
@@ -2696,213 +4853,179 @@ fn finish_run(
   error_text: Text,
   now_text: Text
 ) : Result(Unit, MotetError)
-  db.run(
-    "UPDATE bot_runs SET status = ?, steps = ?, spent_usd = ?, reply = ?, error = ?, updated_at = ? WHERE id = ?",
-    [
-      Sqlite.String(status),
-      Sqlite.Integer(steps),
-      Sqlite.String(spent_usd.to_fixed(6)),
-      Sqlite.String(reply),
-      Sqlite.String(error_text),
-      Sqlite.String(now_text),
-      Sqlite.String(run_id)
-    ]
-  ).map_error(db_err)
+  _res = try exec_replay(
+    db,
+    "system:worker",
+    "finish_run",
+    "finish #{run_id} -> #{status}",
+    FinishRunArgs(
+      run_id: run_id,
+      status: status,
+      steps: steps,
+      spent_usd: spent_usd,
+      reply: reply,
+      error_text: error_text,
+      now_text: now_text
+    ).to_json
+  )
+  Ok(Unit)
 end
 
-# ==============================================================================
-# Webhook Routing & HMAC Config
-# ==============================================================================
-fn upsert_webhook_config(db: Sqlite.Database, cfg: WebhookConfig) : Result(
-  WebhookConfig,
-  MotetError
-)
-  try db.run(
-    [
-      "INSERT INTO webhook_configs (source, target_bot, secret_name, enabled) VALUES (?, ?, ?, ?) ",
-      "ON CONFLICT(source) DO UPDATE SET target_bot = excluded.target_bot, ",
-      "secret_name = excluded.secret_name, enabled = excluded.enabled"
-    ].join(""),
-    [
-      Sqlite.String(cfg.source),
-      Sqlite.String(cfg.target_bot),
-      Sqlite.String(cfg.secret_name),
-      Sqlite.Integer(if cfg.enabled?: 1 else: 0)
-    ]
-  ).map_error(db_err)
-  Ok(cfg)
+## Webhook Routing & HMAC Config.
+fn upsert_webhook_config(db: DbHandle, cfg: WebhookConfig) : Result(WebhookConfig, MotetError)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "upsert_webhook_config",
+    "upsert webhook #{cfg.source}",
+    cfg.to_json
+  )
+  Json.decode[WebhookConfig](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
-fn get_webhook_config(db: Sqlite.Database, source: Text) : Result(Option(WebhookConfig), MotetError)
-  rows = try db.query(
-    "SELECT source, target_bot, secret_name, enabled FROM webhook_configs WHERE source = ?",
-    [Sqlite.String(source)]
-  ).map_error(db_err)
-  Ok(
-    rows.rows.first.map(fn(r)
-      WebhookConfig(
-        source: cell_str(r, 0),
-        target_bot: cell_str(r, 1),
-        secret_name: cell_str(r, 2),
-        enabled?: cell_bool(r, 3)
-      )
-    end)
+fn get_webhook_config(db: DbHandle, source: Text) : Result(Option(WebhookConfig), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) Table.get(Ledger.store(ldb), webhook_configs_table(), source).map_error(table_err) end
   )
 end
 
-fn list_webhook_configs(db: Sqlite.Database) : Result(List(WebhookConfig), MotetError)
-  rows = try db.query(
-    "SELECT source, target_bot, secret_name, enabled FROM webhook_configs ORDER BY source ASC",
-    []
-  ).map_error(db_err)
-  Ok(
-    rows.rows.map(fn(r)
-      WebhookConfig(
-        source: cell_str(r, 0),
-        target_bot: cell_str(r, 1),
-        secret_name: cell_str(r, 2),
-        enabled?: cell_bool(r, 3)
-      )
-    end)
-  )
-end
-
-fn delete_webhook_config(db: Sqlite.Database, source: Text) : Result(Unit, MotetError)
-  db.run("DELETE FROM webhook_configs WHERE source = ?", [Sqlite.String(source)]).map_error(db_err)
-end
-
-# ==============================================================================
-# App Settings, Telegram Offset, Web Push Subscriptions & Analytics
-# ==============================================================================
-fn get_setting_val(db: Sqlite.Database, key: Text, fallback: Text) : Result(Text, MotetError)
-  rows = try db.query("SELECT value FROM app_settings WHERE key = ?", [Sqlite.String(key)])
-    .map_error(db_err)
-  Ok(
-    case rows.rows.first
-      Some(r):
-        v = cell_str(r, 0)
-        if v.empty?: fallback else: v
-      None: fallback
+fn list_webhook_configs(db: DbHandle) : Result(List(WebhookConfig), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), webhook_configs_table()).map_error(table_err)
+      Ok(rows.map(fn(p) p.1 end))
     end
   )
 end
 
-fn set_setting_val(db: Sqlite.Database, key: Text, value: Text) : Result(Unit, MotetError)
-  db.run(
-    "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    [Sqlite.String(key), Sqlite.String(value)]
-  ).map_error(db_err)
+fn delete_webhook_config(db: DbHandle, source: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "delete_webhook_config",
+    "delete webhook #{source}",
+    NameArgs(name: source).to_json
+  )
+  Ok(Unit)
 end
 
-fn get_settings(db: Sqlite.Database) : Result(AppSettings, MotetError)
-  tz = try get_setting_val(db, "timezone", "America/Los_Angeles")
-  qs = try get_setting_val(db, "quiet_hours_start", "22:00")
-  qe = try get_setting_val(db, "quiet_hours_end", "07:00")
-  pub = try get_setting_val(db, "public_url", "")
-  vp = try get_setting_val(db, "vault_path", "vault")
-  vgr = try get_setting_val(db, "vault_git_remote", "")
-  tg_en = (try get_setting_val(db, "telegram_enabled", "0")) == "1"
-  tg_uid = try get_setting_val(db, "telegram_allowed_user_id", "")
-  tg_bot = try get_setting_val(db, "telegram_default_bot", "chief")
+## App Settings, Telegram Offset, Push Subscriptions, Analytics & Health.
+fn read_setting_val_from_store(st: Modb.Store, key: Text, fallback: Text) : Result(Text, MotetError)
+  val_opt = try Table.get(st, app_settings_table(), key).map_error(table_err)
   Ok(
-    AppSettings(
-      timezone: tz,
-      quiet_hours_start: qs,
-      quiet_hours_end: qe,
-      public_url: pub,
-      vault_path: vp,
-      vault_git_remote: vgr,
-      telegram_enabled?: tg_en,
-      telegram_allowed_user_id: tg_uid,
-      telegram_default_bot: tg_bot
-    )
+    case val_opt
+      Some(v) if not v.empty?: v
+      Some(_) | None: fallback
+    end
   )
 end
 
-fn save_settings(db: Sqlite.Database, s: AppSettings) : Result(AppSettings, MotetError)
-  prev_tz = (try get_setting_val(db, "timezone", "America/Los_Angeles")).trim
-  next_tz = s.timezone.trim
-  try set_setting_val(db, "timezone", next_tz)
-  if not next_tz.empty? and next_tz != prev_tz
-    _r = try db.run(
-      "UPDATE routines SET timezone = ? WHERE timezone = ?",
-      [Sqlite.String(next_tz), Sqlite.String(prev_tz)]
-    ).map_error(db_err)
-  end
-  try set_setting_val(db, "quiet_hours_start", s.quiet_hours_start.trim)
-  try set_setting_val(db, "quiet_hours_end", s.quiet_hours_end.trim)
-  try set_setting_val(db, "public_url", s.public_url.trim)
-  try set_setting_val(db, "vault_path", s.vault_path.trim)
-  try set_setting_val(db, "vault_git_remote", s.vault_git_remote.trim)
-  try set_setting_val(db, "telegram_enabled", if s.telegram_enabled?: "1" else: "0")
-  try set_setting_val(db, "telegram_allowed_user_id", s.telegram_allowed_user_id.trim)
-  try set_setting_val(db, "telegram_default_bot", s.telegram_default_bot.trim)
+fn set_setting_val(db: DbHandle, key: Text, value: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:settings",
+    "set_setting_val",
+    "set setting #{key}",
+    SetSettingArgs(key: key, value: value).to_json
+  )
+  Ok(Unit)
+end
+
+fn get_settings(db: DbHandle) : Result(AppSettings, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      tz = try read_setting_val_from_store(st, "timezone", "America/Los_Angeles")
+      qs = try read_setting_val_from_store(st, "quiet_hours_start", "22:00")
+      qe = try read_setting_val_from_store(st, "quiet_hours_end", "07:00")
+      pub = try read_setting_val_from_store(st, "public_url", "")
+      vp = try read_setting_val_from_store(st, "vault_path", "vault")
+      vgr = try read_setting_val_from_store(st, "vault_git_remote", "")
+      tg_en = (try read_setting_val_from_store(st, "telegram_enabled", "0")) == "1"
+      tg_uid = try read_setting_val_from_store(st, "telegram_allowed_user_id", "")
+      tg_bot = try read_setting_val_from_store(st, "telegram_default_bot", "chief")
+      Ok(
+        AppSettings(
+          timezone: tz,
+          quiet_hours_start: qs,
+          quiet_hours_end: qe,
+          public_url: pub,
+          vault_path: vp,
+          vault_git_remote: vgr,
+          telegram_enabled?: tg_en,
+          telegram_allowed_user_id: tg_uid,
+          telegram_default_bot: tg_bot
+        )
+      )
+    end
+  )
+end
+
+fn save_settings(db: DbHandle, s: AppSettings) : Result(AppSettings, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "save_settings",
+    "update system settings",
+    s.to_json
+  )
   get_settings(db)
 end
 
-fn get_telegram_offset(db: Sqlite.Database) : Result(Int, MotetError)
-  raw = try get_setting_val(db, "telegram_last_update_id", "0")
-  Ok(raw.to_int or 0)
+fn get_telegram_offset(db: DbHandle) : Result(Int, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      raw = try read_setting_val_from_store(Ledger.store(ldb), "telegram_last_update_id", "0")
+      Ok(raw.to_int or 0)
+    end
+  )
 end
 
-fn set_telegram_offset(db: Sqlite.Database, offset: Int) : Result(Unit, MotetError)
+fn set_telegram_offset(db: DbHandle, offset: Int) : Result(Unit, MotetError)
   set_setting_val(db, "telegram_last_update_id", "#{offset}")
 end
 
-fn save_push_subscription(db: Sqlite.Database, sub: PushSubscription, now_text: Text) : Result(
+fn save_push_subscription(db: DbHandle, sub: PushSubscription, now_text: Text) : Result(
   PushSubscription,
   MotetError
 )
-  ep = sub.endpoint.trim
-  return Error(BadInput(message: "push endpoint required")) if ep.empty?
-  try db.run(
-    [
-      "INSERT INTO push_subscriptions (endpoint, p256dh, auth, user_agent, created_at) VALUES (?, ?, ?, ?, ?) ",
-      "ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, user_agent = excluded.user_agent"
-    ].join(""),
-    [
-      Sqlite.String(ep),
-      Sqlite.String(sub.p256dh.trim),
-      Sqlite.String(sub.auth.trim),
-      Sqlite.String(sub.user_agent.trim),
-      Sqlite.String(now_text)
-    ]
-  ).map_error(db_err)
-  Ok(
-    PushSubscription(
-      endpoint: ep,
-      p256dh: sub.p256dh.trim,
-      auth: sub.auth.trim,
-      user_agent: sub.user_agent.trim,
-      created_at: now_text
-    )
+  rep = try exec_replay(
+    db,
+    "operator",
+    "save_push_subscription",
+    "register push subscription",
+    SavePushSubArgs(sub: sub, now_text: now_text).to_json
+  )
+  Json.decode[PushSubscription](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn list_push_subscriptions(db: DbHandle) : Result(List(PushSubscription), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), push_subscriptions_table()).map_error(table_err)
+      sorted = rows.map(fn(p) p.1 end).sort_by(fn(s) "#{s.created_at}:#{s.endpoint}" end).reverse
+      Ok(sorted)
+    end
   )
 end
 
-fn list_push_subscriptions(db: Sqlite.Database) : Result(List(PushSubscription), MotetError)
-  rows = try db.query(
-    "SELECT endpoint, p256dh, auth, user_agent, created_at FROM push_subscriptions ORDER BY created_at DESC",
-    []
-  ).map_error(db_err)
-  Ok(
-    rows.rows.map(fn(r)
-      PushSubscription(
-        endpoint: cell_str(r, 0),
-        p256dh: cell_str(r, 1),
-        auth: cell_str(r, 2),
-        user_agent: cell_str(r, 3),
-        created_at: cell_str(r, 4)
-      )
-    end)
+fn delete_push_subscription(db: DbHandle, endpoint: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "delete_push_subscription",
+    "delete push subscription",
+    NameArgs(name: endpoint).to_json
   )
+  Ok(Unit)
 end
 
-fn delete_push_subscription(db: Sqlite.Database, endpoint: Text) : Result(Unit, MotetError)
-  db.run("DELETE FROM push_subscriptions WHERE endpoint = ?", [Sqlite.String(endpoint.trim)])
-    .map_error(db_err)
-end
-
-fn analytics_summary(db: Sqlite.Database, day_prefix: Text) : Result(AnalyticsSummary, MotetError)
+fn analytics_summary(db: DbHandle, day_prefix: Text) : Result(AnalyticsSummary, MotetError)
   by_bot = try daily_budget_snapshots(db, day_prefix)
   var tot_usd = 0.0
   var tot_in = 0
@@ -2922,8 +5045,8 @@ fn analytics_summary(db: Sqlite.Database, day_prefix: Text) : Result(AnalyticsSu
     r_runs = r_runs.saturating_add(r.run_count)
     r_skips = r_skips.saturating_add(r.skip_count)
   end
-  pending = try count_table(db, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'")
-  active_bots = try count_table(db, "SELECT COUNT(*) FROM bots WHERE active = 1")
+  pending = (try list_approvals(db, true)).size
+  active_bots = (try list_bots(db)).filter(fn(b) b.active? end).size
   Ok(
     AnalyticsSummary(
       day: day_prefix,
@@ -2941,20 +5064,42 @@ fn analytics_summary(db: Sqlite.Database, day_prefix: Text) : Result(AnalyticsSu
   )
 end
 
-fn count_table(db: Sqlite.Database, sql: Text) : Result(Int, MotetError)
-  rows = try db.query(sql, []).map_error(db_err)
-  Ok(cell_int(rows.rows.first or [], 0))
-end
-
-fn health_summary(db: Sqlite.Database, env: Env) : Result(HealthSummary, MotetError)
-  bots = try count_table(db, "SELECT COUNT(*) FROM bots WHERE active = 1")
-  pending = try count_table(db, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'")
-  conns = try count_table(db, "SELECT COUNT(*) FROM connectors WHERE enabled = 1")
-  routines = try count_table(db, "SELECT COUNT(*) FROM routines WHERE enabled = 1")
-  qruns = try count_table(db, "SELECT COUNT(*) FROM bot_runs WHERE status IN ('queued', 'running')")
-  vsecs = try count_table(db, "SELECT COUNT(*) FROM vault_secrets")
-  psubs = try count_table(db, "SELECT COUNT(*) FROM push_subscriptions")
-  settings = try get_settings(db)
+fn health_summary(db: DbHandle, env: Env) : Result(HealthSummary, MotetError)
+  (bots, pending, conns, routines, qruns, psubs, tg_en) = try with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      bs = try Table.all(st, bots_table()).map_error(table_err)
+      active_bs = bs.filter(fn(p) p.1.active? end).size
+      pend = try Table.lookup(st, approvals_table(), approvals_by_status_index(), "pending")
+        .map_error(table_err)
+      cs = try Table.all(st, connectors_table()).map_error(table_err)
+      en_conns = cs.filter(fn(p) p.1.enabled? end).size
+      rs = try Table.all(st, routines_table()).map_error(table_err)
+      en_routines = rs.filter(fn(p) p.1.enabled? end).size
+      qs = try Table.lookup(st, bot_runs_table(), bot_runs_by_status_index(), "queued").map_error(
+        table_err
+      )
+      runs = try Table.lookup(st, bot_runs_table(), bot_runs_by_status_index(), "running")
+        .map_error(table_err)
+      ps = try Table.count(st, push_subscriptions_table()).map_error(table_err)
+      tg = (try read_setting_val_from_store(st, "telegram_enabled", "0")) == "1"
+      Ok((active_bs, pend.size, en_conns, en_routines, qs.size + runs.size, ps, tg))
+    end
+  )
+  vsecs = if not db.files.read_only.exists?(db.secrets_path)
+    0
+  else
+    case Modb.with_shared_lock(
+      db.files.read_only,
+      db.secrets_path,
+      modb_err,
+      fn(st) Table.count(st, vault_secrets_table()).map_error(table_err) end
+    )
+      Ok(n): n
+      Error(_): 0
+    end
+  end
   Ok(
     HealthSummary(
       status: "ok",
@@ -2966,16 +5111,272 @@ fn health_summary(db: Sqlite.Database, env: Env) : Result(HealthSummary, MotetEr
       queued_runs: qruns,
       vault_secrets: vsecs,
       master_key_set?: Vault.master_key_configured?(env),
-      telegram_enabled?: settings.telegram_enabled?,
+      telegram_enabled?: tg_en,
       push_subscriptions: psubs
     )
   )
 end
 
+## One-time migration import helpers (for `migrate-sqlite.mo`).
+fn import_snapshot(db: DbHandle, snap: MigrationSnapshot) : Result(Unit, MotetError)
+  now = db.clock.now
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (ldb1, _rep) = try exec_replay_on(
+        ldb,
+        "system:migration",
+        "import_snapshot",
+        "import SQLite snapshot (#{snap.sessions.size} sessions, #{snap.events.size} events)",
+        now,
+        snap.to_json
+      )
+      bots = try Table.all(Ledger.store(ldb1), bots_table()).map_error(table_err)
+      var cur_ldb = ldb1
+      for (_k, b) in bots
+        (next_ldb, _g) = try ensure_bot_root_grant_on(cur_ldb, b.name, now)
+        cur_ldb = next_ldb
+      end
+      Ok(Unit)
+    end
+  )
+end
+
+fn import_secrets_snapshot(
+  db: DbHandle,
+  pendings: List(OAuthPending),
+  tokens: List(ConnectorTokenRow),
+  secrets: List(VaultSecretRow)
+) : Result(Unit, MotetError)
+  Modb.with_exclusive_lock(
+    db.files,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      var tx = Modb.begin_write(st)
+      for p in pendings
+        tx = try Table.put(tx, oauth_pending_table(), p.state, p).map_error(table_err)
+      end
+      for t in tokens
+        tx = try Table.put(tx, connector_tokens_table(), t.connector_name, t).map_error(table_err)
+      end
+      for s in secrets
+        tx = try Table.put(tx, vault_secrets_table(), s.name, s).map_error(table_err)
+      end
+      _s1 = try Modb.commit(tx).map_error(modb_err)
+      Ok(Unit)
+    end
+  )
+end
+
+## Layer 4 Claims: routine execution leases preventing double runs across workers/processes.
+fn try_claim_routine(db: DbHandle, routine_id: Int, holder: Text, now: Time, ttl_seconds: Int) : Result(
+  Bool,
+  MotetError
+)
+  res = "routine:#{routine_id}"
+  gid = "system:scheduler"
+  meta = WriteMeta(
+    principal: holder,
+    action: "claim_routine",
+    reason: "acquire lease on #{res}",
+    at: now
+  )
+  case Claims.acquire_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    meta,
+    res,
+    gid,
+    None,
+    now + ttl_seconds.seconds
+  )
+    Ok(_c): Ok(true)
+    Error(Claims.AlreadyClaimed(resource: _, holder: _, expires_at: _)): Ok(false)
+    Error(other): Error(claim_err(other))
+  end
+end
+
+fn release_routine_claim(db: DbHandle, routine_id: Int, holder: Text, now: Time) : Result(
+  Unit,
+  MotetError
+)
+  res = "routine:#{routine_id}"
+  meta = WriteMeta(
+    principal: holder,
+    action: "release_routine",
+    reason: "release lease on #{res}",
+    at: now
+  )
+  case Claims.release_locked(db.files, db.path, motet_schema(), meta, res)
+    Ok(Unit): Ok(Unit)
+    Error(Claims.ClaimNotFound(resource: _)): Ok(Unit)
+    Error(other): Error(claim_err(other))
+  end
+end
+
+fn list_active_claims(db: DbHandle, now: Time) : Result(List(Claims.Claim), MotetError)
+  with_db_read(db, fn(ldb) Claims.list_active(Ledger.store(ldb), now).map_error(claim_err) end)
+end
+
+## Layer 4 Views & Self-Onboarding.
+fn describe_for_caller(db: DbHandle, principal: Text, grant_id_opt: Option(Text), now: Time) : Result(
+  OnboardingManifest,
+  MotetError
+)
+  is_admin = grant_id_opt == None
+  with_db_read(
+    db,
+    fn(ldb)
+      Views.describe_for_caller(
+        ldb,
+        motet_view_catalog(),
+        principal,
+        if is_admin: "operator" else: "delegated_bot",
+        is_admin,
+        ["save_memory", "add_rule", "save_artifact"],
+        grant_id_opt,
+        Views.default_limits(),
+        now
+      ).map_error(views_err)
+    end
+  )
+end
+
+fn run_read_program(
+  db: DbHandle,
+  principal: Text,
+  grant_id_opt: Option(Text),
+  program: ReadProgram,
+  now: Time
+) : Result(ReadResult, MotetError)
+  is_admin = grant_id_opt == None
+  Views.execute_read_program_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    motet_view_catalog(),
+    program,
+    principal,
+    grant_id_opt,
+    is_admin,
+    Views.default_limits(),
+    now
+  ).map_error(views_err)
+end
+
+## Layer 3/4 Verification, Audit Tail, Export, and Replay APIs.
+fn verify_all(db: DbHandle) : Result(ModbVerifySummary, MotetError)
+  main_res = try with_db_read(
+    db,
+    fn(ldb)
+      rep = try Ledger.verify_all(ldb).map_error(ledger_err)
+      calls = try Replay.call_count(Ledger.store(ldb)).map_error(replay_err)
+      Ok((rep, Ledger.txid(ldb), Ledger.schema_version(ldb), ldb.state.last_audit_hash, calls))
+    end
+  )
+  (rep, txid_val, sc_ver, last_hash, calls) = main_res
+  secrets_ok = if not db.files.read_only.exists?(db.secrets_path)
+    true
+  else
+    case Modb.with_shared_lock(
+      db.files.read_only,
+      db.secrets_path,
+      modb_err,
+      fn(st)
+        Modb.verify(st).map_error(modb_err)
+      end
+    )
+      Ok(_srep): true
+      Error(_): false
+    end
+  end
+  Ok(
+    ModbVerifySummary(
+      ok?: secrets_ok,
+      txid: txid_val,
+      page_count: rep.storage.page_count,
+      bucket_count: rep.storage.bucket_count,
+      schema_version: sc_ver,
+      audit_entries: rep.audit.entry_count,
+      last_audit_hash: last_hash,
+      invariants_checked: rep.invariants_checked,
+      call_count: calls,
+      secrets_ok?: secrets_ok
+    )
+  )
+end
+
+fn audit_tail(db: DbHandle, limit: Int) : Result(List(AuditEntry), MotetError)
+  cap = if limit > 0 and limit <= 200: limit else: 50
+  with_db_read(db, fn(ldb) Ledger.audit_tail(ldb, cap).map_error(ledger_err) end)
+end
+
+fn export_snapshot(db: DbHandle, now: Time) : Result(PortableSnapshot, MotetError)
+  Export.export_locked(db.files.read_only, db.path, motet_schema(), false, now).map_error(
+    export_err
+  )
+end
+
+fn simulate_replay(
+  db: DbHandle,
+  id: Text,
+  description: Text,
+  filter: ReplayFilter,
+  created_by: Text,
+  now: Time
+) : Result(ReplayProposal, MotetError)
+  Replay.simulate_replay_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    motet_replay_catalog(),
+    filter,
+    id,
+    description,
+    created_by,
+    now
+  ).map_error(replay_err)
+end
+
+fn list_replay_proposals(db: DbHandle) : Result(List(ReplayProposal), MotetError)
+  Replay.list_proposals_locked(db.files.read_only, db.path, motet_schema()).map_error(replay_err)
+end
+
+fn accept_replay_proposal(db: DbHandle, id: Text, principal: Text, reason: Text, now: Time) : Result(
+  ReplayProposal,
+  MotetError
+)
+  eff_reason = if reason.trim.empty?: "accept replay proposal #{id}" else: reason.trim
+  meta = WriteMeta(
+    principal: principal,
+    action: "accept_replay_proposal",
+    reason: eff_reason,
+    at: now
+  )
+  Replay.accept_proposal_locked(db.files, db.path, motet_schema(), id, meta).map_error(replay_err)
+end
+
+fn discard_replay_proposal(db: DbHandle, id: Text, principal: Text, now: Time) : Result(
+  ReplayProposal,
+  MotetError
+)
+  Replay.discard_proposal_locked(db.files, db.path, motet_schema(), id, principal, now).map_error(
+    replay_err
+  )
+end
+
 test "store seeds specialist roster, seals vault secrets & OAuth tokens, supports canonical chats and async runs"
-  sqlite = Sqlite.in_memory()
-  assert sqlite.open("motet.sqlite") is Ok(db)
-  now = "2026-11-25T00:00:00Z"
+  files = Files.in_memory({})
+  t0 = Time.parse("2026-11-25T00:00:00Z") or stop "time"
+  now = t0.to_text
+  clock = Clock.fixed(t0)
+  db = open(files, clock)
   env = Env.of({"MOTET_MASTER_KEY": "test-master-key-123"})
   srng = SecureRandom.seeded(99)
 
@@ -2993,7 +5394,7 @@ test "store seeds specialist roster, seals vault secrets & OAuth tokens, support
   assert trv.name == "travel" and trv.provider == Gemini and trv.active?
   assert set_bot_active(db, "travel", Some(false)) is Ok(trv_off) and not trv_off.active?
 
-  # Write-only Vault secret seal + resolve (never stored in plaintext)
+  # Write-only Vault secret seal + resolve (physically isolated in motet-secrets.modb!)
   assert save_vault_secret(db, env, srng, "GEMINI_API_KEY", "llm", "gem-secret-abc", now) is
     Ok(meta)
   assert meta.name == "GEMINI_API_KEY" and meta.source == "vault"
@@ -3002,6 +5403,14 @@ test "store seeds specialist roster, seals vault secrets & OAuth tokens, support
     Ok(Unit)
   assert get_connector_token(db, "notion") is Ok(Some(raw_ct)) and raw_ct.starts_with?("enc:v1:")
   assert get_connector_token_opened(db, env, "notion") == Ok(Some("ntn-live-tok"))
+
+  # Secrets MUST NEVER appear in portable export, audit ledger, or views!
+  assert export_snapshot(db, t0) is Ok(snap)
+  snap_json = Json.encode(snap)
+  assert not snap_json.contains?("gem-secret-abc") and not snap_json.contains?("ntn-live-tok")
+  assert audit_tail(db, 100) is Ok(aud)
+  aud_json = Json.encode(aud)
+  assert not aud_json.contains?("gem-secret-abc") and not aud_json.contains?("ntn-live-tok")
 
   # Canonical forever-chat + incremental event tailing + FTS
   assert get_or_create_canonical_session(db, "chief", now) is Ok(canon)
@@ -3022,8 +5431,8 @@ test "store seeds specialist roster, seals vault secrets & OAuth tokens, support
     Ok(e2)
   assert list_events_after(db, canon.id, e1.seq, 50) is Ok(tail) and
     tail.size == 1 and
-    tail.first is Some(t0) and
-    t0.seq == e2.seq
+    tail.first is Some(t_last) and
+    t_last.seq == e2.seq
   assert search_events(db, "Mercury receipts", 10) is Ok(hits) and hits.size == 1
 
   # Async run enqueue + atomic claim + live steer queue
@@ -3039,4 +5448,60 @@ test "store seeds specialist roster, seals vault secrets & OAuth tokens, support
   assert record_spend_ledger_full(db, "chief", canon.id, 1000, 100, 800, 0.00156, now) is Ok(Unit)
   assert daily_budget_snapshots(db, utc_day_prefix(now)) is Ok(snaps)
   assert snaps.find(fn(s) s.bot_name == "chief" end) is Some(cs) and cs.cached_input_tokens == 800
+
+  # Verify integrity across main + secrets DBs
+  assert verify_all(db) is Ok(vrep) and vrep.ok? and vrep.secrets_ok?
+end
+
+test "Modb Store enforces invariants, supports lossless selective-undo Replay, Grants, and Claims"
+  files = Files.in_memory({})
+  t0 = Time.parse("2026-11-25T00:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = open(files, clock)
+  assert seed_defaults(db, t0.to_text) is Ok(Unit)
+
+  # 1. Commit-time invariant blocks empty memory and negative spend without corrupting state
+  assert save_memory(db, "shared", "fact", "   ", "user", t0.to_text) is Error(BadInput(message: _))
+  assert record_spend_ledger(db, "chief", "s1", 10, 5, -1.0, t0.to_text) is
+    Error(BadInput(message: _))
+
+  # 2. Lossless selective-undo Replay removes bot:researcher memories while keeping user memories & seed bots
+  assert save_memory(db, "shared", "fact", "Keep user preference", "user", t0.to_text) is Ok(_)
+  assert save_memory(db, "researcher", "work_log", "Bad noisy log", "bot:researcher", t0.to_text) is
+    Ok(_)
+  assert simulate_replay(
+    db,
+    "undo-researcher",
+    "Remove bot:researcher writes",
+    Replay.ExcludePrincipal(principal: "bot:researcher"),
+    "operator",
+    t0
+  ) is
+    Ok(prop)
+  assert prop.summary.excluded == 1
+  assert accept_replay_proposal(db, "undo-researcher", "operator", "clean noisy researcher", t0) is
+    Ok(_)
+  assert list_memories(db, None, 20) is Ok(mems) and mems.size == 1
+  assert (mems.first or stop "m").content == "Keep user preference"
+  assert list_bots(db) is Ok(bots) and bots.size == 7
+
+  # 3. Attenuated Grants + cascading revocation
+  assert delegate_bot_grant(db, "chief", "bot:chief", "del:chief-finance", "finance", true, 3, t0) is
+    Ok(cg)
+  assert cg.allowed_actions == ["read"]
+  assert authorize_grant_action(db, "del:chief-finance", "write_local", t0) is
+    Error(PolicyDenied(message: _))
+  assert authorize_grant_action(db, "del:chief-finance", "read", t0) is Ok(_)
+  assert revoke_grant(db, "bot:chief", "operator", "rotate chief", t0) is Ok(_)
+  assert authorize_grant_action(db, "del:chief-finance", "read", t0) is
+    Error(PolicyDenied(message: _))
+
+  # 4. Claims mutual exclusion for routine execution
+  assert try_claim_routine(db, 1, "worker-1", t0, 300) == Ok(true)
+  assert try_claim_routine(db, 1, "worker-2", t0, 300) == Ok(false)
+  assert release_routine_claim(db, 1, "worker-1", t0) == Ok(Unit)
+  assert try_claim_routine(db, 1, "worker-2", t0, 300) == Ok(true)
+  assert describe_for_caller(db, "operator", None, t0) is Ok(manifest) and
+    manifest.allowed_views.size == 4
+  assert verify_all(db) is Ok(v) and v.ok?
 end
