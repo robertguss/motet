@@ -1,9 +1,10 @@
 ## Motet CLI and always-on worker (`mo install main.mo --name motet`).
-## Shares the exact same core modules and WAL SQLite database as `server.mo`.
+## Shares the exact same core modules and pure-Mo MoDB storage engine as `server.mo`.
 module Main
 use Brain
 use Command
 use Http
+use Json
 use Llm{LlmMessage, build_http_request}
 use Mcp{parse_host_port}
 use Skills
@@ -50,14 +51,19 @@ fn print_usage(console: Console)
       "  motet skills show <name>                         Print a skill's full SKILL.md",
       "  motet log <session_id>                           Print a session's append-only event log",
       "  motet search <query...>                          Full-text search across all session logs",
-      "  motet budget                                     Show exact Decimal USD spend per bot"
+      "  motet budget                                     Show exact Decimal USD spend per bot",
+      "  motet verify                                     Verify MoDB storage, SHA-256 audit chain, invariants & secrets",
+      "  motet audit [limit]                              Print recent SHA-256 hash-chained audit entries",
+      "  motet export                                     Export SHA-256 verified portable JSON snapshot (no secrets)",
+      "  motet grants                                     List attenuated bot grants",
+      "  motet claims                                     List active routine leases"
     ].join("\n")
   )
 end
 
-fn open_and_seed(sqlite: Sqlite, clock: Clock) : Result(Sqlite.Database, MotetError)
-  db = try sqlite.open("motet.sqlite").map_error(fn(e) StorageFailed(message: "#{e}") end)
-  try Store.seed_defaults(db, clock.now.to_text)
+fn open_and_seed(files: Files, clock: Clock) : Result(Store.DbHandle, MotetError)
+  db = Store.open(files, clock)
+  try Store.ensure_seeded(db, clock.now.to_text)
   Ok(db)
 end
 
@@ -66,7 +72,7 @@ fn print_err(console: Console, err: MotetError) : Int
   1
 end
 
-fn cmd_init(db: Sqlite.Database, env: Env, console: Console) : Int
+fn cmd_init(db: Store.DbHandle, env: Env, console: Console) : Int
   case Store.health_summary(db, env)
     Ok(h):
       console.print(
@@ -77,7 +83,7 @@ fn cmd_init(db: Sqlite.Database, env: Env, console: Console) : Int
   end
 end
 
-fn cmd_bots(db: Sqlite.Database, console: Console) : Int
+fn cmd_bots(db: Store.DbHandle, console: Console) : Int
   case Store.list_bots(db)
     Ok(bots):
       for b in bots
@@ -93,7 +99,7 @@ fn cmd_bots(db: Sqlite.Database, console: Console) : Int
   end
 end
 
-fn cmd_bot_sub(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
+fn cmd_bot_sub(db: Store.DbHandle, console: Console, rest: List(Text)) : Int
   sub = rest.first or ""
   if sub == "show" and rest.size == 2
     name = rest.get(1) or ""
@@ -177,7 +183,7 @@ fn cmd_bot_sub(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
   2
 end
 
-fn cmd_ask(rt: ToolRuntime, db: Sqlite.Database, console: Console, rest: List(Text)) : Int
+fn cmd_ask(rt: ToolRuntime, db: Store.DbHandle, console: Console, rest: List(Text)) : Int
   if rest.size < 2
     console.error("usage: motet ask <bot> <message...>")
     return 2
@@ -197,7 +203,7 @@ fn cmd_ask(rt: ToolRuntime, db: Sqlite.Database, console: Console, rest: List(Te
   end
 end
 
-fn cmd_chat(rt: ToolRuntime, db: Sqlite.Database, console: Console, bot_name: Text) : Int
+fn cmd_chat(rt: ToolRuntime, db: Store.DbHandle, console: Console, bot_name: Text) : Int
   console.print("Motet forever-chat with #{bot_name} (type /quit to exit)")
   var session_opt = None
   while true
@@ -223,7 +229,7 @@ fn cmd_chat(rt: ToolRuntime, db: Sqlite.Database, console: Console, bot_name: Te
   0
 end
 
-fn cmd_inbox(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
+fn cmd_inbox(db: Store.DbHandle, console: Console, rest: List(Text)) : Int
   show_all? = rest.first == Some("--all")
   case Store.list_approvals(db, not show_all?)
     Ok(items):
@@ -244,7 +250,7 @@ end
 
 fn cmd_resolve(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   console: Console,
   rest: List(Text),
   approve?: Bool
@@ -279,7 +285,7 @@ fn cmd_resolve(
 end
 
 fn cmd_vault(
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   env: Env,
   clock: Clock,
   srng: SecureRandom,
@@ -325,7 +331,7 @@ fn cmd_vault(
   2
 end
 
-fn cmd_connectors(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
+fn cmd_connectors(db: Store.DbHandle, console: Console, rest: List(Text)) : Int
   if rest.empty?
     return case Store.list_connectors(db)
       Ok(list):
@@ -368,7 +374,7 @@ fn cmd_connectors(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
   2
 end
 
-fn cmd_memory(db: Sqlite.Database, clock: Clock, console: Console, rest: List(Text)) : Int
+fn cmd_memory(db: Store.DbHandle, clock: Clock, console: Console, rest: List(Text)) : Int
   if rest.empty?
     return case Store.list_memories(db, None, 40)
       Ok(items):
@@ -433,7 +439,7 @@ fn cmd_skills(read_files: ReadFiles, console: Console, rest: List(Text)) : Int
   0
 end
 
-fn cmd_budget(db: Sqlite.Database, console: Console) : Int
+fn cmd_budget(db: Store.DbHandle, console: Console) : Int
   case Store.list_bots(db)
     Ok(bots):
       for b in bots
@@ -450,7 +456,7 @@ fn cmd_budget(db: Sqlite.Database, console: Console) : Int
   end
 end
 
-fn cmd_watch(rt: ToolRuntime, db: Sqlite.Database, console: Console, rest: List(Text)) : Int
+fn cmd_watch(rt: ToolRuntime, db: Store.DbHandle, console: Console, rest: List(Text)) : Int
   secs = case rest.first
     Some(s):
       case s.to_int
@@ -482,6 +488,75 @@ fn cmd_watch(rt: ToolRuntime, db: Sqlite.Database, console: Console, rest: List(
   0
 end
 
+fn cmd_verify(db: Store.DbHandle, console: Console) : Int
+  case Store.verify_all(db)
+    Ok(rep):
+      console.print(
+        "MoDB verify ok=#{rep.ok?} txid=#{rep.txid} schema=v#{rep.schema_version} pages=#{rep
+          .page_count} audit=#{rep.audit_entries} calls=#{rep.call_count} secrets_ok=#{rep
+          .secrets_ok?} tail=#{rep.last_audit_hash}"
+      )
+      if rep.ok?: 0 else: 1
+    Error(err): print_err(console, err)
+  end
+end
+
+fn cmd_audit(db: Store.DbHandle, console: Console, rest: List(Text)) : Int
+  limit = case rest.first
+    Some(s): s.to_int or 25
+    None: 25
+  end
+  case Store.audit_tail(db, limit)
+    Ok(entries):
+      for e in entries
+        console.print(
+          "##{e.seq} tx=#{e.txid} [#{e.principal}] #{e.action} — #{e.summary} (#{e.reason})"
+        )
+      end
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
+fn cmd_export(db: Store.DbHandle, clock: Clock, console: Console) : Int
+  case Store.export_snapshot(db, clock.now)
+    Ok(snap):
+      console.print(Json.encode(snap))
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
+fn cmd_grants(db: Store.DbHandle, console: Console) : Int
+  case Store.list_grants(db)
+    Ok(gs):
+      for g in gs
+        rev = if g.revoked: " [REVOKED]" else: ""
+        console.print(
+          "#{g.id}#{rev} principal=#{g.principal} calls=#{g.used_calls}/#{g.max_calls} actions=#{g
+            .allowed_actions.join(",")}"
+        )
+      end
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
+fn cmd_claims(db: Store.DbHandle, clock: Clock, console: Console) : Int
+  case Store.list_active_claims(db, clock.now)
+    Ok(cs):
+      if cs.empty?
+        console.print("No active routine claims.")
+      else
+        for c in cs
+          console.print("#{c.resource} holder=#{c.holder} expires=#{c.expires_at.to_text}")
+        end
+      end
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
 fn main(
   args: Args,
   env: Env,
@@ -489,7 +564,6 @@ fn main(
   files: Files,
   command: Command,
   network: Network,
-  sqlite: Sqlite,
   clock: Clock,
   srng: SecureRandom
 ) : Int
@@ -502,7 +576,7 @@ fn main(
     return 0
   end
 
-  db = case open_and_seed(sqlite, clock)
+  db = case open_and_seed(files, clock)
     Ok(d): d
     Error(err): return print_err(console, err)
   end
@@ -522,6 +596,11 @@ fn main(
   return cmd_skills(files.read_only, console, rest) if head == "skills"
   return cmd_budget(db, console) if head == "budget"
   return cmd_watch(rt, db, console, rest) if head == "watch"
+  return cmd_verify(db, console) if head == "verify"
+  return cmd_audit(db, console, rest) if head == "audit"
+  return cmd_export(db, clock, console) if head == "export"
+  return cmd_grants(db, console) if head == "grants"
+  return cmd_claims(db, clock, console) if head == "claims"
 
   if head == "tick"
     _drained = Brain.drain_queued_runs(rt, db, 10)
@@ -566,8 +645,7 @@ fn main(
   2
 end
 
-test "motet CLI initializes specialist roster, seals Vault API key, and runs canonical ask end-to-end"
-  sqlite = Sqlite.in_memory()
+test "motet CLI initializes specialist roster, seals Vault API key, runs canonical ask, and verifies MoDB"
   files = Files.in_memory({})
   cmd = Command.fake({})
   t0 = Time.parse("2026-11-25T00:00:00Z") or stop "time"
@@ -576,7 +654,7 @@ test "motet CLI initializes specialist roster, seals Vault API key, and runs can
   env = Env.of({"MOTET_MASTER_KEY": "cli-master-key"})
 
   c1 = Console.fake()
-  assert main(Args.of(["init"]), env, c1, files, cmd, Network.fake({}), sqlite, clock, srng) == 0
+  assert main(Args.of(["init"]), env, c1, files, cmd, Network.fake({}), clock, srng) == 0
   assert c1.printed.first ==
     Some("Motet initialized: 5 active bots, 1 enabled connectors, 4 routines")
 
@@ -589,7 +667,6 @@ test "motet CLI initializes specialist roster, seals Vault API key, and runs can
     files,
     cmd,
     Network.fake({}),
-    sqlite,
     clock,
     srng
   ) ==
@@ -603,7 +680,6 @@ test "motet CLI initializes specialist roster, seals Vault API key, and runs can
     files,
     cmd,
     Network.fake({}),
-    sqlite,
     clock,
     srng
   ) ==
@@ -618,13 +694,12 @@ test "motet CLI initializes specialist roster, seals Vault API key, and runs can
     files,
     cmd,
     Network.fake({}),
-    sqlite,
     clock,
     srng
   ) ==
     0
 
-  assert sqlite.open("motet.sqlite") is Ok(db)
+  db = Store.open(files, clock)
   assert Store.get_bot(db, "chief") is Ok(Some(chief))
   assert Brain.build_prompt_tiers(db, files.read_only, chief, Owner, t0.to_text) is Ok(tiers)
   ask_req = build_http_request(
@@ -646,17 +721,12 @@ test "motet CLI initializes specialist roster, seals Vault API key, and runs can
     ])
   )
   c4 = Console.fake()
-  assert main(
-    Args.of(["ask", "chief", "status", "check"]),
-    env,
-    c4,
-    files,
-    cmd,
-    ask_net,
-    sqlite,
-    clock,
-    srng
-  ) ==
+  assert main(Args.of(["ask", "chief", "status", "check"]), env, c4, files, cmd, ask_net, clock, srng) ==
     0
   assert c4.printed.first == Some("All 5 specialists ready.")
+
+  c5 = Console.fake()
+  assert main(Args.of(["verify"]), env, c5, files, cmd, Network.fake({}), clock, srng) == 0
+  assert (c5.printed.first or "").contains?("MoDB verify ok=true") and
+    (c5.printed.first or "").contains?("secrets_ok=true")
 end

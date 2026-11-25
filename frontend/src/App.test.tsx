@@ -112,6 +112,42 @@ function mockFetch() {
         summary_markdown: '# Motet Weekly Self-Audit\n\n- **Total routines:** 4',
       });
     }
+    if (url.includes('/v1/modb/verify')) {
+      return json({
+        'ok?': true,
+        txid: 42,
+        page_count: 18,
+        bucket_count: 20,
+        schema_version: 1,
+        audit_entries: 41,
+        last_audit_hash: 'abcdef1234567890',
+        invariants_checked: 4,
+        call_count: 30,
+        'secrets_ok?': true,
+      });
+    }
+    if (url.includes('/v1/modb/audit')) {
+      return json([
+        {
+          seq: 41,
+          txid: 42,
+          schema_version: 1,
+          principal: 'operator',
+          action: 'seed_defaults',
+          reason: 'seed default bots',
+          at: '2026-11-25T19:00:00Z',
+          summary: 'ok',
+          prev_hash: '0000',
+          entry_hash: 'abcdef1234567890',
+        },
+      ]);
+    }
+    if (url.includes('/v1/modb/grants')) {
+      return json([]);
+    }
+    if (url.includes('/v1/modb/claims')) {
+      return json([]);
+    }
     if (url.includes('/v1/analytics')) {
       return json({
         day: '2026-11-25',
@@ -207,11 +243,13 @@ describe('Motet Control Plane Dashboard', () => {
       expect(screen.getByText('Approve & Run')).toBeInTheDocument();
     });
 
-    // Switch to Analytics & System and verify cache hit rate + weekly audit scorecard render
+    // Switch to Analytics & System and verify cache hit rate, weekly audit scorecard, and MoDB Integrity render
     fireEvent.click(screen.getByText('Analytics & System'));
     await waitFor(() => {
       expect(screen.getByText('82%')).toBeInTheDocument();
       expect(screen.getByText('Weekly Self-Audit Anti-Job Scorecard')).toBeInTheDocument();
+      expect(screen.getByText('MoDB Storage Engine & Integrity')).toBeInTheDocument();
+      expect(screen.getByText('Verified')).toBeInTheDocument();
     });
 
     // Switch to Personal Vault & Pages and verify Git+qmd vault renders

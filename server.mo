@@ -3,7 +3,8 @@
 ## - Built-in durable background jobs (`motet.runs` every 1s, `motet.routines` every 1m)
 ## - Write-only AES-256-GCM Vault (`/v1/vault/secrets`) + sealed OAuth tokens
 ## - Responsive mobile-first PWA Web UI (`GET /`, `GET /manifest.json`)
-## - Built-in Streamable HTTP MCP endpoint (`POST /mcp`) sharing one WAL SQLite DB & live actors
+## - Built-in Streamable HTTP MCP endpoint (`POST /mcp`) sharing pure-Mo MoDB storage
+## - Layer 3/4 MoDB governance endpoints (`/v1/modb/*`) + isolated `motet-secrets.modb`
 ## - HMAC-SHA256 verified inbound webhooks (`POST /webhooks/:source`) tagged with External trust.
 module Server
 use Api
@@ -14,6 +15,12 @@ use Intents
 use Json
 use Mcp{parse_host_port, resolve_connector_url}
 use Memory
+use Modb.Claims
+use Modb.Export
+use Modb.Grants
+use Modb.Ledger
+use Modb.Replay
+use Modb.Views
 use Oauth
 use Scheduler
 use Skills
@@ -46,13 +53,16 @@ use Types{
   EvaluateIntentsResponse,
   HealthSummary,
   MemoryEntry,
+  ModbVerifySummary,
   MotetError,
   PolicyRule,
   ProviderKind,
   PublishGdocRequest,
   PublishGdocResponse,
   PushSubscription,
+  ReplaySimulateRequest,
   ResolveApprovalRequest,
+  RevokeGrantRequest,
   RoutineSpec,
   SaveMemoryRequest,
   SaveSecretRequest,
@@ -90,7 +100,6 @@ end
 api
   port 8787
   cors "*"
-  sqlite db from "motet.sqlite"
   static "/assets" from "public/assets"
   auth Operator via authenticate
 
@@ -192,6 +201,19 @@ api
   get "/v1/budget" get_budget
   get "/v1/events/stream" get_events_stream
 
+  get "/v1/modb/verify" get_modb_verify
+  get "/v1/modb/audit" get_modb_audit
+  get "/v1/modb/export" get_modb_export
+  get "/v1/modb/describe" get_modb_describe
+  post "/v1/modb/query" post_modb_query
+  get "/v1/modb/grants" get_modb_grants
+  post "/v1/modb/grants/:id/revoke" post_modb_revoke_grant
+  get "/v1/modb/claims" get_modb_claims
+  get "/v1/modb/replay/proposals" get_modb_replay_proposals
+  post "/v1/modb/replay/simulate" post_modb_replay_simulate
+  post "/v1/modb/replay/proposals/:id/accept" post_modb_replay_accept
+  post "/v1/modb/replay/proposals/:id/discard" post_modb_replay_discard
+
   post "/webhooks/:source" post_webhook
   post "/mcp" post_mcp
 
@@ -217,21 +239,22 @@ fn authenticate(req: Api.Request, env: Env) : Result(Operator, MotetError)
   end
 end
 
-fn ensure_ready(db: Sqlite.Database, clock: Clock) : Result(Unit, MotetError)
-  Store.seed_defaults(db, clock.now.to_text)
+fn ensure_ready(files: Files, clock: Clock) : Result(Store.DbHandle, MotetError)
+  db = Store.open(files, clock)
+  try Store.ensure_seeded(db, clock.now.to_text)
+  Ok(db)
 end
 
 ## Background worker job: drains queued async BotRuns every second inside `mo serve`.
 fn job_drain_runs(
   _payload: Json,
-  db: Sqlite.Database,
   files: Files,
   command: Command,
   network: Network,
   env: Env,
   clock: Clock
 ) : Result(Unit, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
   _n = try Brain.drain_queued_runs(rt, db, 4)
   Ok(Unit)
@@ -240,14 +263,13 @@ end
 ## Background worker job: executes due standing routines every minute inside `mo serve`.
 fn job_run_routines(
   _payload: Json,
-  db: Sqlite.Database,
   files: Files,
   command: Command,
   network: Network,
   env: Env,
   clock: Clock
 ) : Result(Unit, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
   _t = try Brain.run_due_routines(rt, db)
   Ok(Unit)
@@ -256,22 +278,21 @@ end
 ## Background worker job: polls Telegram Bot API every 3 seconds when enabled.
 fn job_poll_telegram(
   _payload: Json,
-  db: Sqlite.Database,
   files: Files,
   command: Command,
   network: Network,
   env: Env,
   clock: Clock
 ) : Result(Unit, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
   _n = Telegram.poll_once(rt, db)
   Ok(Unit)
 end
 
 ## Background worker job: runs overnight Dreaming consolidation once per local day around 03:00.
-fn job_run_dreaming(_payload: Json, db: Sqlite.Database, clock: Clock) : Result(Unit, MotetError)
-  try ensure_ready(db, clock)
+fn job_run_dreaming(_payload: Json, files: Files, clock: Clock) : Result(Unit, MotetError)
+  db = try ensure_ready(files, clock)
   settings = try Store.get_settings(db)
   now_t = clock.now
   local = Scheduler.to_local_clock(now_t, settings.timezone)
@@ -324,41 +345,41 @@ fn get_icon() : Api.Response
 end
 
 ## Reports Motet server health, active roster, inbox, async run queue, and Vault status.
-fn get_health(db: Sqlite.Database, env: Env, clock: Clock) : Result(HealthSummary, MotetError)
-  try ensure_ready(db, clock)
+fn get_health(files: Files, env: Env, clock: Clock) : Result(HealthSummary, MotetError)
+  db = try ensure_ready(files, clock)
   Store.health_summary(db, env)
 end
 
 ## Reads global Motet settings (timezone, quiet hours, public URL, vault path, Telegram config).
-fn get_settings(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(AppSettings, MotetError)
-  try ensure_ready(db, clock)
+fn get_settings(_op: Operator, files: Files, clock: Clock) : Result(AppSettings, MotetError)
+  db = try ensure_ready(files, clock)
   Store.get_settings(db)
 end
 
 ## Updates global Motet settings (timezone, quiet hours, public URL, vault path, Telegram config).
-fn post_settings(_op: Operator, db: Sqlite.Database, clock: Clock, body: AppSettings) : Result(
+fn post_settings(_op: Operator, files: Files, clock: Clock, body: AppSettings) : Result(
   AppSettings,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.save_settings(db, body)
 end
 
 ## Returns live spend, prompt-cache hit %, routine run vs zero-token skip telemetry, and roster metrics.
-fn get_analytics(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn get_analytics(_op: Operator, files: Files, clock: Clock) : Result(
   AnalyticsSummary,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.analytics_summary(db, Store.utc_day_prefix(clock.now.to_text))
 end
 
 ## Reads Telegram channel configuration and token status without exposing the bot token.
-fn get_telegram_config(_op: Operator, db: Sqlite.Database, env: Env, clock: Clock) : Result(
+fn get_telegram_config(_op: Operator, files: Files, env: Env, clock: Clock) : Result(
   TelegramConfig,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   s = try Store.get_settings(db)
   tok_ok = case try Store.resolve_secret(db, env, "TELEGRAM_BOT_TOKEN")
     Some(t) if not t.trim.empty?: true
@@ -377,55 +398,55 @@ fn get_telegram_config(_op: Operator, db: Sqlite.Database, env: Env, clock: Cloc
 end
 
 ## Tests Telegram Bot API connectivity using the Vault/Env TELEGRAM_BOT_TOKEN.
-fn post_telegram_test(_op: Operator, db: Sqlite.Database, network: Network, env: Env, clock: Clock) : Result(
+fn post_telegram_test(_op: Operator, files: Files, network: Network, env: Env, clock: Clock) : Result(
   TelegramTestResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   tok = (try Store.resolve_secret(db, env, "TELEGRAM_BOT_TOKEN")) or ""
   Ok(Telegram.test_bot_token(network, tok))
 end
 
 ## Lists registered PWA Web Push subscriptions.
-fn get_push_subscriptions(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn get_push_subscriptions(_op: Operator, files: Files, clock: Clock) : Result(
   List(PushSubscription),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.list_push_subscriptions(db)
 end
 
 ## Registers or updates a PWA Web Push subscription for approval & briefing alerts.
-fn post_push_subscribe(_op: Operator, db: Sqlite.Database, clock: Clock, body: PushSubscription) : Result(
+fn post_push_subscribe(_op: Operator, files: Files, clock: Clock, body: PushSubscription) : Result(
   PushSubscription,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.save_push_subscription(db, body, clock.now.to_text)
 end
 
 ## Removes a registered PWA Web Push subscription by endpoint URL.
-fn delete_push_subscribe(_op: Operator, db: Sqlite.Database, clock: Clock, endpoint: Text) : Result(
+fn delete_push_subscribe(_op: Operator, files: Files, clock: Clock, endpoint: Text) : Result(
   DeleteResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   try Store.delete_push_subscription(db, endpoint)
   Ok(DeleteResult(deleted?: true))
 end
 
 ## Lists all configured bots in the Motet roster (active specialists first).
-fn get_bots(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(List(BotConfig), MotetError)
-  try ensure_ready(db, clock)
+fn get_bots(_op: Operator, files: Files, clock: Clock) : Result(List(BotConfig), MotetError)
+  db = try ensure_ready(files, clock)
   Store.list_bots(db)
 end
 
 ## Creates or updates a persistent named specialist bot with strict connector allowlists.
-fn post_bot(_op: Operator, db: Sqlite.Database, clock: Clock, body: CreateBotRequest) : Result(
+fn post_bot(_op: Operator, files: Files, clock: Clock, body: CreateBotRequest) : Result(
   BotConfig,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   clean_name = body.name.trim
   return Error(BadInput(message: "bot name cannot be empty")) if clean_name.empty?
   provider = body.provider or Anthropic
@@ -473,35 +494,35 @@ fn post_bot(_op: Operator, db: Sqlite.Database, clock: Clock, body: CreateBotReq
 end
 
 ## Fetches a single bot configuration by name.
-fn get_bot_by_name(_op: Operator, db: Sqlite.Database, clock: Clock, name: Text) : Result(
+fn get_bot_by_name(_op: Operator, files: Files, clock: Clock, name: Text) : Result(
   BotConfig,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   (try Store.get_bot(db, name)).or_fail(ItemNotFound(message: "unknown bot: #{name}"))
 end
 
 ## Enables, disables, or toggles a bot's active state (preserve dormant presets).
 fn post_toggle_bot(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   clock: Clock,
   name: Text,
   body: ToggleRequest
 ) : Result(BotConfig, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.set_bot_active(db, name, body.enabled)
 end
 
 ## Clones an existing bot into a new dedicated specialist bot with optional overrides.
 fn post_clone_bot(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   clock: Clock,
   name: Text,
   body: CloneBotRequest
 ) : Result(BotConfig, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.clone_bot(
     db,
     name,
@@ -514,21 +535,21 @@ fn post_clone_bot(
 end
 
 ## Deletes a non-primary custom bot from the roster.
-fn delete_bot_by_name(_op: Operator, db: Sqlite.Database, clock: Clock, name: Text) : Result(
+fn delete_bot_by_name(_op: Operator, files: Files, clock: Clock, name: Text) : Result(
   DeleteResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   try Store.delete_bot(db, name)
   Ok(DeleteResult(deleted?: true))
 end
 
 ## Returns (or initializes) the canonical forever-chat session for a named bot.
-fn get_bot_canonical(_op: Operator, db: Sqlite.Database, clock: Clock, name: Text) : Result(
+fn get_bot_canonical(_op: Operator, files: Files, clock: Clock, name: Text) : Result(
   SessionSummary,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   _b = try (try Store.get_bot(db, name)).or_fail(ItemNotFound(message: "unknown bot: #{name}"))
   Store.get_or_create_canonical_session(db, name, clock.now.to_text)
 end
@@ -536,7 +557,6 @@ end
 ## Sends a message to a named bot and runs its multi-turn agent loop synchronously.
 fn post_ask_bot(
   _op: Operator,
-  db: Sqlite.Database,
   files: Files,
   command: Command,
   network: Network,
@@ -545,7 +565,7 @@ fn post_ask_bot(
   name: Text,
   body: AskRequest
 ) : Result(TurnReply, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
   if body.use_canonical or false
     Brain.run_turn_canonical(rt, db, name, body.session_id, Owner, false, body.message)
@@ -557,13 +577,13 @@ end
 ## Enqueues a non-blocking async BotRun (drained by `motet.runs` job or `motet watch`).
 fn post_enqueue_run(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   clock: Clock,
   srng: SecureRandom,
   name: Text,
   body: EnqueueRunRequest
 ) : Result(BotRun, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   bot = try (try Store.get_bot(db, name)).or_fail(ItemNotFound(message: "unknown bot: #{name}"))
   return Error(BadInput(message: "bot #{bot.name} is inactive")) if not bot.active?
   return Error(BadInput(message: "message cannot be empty")) if body.message.trim.empty?
@@ -587,29 +607,29 @@ fn post_enqueue_run(
 end
 
 ## Lists recent async bot runs (optionally filtered by bot name).
-fn get_runs(_op: Operator, db: Sqlite.Database, clock: Clock, bot: Option(Text)) : Result(
+fn get_runs(_op: Operator, files: Files, clock: Clock, bot: Option(Text)) : Result(
   List(BotRun),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.list_runs(db, bot, 40)
 end
 
 ## Reads the live status, step count, spend, and reply of one async BotRun.
-fn get_run_by_id(_op: Operator, db: Sqlite.Database, clock: Clock, id: Text) : Result(
+fn get_run_by_id(_op: Operator, files: Files, clock: Clock, id: Text) : Result(
   BotRun,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   (try Store.get_run(db, id)).or_fail(ItemNotFound(message: "unknown run: #{id}"))
 end
 
 ## Sends a live steering instruction (`steer`, `followup`, or `interrupt`) to an active BotRun.
-fn post_steer_run(_op: Operator, db: Sqlite.Database, clock: Clock, id: Text, body: SteerRunRequest) : Result(
+fn post_steer_run(_op: Operator, files: Files, clock: Clock, id: Text, body: SteerRunRequest) : Result(
   BotRun,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   mode = body.mode.trim.ascii_lowercase
   if mode != "steer" and mode != "followup" and mode != "interrupt" and mode != "cancel"
     return Error(BadInput(message: "steer mode must be steer, followup, or interrupt"))
@@ -618,32 +638,32 @@ fn post_steer_run(_op: Operator, db: Sqlite.Database, clock: Clock, id: Text, bo
 end
 
 ## Lists recent conversation sessions, optionally filtered by bot name (canonical chats first).
-fn get_sessions(_op: Operator, db: Sqlite.Database, clock: Clock, bot: Option(Text)) : Result(
+fn get_sessions(_op: Operator, files: Files, clock: Clock, bot: Option(Text)) : Result(
   List(SessionSummary),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.list_sessions(db, bot)
 end
 
 ## Full-text searches across all append-only session event logs.
-fn get_search_sessions(_op: Operator, db: Sqlite.Database, clock: Clock, q: Text) : Result(
+fn get_search_sessions(_op: Operator, files: Files, clock: Clock, q: Text) : Result(
   List(SessionEvent),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.search_events(db, q, 25)
 end
 
 ## Reads the append-only event stream for one session (supports `?after_seq=N` live tailing).
 fn get_session_events(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   clock: Clock,
   id: Text,
   after_seq: Option(Int)
 ) : Result(List(SessionEvent), MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   case after_seq
     Some(n) if n > 0: Store.list_events_after(db, id, n, 200)
     Some(_) | None: Store.list_events(db, id, 200)
@@ -651,20 +671,20 @@ fn get_session_events(
 end
 
 ## Lists Needs-You approval inbox items (defaults to pending items when `pending=true`).
-fn get_inbox(_op: Operator, db: Sqlite.Database, clock: Clock, pending: Option(Bool)) : Result(
+fn get_inbox(_op: Operator, files: Files, clock: Clock, pending: Option(Bool)) : Result(
   List(ApprovalItem),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.list_approvals(db, pending or false)
 end
 
 ## Dismisses all pending Needs-You approvals in bulk without executing them.
-fn post_dismiss_all_inbox(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn post_dismiss_all_inbox(_op: Operator, files: Files, clock: Clock) : Result(
   BulkActionResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   count = try Store.dismiss_all_pending_approvals(db)
   Ok(BulkActionResult(affected: count))
 end
@@ -672,7 +692,6 @@ end
 ## Resolves a Needs-You item with optional edited draft args, denial reason, Always-Allow rule, and auto-resume.
 fn post_resolve_approval(
   _op: Operator,
-  db: Sqlite.Database,
   files: Files,
   command: Command,
   network: Network,
@@ -681,7 +700,7 @@ fn post_resolve_approval(
   id: Int,
   body: ResolveApprovalRequest
 ) : Result(ApprovalResolution, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
   Brain.resolve_approval_with_options(rt, db, id, body)
 end
@@ -689,7 +708,6 @@ end
 ## Approves a Needs-You item, executes its paused tool action, and auto-resumes the bot turn.
 fn post_approve(
   _op: Operator,
-  db: Sqlite.Database,
   files: Files,
   command: Command,
   network: Network,
@@ -697,7 +715,7 @@ fn post_approve(
   clock: Clock,
   id: Int
 ) : Result(ApprovalItem, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
   res = try Brain.resolve_approval_with_options(
     rt,
@@ -717,7 +735,6 @@ end
 ## Denies a Needs-You item without executing the paused tool action.
 fn post_deny(
   _op: Operator,
-  db: Sqlite.Database,
   files: Files,
   command: Command,
   network: Network,
@@ -725,30 +742,30 @@ fn post_deny(
   clock: Clock,
   id: Int
 ) : Result(ApprovalItem, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
   Brain.resolve_approval(rt, db, id, false)
 end
 
 ## Lists write-only AES-256-GCM Vault secret metadata (NEVER returns secret values).
-fn get_vault_secrets(_op: Operator, db: Sqlite.Database, env: Env, clock: Clock) : Result(
+fn get_vault_secrets(_op: Operator, files: Files, env: Env, clock: Clock) : Result(
   List(VaultSecretMeta),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.list_vault_secrets(db, env)
 end
 
 ## Seals a secret into the write-only AES-256-GCM Vault (keys, bot tokens, webhook secrets).
 fn post_vault_secret(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   env: Env,
   clock: Clock,
   srng: SecureRandom,
   body: SaveSecretRequest
 ) : Result(VaultSecretMeta, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.save_vault_secret(
     db,
     env,
@@ -761,46 +778,45 @@ fn post_vault_secret(
 end
 
 ## Deletes a secret from the encrypted Vault by name.
-fn delete_vault_secret_by_name(_op: Operator, db: Sqlite.Database, clock: Clock, name: Text) : Result(
+fn delete_vault_secret_by_name(_op: Operator, files: Files, clock: Clock, name: Text) : Result(
   DeleteResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   try Store.delete_vault_secret(db, name)
   Ok(DeleteResult(deleted?: true))
 end
 
 ## Lists Markdown files inside the Git-backed personal vault.
-fn get_vault_files(_op: Operator, db: Sqlite.Database, files: ReadFiles, clock: Clock) : Result(
+fn get_vault_files(_op: Operator, files: Files, clock: Clock) : Result(
   List(VaultFileEntry),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   settings = try Store.get_settings(db)
-  Ok(VaultFs.list_files(files, settings.vault_path))
+  Ok(VaultFs.list_files(files.read_only, settings.vault_path))
 end
 
 ## Reads a single Markdown note from the Git-backed personal vault.
-fn get_vault_file(_op: Operator, db: Sqlite.Database, files: ReadFiles, clock: Clock, path: Text) : Result(
+fn get_vault_file(_op: Operator, files: Files, clock: Clock, path: Text) : Result(
   VaultFileReadResponse,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   settings = try Store.get_settings(db)
-  content = try VaultFs.read_file(files, settings.vault_path, path)
+  content = try VaultFs.read_file(files.read_only, settings.vault_path, path)
   Ok(VaultFileReadResponse(path: path.trim, content: content))
 end
 
 ## Writes a Markdown note to the Git-backed personal vault and auto-commits + triggers qmd update.
 fn post_vault_file(
   _op: Operator,
-  db: Sqlite.Database,
   files: Files,
   command: Command,
   clock: Clock,
   body: VaultFileWriteRequest
 ) : Result(VaultFileEntry, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   settings = try Store.get_settings(db)
   VaultFs.write_file(
     files,
@@ -813,11 +829,11 @@ fn post_vault_file(
 end
 
 ## Reports Git branch, dirty count, last commit, and configured remote for the personal vault.
-fn get_vault_git_status(_op: Operator, db: Sqlite.Database, command: Command, clock: Clock) : Result(
+fn get_vault_git_status(_op: Operator, files: Files, command: Command, clock: Clock) : Result(
   VaultGitStatus,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   settings = try Store.get_settings(db)
   Ok(VaultFs.git_status(command, settings.vault_path, settings.vault_git_remote))
 end
@@ -825,32 +841,31 @@ end
 ## Searches the personal vault via `tobi/qmd` sidecar (with local zero-dep Markdown fallback).
 fn get_vault_search(
   _op: Operator,
-  db: Sqlite.Database,
-  files: ReadFiles,
+  files: Files,
   network: Network,
   env: Env,
   clock: Clock,
   q: Text
 ) : Result(VaultSearchResponse, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   settings = try Store.get_settings(db)
   qmd_url = case try Store.get_connector(db, "qmd")
     Some(sp) if sp.enabled?: Some(resolve_connector_url(sp, env))
     Some(_) | None: None
   end
-  res = VaultFs.search_vault(files, network, settings.vault_path, q, qmd_url)
+  res = VaultFs.search_vault(files.read_only, network, settings.vault_path, q, qmd_url)
   Ok(VaultSearchResponse(query: q, results: res))
 end
 
 ## Lists or keyword-searches persistent shared and bot-scoped memory.
 fn get_memory(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   clock: Clock,
   scope: Option(Text),
   q: Option(Text)
 ) : Result(List(MemoryEntry), MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   case q
     Some(query) if not query.trim.empty?: Store.search_memories(db, scope, query)
     Some(_) | None: Store.list_memories(db, scope, 50)
@@ -858,11 +873,11 @@ fn get_memory(
 end
 
 ## Saves a persistent memory entry (`shared` or bot-scoped).
-fn post_memory(_op: Operator, db: Sqlite.Database, clock: Clock, body: SaveMemoryRequest) : Result(
+fn post_memory(_op: Operator, files: Files, clock: Clock, body: SaveMemoryRequest) : Result(
   MemoryEntry,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   return Error(BadInput(message: "memory content cannot be empty")) if body.content.trim.empty?
   scope = if body.scope.trim.empty?: "shared" else: body.scope.trim
   kind = if body.kind.trim.empty?: "fact" else: body.kind.trim
@@ -877,118 +892,118 @@ fn post_memory(_op: Operator, db: Sqlite.Database, clock: Clock, body: SaveMemor
 end
 
 ## Deletes a persistent memory entry by id.
-fn delete_memory_by_id(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+fn delete_memory_by_id(_op: Operator, files: Files, clock: Clock, id: Int) : Result(
   DeleteResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   try Store.delete_memory(db, id)
   Ok(DeleteResult(deleted?: true))
 end
 
 ## Lists staged untrusted/routine memory candidates waiting for owner promotion.
-fn get_staged_memory(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn get_staged_memory(_op: Operator, files: Files, clock: Clock) : Result(
   List(MemoryEntry),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.list_staged_memories(db, 50)
 end
 
 ## Promotes a staged memory candidate into active owner-verified durable memory.
-fn post_promote_staged_memory(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+fn post_promote_staged_memory(_op: Operator, files: Files, clock: Clock, id: Int) : Result(
   MemoryEntry,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.promote_staged_memory(db, id)
 end
 
 ## Runs Overnight Dreaming consolidation (Light -> REM -> Deep) with a pre-image rollback snapshot.
-fn post_run_dreaming(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn post_run_dreaming(_op: Operator, files: Files, clock: Clock) : Result(
   DreamingDigest,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Memory.run_dreaming(db, clock.now.to_text)
 end
 
 ## Lists recent Overnight Dreaming digests and rollback state.
-fn get_dreaming_history(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn get_dreaming_history(_op: Operator, files: Files, clock: Clock) : Result(
   List(DreamingDigest),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Memory.list_dreaming_history(db, 20)
 end
 
 ## 1-click Rollback of an Overnight Dreaming run to its pre-image memory snapshot.
-fn post_rollback_dreaming(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+fn post_rollback_dreaming(_op: Operator, files: Files, clock: Clock, id: Int) : Result(
   DreamingDigest,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Memory.rollback_dreaming(db, id)
 end
 
 ## Lists active Standing Intents (zero-LLM FTS prefiltered event watchdogs).
-fn get_intents(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn get_intents(_op: Operator, files: Files, clock: Clock) : Result(
   List(StandingIntent),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Intents.list_intents(db, true)
 end
 
 ## Creates a bounded Standing Intent with cooldown, max_fires, and expiry.
-fn post_intent(_op: Operator, db: Sqlite.Database, clock: Clock, body: CreateIntentRequest) : Result(
+fn post_intent(_op: Operator, files: Files, clock: Clock, body: CreateIntentRequest) : Result(
   StandingIntent,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Intents.create_intent(db, body, clock.now)
 end
 
 ## Evaluates text against active Standing Intents (zero LLM cost when unmatched).
 fn post_evaluate_intents(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   clock: Clock,
   srng: SecureRandom,
   body: EvaluateIntentsRequest
 ) : Result(EvaluateIntentsResponse, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Intents.evaluate_text(db, body.source, body.text, clock.now, srng)
 end
 
 ## Explicit-only owner cancellation of a Standing Intent.
-fn delete_intent_by_id(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+fn delete_intent_by_id(_op: Operator, files: Files, clock: Clock, id: Int) : Result(
   DeleteResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   try Intents.cancel_intent(db, id)
   Ok(DeleteResult(deleted?: true))
 end
 
 ## Weekly Self-Audit Anti-Job scorecard (routine noise, unused bot skills, approval friction).
-fn get_weekly_audit(_op: Operator, db: Sqlite.Database, files: ReadFiles, clock: Clock) : Result(
+fn get_weekly_audit(_op: Operator, files: Files, clock: Clock) : Result(
   WeeklyAuditReport,
   MotetError
 )
-  try ensure_ready(db, clock)
-  Memory.generate_weekly_audit(db, files, clock.now.to_text)
+  db = try ensure_ready(files, clock)
+  Memory.generate_weekly_audit(db, files.read_only, clock.now.to_text)
 end
 
 ## Lists installed progressive-disclosure SKILL.md documents enriched with Skill Curator usage counts.
-fn get_skills(_op: Operator, db: Sqlite.Database, files: ReadFiles, clock: Clock) : Result(
+fn get_skills(_op: Operator, files: Files, clock: Clock) : Result(
   List(SkillSummary),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   usage = try Store.get_skill_usage_map(db)
   Ok(
-    Skills.index_skills(files).map(fn(s)
+    Skills.index_skills(files.read_only).map(fn(s)
       SkillSummary(
         name: s.name,
         description: s.description,
@@ -1014,20 +1029,20 @@ fn post_skill(_op: Operator, files: Files, body: SaveSkillRequest) : Result(
 end
 
 ## Lists standing bot routines and self-scheduled check-ins.
-fn get_routines(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn get_routines(_op: Operator, files: Files, clock: Clock) : Result(
   List(RoutineSpec),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.list_routines(db)
 end
 
 ## Registers or updates a standing routine for a bot.
-fn post_routine(_op: Operator, db: Sqlite.Database, clock: Clock, body: CreateRoutineRequest) : Result(
+fn post_routine(_op: Operator, files: Files, clock: Clock, body: CreateRoutineRequest) : Result(
   RoutineSpec,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   return Error(BadInput(message: "routine name and prompt required")) if body.name.trim.empty? or
     body.prompt.trim.empty?
   _bot = try (try Store.get_bot(db, body.bot_name)).or_fail(
@@ -1053,14 +1068,13 @@ end
 ## Runs all due routines now (used by cron, CLI `tick`, or dashboard trigger).
 fn post_tick_routines(
   _op: Operator,
-  db: Sqlite.Database,
   files: Files,
   command: Command,
   network: Network,
   env: Env,
   clock: Clock
 ) : Result(TickSummary, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
   Brain.run_due_routines(rt, db)
 end
@@ -1068,40 +1082,40 @@ end
 ## Pauses, resumes, or flips a standing routine by id.
 fn post_toggle_routine(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   clock: Clock,
   id: Int,
   body: ToggleRequest
 ) : Result(RoutineSpec, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.set_routine_enabled(db, id, body.enabled)
 end
 
 ## Deletes a standing routine by id.
-fn delete_routine_by_id(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+fn delete_routine_by_id(_op: Operator, files: Files, clock: Clock, id: Int) : Result(
   DeleteResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   try Store.delete_routine(db, id)
   Ok(DeleteResult(deleted?: true))
 end
 
 ## Lists configured MCP/HTTP connectors (qmd, Notion, Gmail, Calendar, Todoist, Hearth Arvo, etc.).
-fn get_connectors(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn get_connectors(_op: Operator, files: Files, clock: Clock) : Result(
   List(ConnectorSpec),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.list_connectors(db)
 end
 
 ## Registers or updates an MCP/HTTP connector with host pinning and default approval effect.
-fn post_connector(_op: Operator, db: Sqlite.Database, clock: Clock, body: ConnectorSpec) : Result(
+fn post_connector(_op: Operator, files: Files, clock: Clock, body: ConnectorSpec) : Result(
   ConnectorSpec,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   return Error(BadInput(message: "connector name and url required")) if body.name.trim.empty? or
     body.url.trim.empty?
   host = if body.allowed_host.trim.empty?: parse_host_port(body.url) else: body.allowed_host.trim
@@ -1122,31 +1136,31 @@ end
 ## Enables, disables, or flips an MCP/HTTP connector by name.
 fn post_toggle_connector(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   clock: Clock,
   name: Text,
   body: ToggleRequest
 ) : Result(ConnectorSpec, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.set_connector_enabled(db, name, body.enabled)
 end
 
 ## Deletes an MCP/HTTP connector by name.
-fn delete_connector_by_name(_op: Operator, db: Sqlite.Database, clock: Clock, name: Text) : Result(
+fn delete_connector_by_name(_op: Operator, files: Files, clock: Clock, name: Text) : Result(
   DeleteResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   try Store.delete_connector(db, name)
   Ok(DeleteResult(deleted?: true))
 end
 
 ## Reports safe auth status (connected, source, scope, expiry) for every connector without exposing tokens.
-fn get_connectors_auth(_op: Operator, db: Sqlite.Database, env: Env, clock: Clock) : Result(
+fn get_connectors_auth(_op: Operator, files: Files, env: Env, clock: Clock) : Result(
   List(ConnectorAuthStatus),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   conns = try Store.list_connectors(db)
   var out = []
   for c in conns
@@ -1209,14 +1223,14 @@ end
 ## (`gmail-*`, `gcal-*`, `gdocs-*`), requesting an offline refresh_token stored sealed in Vault.
 fn post_google_oauth_start(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   env: Env,
   clock: Clock,
   srng: SecureRandom,
   account: Text,
   body: StartOAuthRequest
 ) : Result(StartOAuthResponse, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   acct = if account.trim.ascii_lowercase == "work": "work" else: "personal"
   redir = body.redirect_uri.trim
   valid_redir = redir.starts_with?("https://") or
@@ -1251,7 +1265,7 @@ end
 ## Starts standard MCP OAuth 2.0 + PKCE (RFC 9728 / 8414 / 7591 / 7636) sign-in using CSPRNG.
 fn post_connector_oauth_start(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   network: Network,
   env: Env,
   clock: Clock,
@@ -1259,7 +1273,7 @@ fn post_connector_oauth_start(
   name: Text,
   body: StartOAuthRequest
 ) : Result(StartOAuthResponse, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   redir = body.redirect_uri.trim
   valid_redir = redir.starts_with?("https://") or
     redir.starts_with?("http://localhost") or
@@ -1336,7 +1350,7 @@ end
 
 ## Handles the browser redirect back from an OAuth MCP server and stores the token AES-256-GCM sealed.
 fn get_oauth_callback(
-  db: Sqlite.Database,
+  files: Files,
   network: Network,
   env: Env,
   clock: Clock,
@@ -1346,9 +1360,9 @@ fn get_oauth_callback(
   error: Option(Text),
   error_description: Option(Text)
 ) : Api.Response
-  case ensure_ready(db, clock)
+  db = case ensure_ready(files, clock)
     Error(e): return oauth_html_page(500, "OAuth Error", "Database setup failed: #{e}", None)
-    Ok(Unit): Unit
+    Ok(d): d
   end
   case error
     Some(err_code) if not err_code.trim.empty?:
@@ -1485,11 +1499,11 @@ fn get_oauth_callback(
 end
 
 ## Clears a stored OAuth token for a connector without removing the connector definition.
-fn delete_connector_auth(_op: Operator, db: Sqlite.Database, clock: Clock, name: Text) : Result(
+fn delete_connector_auth(_op: Operator, files: Files, clock: Clock, name: Text) : Result(
   DeleteResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   try Store.delete_connector_token(db, name)
   Ok(DeleteResult(deleted?: true))
 end
@@ -1497,13 +1511,13 @@ end
 ## Publishes any Motet Page or report directly into a shareable Google Doc (work or personal account).
 fn post_gdocs_publish(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   network: Network,
   env: Env,
   clock: Clock,
   body: PublishGdocRequest
 ) : Result(PublishGdocResponse, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   is_work = body.account.trim.ascii_lowercase == "work"
   acct = if is_work: "gdocs-work" else: "gdocs-personal"
   spec = try (try Store.get_connector(db, acct)).or_fail(
@@ -1540,13 +1554,13 @@ end
 ## Live connectivity check: lists tools for built-in connectors or initializes remote MCP session.
 fn post_test_connector(
   _op: Operator,
-  db: Sqlite.Database,
+  files: Files,
   network: Network,
   env: Env,
   clock: Clock,
   name: Text
 ) : Result(ConnectorTestResult, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   spec = try (try Store.get_connector(db, name)).or_fail(
     ItemNotFound(message: "unknown connector: #{name}")
   )
@@ -1593,50 +1607,50 @@ fn post_test_connector(
 end
 
 ## Lists custom host-enforced policy rules.
-fn get_rules(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn get_rules(_op: Operator, files: Files, clock: Clock) : Result(
   List(PolicyRule),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.list_rules(db)
 end
 
 ## Adds a custom Allow / AskFirst / Deny policy rule.
-fn post_rule(_op: Operator, db: Sqlite.Database, clock: Clock, body: CreateRuleRequest) : Result(
+fn post_rule(_op: Operator, files: Files, clock: Clock, body: CreateRuleRequest) : Result(
   PolicyRule,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   return Error(BadInput(message: "tool_pattern required")) if body.tool_pattern.trim.empty?
   bname = if body.bot_name.trim.empty?: "*" else: body.bot_name.trim
   Store.add_rule(db, bname, body.tool_pattern.trim, body.decision, body.note.trim)
 end
 
 ## Deletes a custom policy rule by id.
-fn delete_rule_by_id(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+fn delete_rule_by_id(_op: Operator, files: Files, clock: Clock, id: Int) : Result(
   DeleteResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   try Store.delete_rule(db, id)
   Ok(DeleteResult(deleted?: true))
 end
 
 ## Lists configured inbound webhook routes and HMAC secret bindings.
-fn get_webhooks(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn get_webhooks(_op: Operator, files: Files, clock: Clock) : Result(
   List(WebhookConfig),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.list_webhook_configs(db)
 end
 
 ## Creates or updates a webhook source -> bot routing + HMAC secret binding.
-fn post_webhook_config(_op: Operator, db: Sqlite.Database, clock: Clock, body: WebhookConfig) : Result(
+fn post_webhook_config(_op: Operator, files: Files, clock: Clock, body: WebhookConfig) : Result(
   WebhookConfig,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   return Error(BadInput(message: "webhook source and target_bot required")) if body.source.trim
     .empty? or
     body.target_bot.trim.empty?
@@ -1652,56 +1666,172 @@ fn post_webhook_config(_op: Operator, db: Sqlite.Database, clock: Clock, body: W
 end
 
 ## Deletes a webhook route configuration by source name.
-fn delete_webhook_config_by_source(_op: Operator, db: Sqlite.Database, clock: Clock, source: Text) : Result(
+fn delete_webhook_config_by_source(_op: Operator, files: Files, clock: Clock, source: Text) : Result(
   DeleteResult,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   try Store.delete_webhook_config(db, source)
   Ok(DeleteResult(deleted?: true))
 end
 
 ## Lists durable artifacts and Pages produced by bots.
-fn get_artifacts(_op: Operator, db: Sqlite.Database, clock: Clock, bot: Option(Text)) : Result(
+fn get_artifacts(_op: Operator, files: Files, clock: Clock, bot: Option(Text)) : Result(
   List(ArtifactItem),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.list_artifacts(db, bot)
 end
 
 ## Inspects per-bot exact Decimal USD spend and prompt-cache hits for the current UTC day.
-fn get_budget(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+fn get_budget(_op: Operator, files: Files, clock: Clock) : Result(
   List(BudgetSnapshot),
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   Store.daily_budget_snapshots(db, Store.utc_day_prefix(clock.now.to_text))
 end
 
 ## Streams a Server-Sent Events snapshot of health and pending Needs-You approvals.
-fn get_events_stream(_op: Operator, db: Sqlite.Database, env: Env, clock: Clock) : Result(
+fn get_events_stream(_op: Operator, files: Files, env: Env, clock: Clock) : Result(
   Api.Response,
   MotetError
 )
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   h = try Store.health_summary(db, env)
   inbox = try Store.list_approvals(db, true)
   Ok(Api.sse_response([(Some("health"), Json.encode(h)), (Some("inbox"), Json.encode(inbox))]))
+end
+
+## Layer 3/4 MoDB verification, audit, export, views, grants, claims, and selective-undo replay endpoints.
+fn get_modb_verify(_op: Operator, files: Files, clock: Clock) : Result(
+  ModbVerifySummary,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.verify_all(db)
+end
+
+fn get_modb_audit(_op: Operator, files: Files, clock: Clock, limit: Option(Int)) : Result(
+  List(Ledger.AuditEntry),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.audit_tail(db, limit or 50)
+end
+
+fn get_modb_export(_op: Operator, files: Files, clock: Clock) : Result(
+  Export.PortableSnapshot,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.export_snapshot(db, clock.now)
+end
+
+fn get_modb_describe(op: Operator, files: Files, clock: Clock, grant_id: Option(Text)) : Result(
+  Views.OnboardingManifest,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.describe_for_caller(db, op.subject, grant_id, clock.now)
+end
+
+fn post_modb_query(
+  op: Operator,
+  files: Files,
+  clock: Clock,
+  grant_id: Option(Text),
+  body: Views.ReadProgram
+) : Result(Views.ReadResult, MotetError)
+  db = try ensure_ready(files, clock)
+  Store.run_read_program(db, op.subject, grant_id, body, clock.now)
+end
+
+fn get_modb_grants(_op: Operator, files: Files, clock: Clock) : Result(
+  List(Grants.Grant),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_grants(db)
+end
+
+fn post_modb_revoke_grant(
+  op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  body: RevokeGrantRequest
+) : Result(Grants.Grant, MotetError)
+  db = try ensure_ready(files, clock)
+  Store.revoke_grant(db, id, op.subject, body.reason or "revoked via API", clock.now)
+end
+
+fn get_modb_claims(_op: Operator, files: Files, clock: Clock) : Result(
+  List(Claims.Claim),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_active_claims(db, clock.now)
+end
+
+fn get_modb_replay_proposals(_op: Operator, files: Files, clock: Clock) : Result(
+  List(Replay.ReplayProposal),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_replay_proposals(db)
+end
+
+fn post_modb_replay_simulate(op: Operator, files: Files, clock: Clock, body: ReplaySimulateRequest) : Result(
+  Replay.ReplayProposal,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  return Error(BadInput(message: "proposal id required")) if body.id.trim.empty?
+  filter = case body.exclude_principal
+    Some(p) if not p.trim.empty?: Replay.ExcludePrincipal(principal: p.trim)
+    Some(_) | None:
+      case body.exclude_seqs
+        Some(seqs) if not seqs.empty?: Replay.ExcludeSeqs(seqs: seqs)
+        Some(_) | None:
+          case body.stop_before_seq
+            Some(s): Replay.StopBeforeSeq(seq: s)
+            None: Replay.ReplayAll
+          end
+      end
+  end
+  Store.simulate_replay(db, body.id.trim, body.description.trim, filter, op.subject, clock.now)
+end
+
+fn post_modb_replay_accept(op: Operator, files: Files, clock: Clock, id: Text) : Result(
+  Replay.ReplayProposal,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.accept_replay_proposal(db, id, op.subject, "accepted via API", clock.now)
+end
+
+fn post_modb_replay_discard(op: Operator, files: Files, clock: Clock, id: Text) : Result(
+  Replay.ReplayProposal,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.discard_replay_proposal(db, id, op.subject, clock.now)
 end
 
 ## Receives an external webhook payload with HMAC-SHA256 verification (when configured),
 ## logs it under External trust, and enqueues an External-trust async BotRun for the target bot.
 fn post_webhook(
   _op: Option(Operator),
-  db: Sqlite.Database,
+  files: Files,
   env: Env,
   clock: Clock,
   srng: SecureRandom,
   req: Api.Request,
   source: Text
 ) : Result(WebhookReceipt, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   cfg_opt = try Store.get_webhook_config(db, source)
   target_bot = case cfg_opt
     Some(c):
@@ -1795,10 +1925,9 @@ fn mcp_text_result(text: Text, structured: Json) : Json
   })
 end
 
-## Built-in Streamable HTTP MCP JSON-RPC 2.0 server backed by Motet's live SQLite DB & actors.
+## Built-in Streamable HTTP MCP JSON-RPC 2.0 server backed by Motet's pure-Mo MoDB storage & actors.
 fn post_mcp(
   _op: Operator,
-  db: Sqlite.Database,
   files: Files,
   command: Command,
   network: Network,
@@ -1806,7 +1935,7 @@ fn post_mcp(
   clock: Clock,
   req: Api.Request
 ) : Result(Api.Response, MotetError)
-  try ensure_ready(db, clock)
+  db = try ensure_ready(files, clock)
   raw = try req.text.or_fail(BadInput(message: "MCP body must be UTF-8 JSON"))
   doc = try Json.parse(raw).map_error(fn(e) BadInput(message: "MCP JSON parse error: #{e}") end)
   id = doc.get("id") or Json.Null
@@ -1876,6 +2005,21 @@ fn post_mcp(
           }),
           "required": Json.Array([Json.String("message")])
         })
+      }),
+      Json.Object({
+        "name": Json.String("motet_verify"),
+        "description": Json.String(
+          "Verify MoDB storage integrity, hash-chained audit ledger, invariants, and isolated secrets DB"
+        ),
+        "inputSchema": Json.Object({"type": Json.String("object")})
+      }),
+      Json.Object({
+        "name": Json.String("motet_audit"),
+        "description": Json.String("Read recent tamper-evident SHA-256 hash-chained audit entries"),
+        "inputSchema": Json.Object({
+          "type": Json.String("object"),
+          "properties": Json.Object({"limit": Json.Object({"type": Json.String("integer")})})
+        })
       })
     ])
     return Ok(mcp_ok(id, Json.Object({"tools": tool_list})))
@@ -1904,6 +2048,15 @@ fn post_mcp(
       saved = try Store.save_memory(db, scope, kind, content, "mcp", clock.now.to_text)
       return Ok(mcp_ok(id, mcp_text_result(Json.encode(saved), saved.to_json)))
     end
+    if tname == "motet_verify"
+      rep = try Store.verify_all(db)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(rep), rep.to_json)))
+    end
+    if tname == "motet_audit"
+      lim = args.int_at("limit") or 20
+      entries = try Store.audit_tail(db, lim)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(entries), entries.to_json)))
+    end
     if tname == "motet_ask"
       bot_name = args.text_at("bot") or "chief"
       msg = args.text_at("message") or ""
@@ -1918,26 +2071,26 @@ fn post_mcp(
 end
 
 test "Motet v1 API serves specialist roster, write-only Vault, async runs + job drain, and HMAC webhooks"
-  sqlite = Sqlite.in_memory()
+  files = Files.in_memory({})
   srng = SecureRandom.seeded(123)
   env = Env.of({"MOTET_API_TOKEN": "secret-op", "MOTET_MASTER_KEY": "master-test-key-v1"})
   t0 = Time.parse("2026-11-25T09:00:00Z") or stop "time"
   clock = Clock.fixed(t0)
 
   # 1. Public PWA UI, icon, OpenAPI spec, and auth enforcement
-  ui_resp = ApiTest.send(Server, Api.get("/"), sqlite, env, clock, srng)
+  ui_resp = ApiTest.send(Server, Api.get("/"), files, env, clock, srng)
   assert ui_resp.status == 200 and ui_resp.text.contains?("Motet")
-  oa_resp = ApiTest.send(Server, Api.get("/openapi.json"), sqlite, env, clock, srng)
+  oa_resp = ApiTest.send(Server, Api.get("/openapi.json"), files, env, clock, srng)
   assert oa_resp.status == 200 and
     oa_resp.text.contains?("/v1/vault/secrets") and
     oa_resp.text.contains?("/v1/bots/{name}/runs")
 
-  unauth = ApiTest.send(Server, Api.get("/v1/bots"), sqlite, env, clock, srng)
+  unauth = ApiTest.send(Server, Api.get("/v1/bots"), files, env, clock, srng)
   assert unauth.status == 401
   authed = ApiTest.send(
     Server,
     Api.get("/v1/bots").with_bearer("secret-op"),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -1957,7 +2110,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
         read_only_connectors: None
       )
     ),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -1972,7 +2125,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     Api.post("/v1/vault/secrets").with_bearer("secret-op").with_json(
       SaveSecretRequest(name: "WH_SECRET_RECEIPTS", value: "whsec_live_999", scope: Some("webhook"))
     ),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -1981,7 +2134,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   list_sec = ApiTest.send(
     Server,
     Api.get("/v1/vault/secrets").with_bearer("secret-op"),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2001,7 +2154,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
         enabled?: true
       )
     ),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2015,7 +2168,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
       "x-hub-signature-256",
       "sha256=0000000000000000000000000000000000000000000000000000000000000000"
     ).with_text(payload),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2026,7 +2179,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   good_hook = ApiTest.send(
     Server,
     Api.post("/webhooks/receipts").with_header("x-hub-signature-256", good_sig).with_text(payload),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2040,7 +2193,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   canon = ApiTest.send(
     Server,
     Api.get("/v1/bots/chief/canonical").with_bearer("secret-op"),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2052,7 +2205,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     Api.post("/v1/bots/chief/runs").with_bearer("secret-op").with_json(
       EnqueueRunRequest(message: "Draft morning brief", session_id: None, use_canonical: Some(true))
     ),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2064,20 +2217,20 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     Api.post("/v1/runs/#{run0.id}/steer").with_bearer("secret-op").with_json(
       SteerRunRequest(mode: "steer", message: Some("Keep it to 3 bullets"))
     ),
-    sqlite,
+    files,
     env,
     clock,
     srng
   )
   assert steered.status == 200
 
-  # 6. Built-in /mcp endpoint shares the exact same SQLite database
+  # 6. Built-in /mcp endpoint shares the exact same pure-Mo MoDB database
   mcp_save = ApiTest.send(
     Server,
     Api.post("/mcp").with_bearer("secret-op").with_text(
       "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"motet_memory_save\",\"arguments\":{\"scope\":\"shared\",\"kind\":\"profile\",\"content\":\"Uses Hearth Arvo and Todoist daily\"}}}"
     ),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2088,7 +2241,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   sse = ApiTest.send(
     Server,
     Api.get("/v1/events/stream").with_bearer("secret-op"),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2098,7 +2251,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   bad_cb = ApiTest.send(
     Server,
     Api.get("/oauth/callback").with_query("code", "abc").with_query("state", "unknown-state"),
-    sqlite,
+    files,
     Network.fake({}),
     env,
     clock,
@@ -2107,7 +2260,6 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   assert bad_cb.status == 400 and bad_cb.text.contains?("Expired or Unknown Sign-In")
 
   # 8. Phase 3: Git-backed Personal Vault API + Built-in everyday connector tool discovery
-  vfiles = Files.in_memory({})
   vcmd = Command.fake({})
   v_save = ApiTest.send(
     Server,
@@ -2118,8 +2270,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
         commit_message: Some("Add Kyoto note")
       )
     ),
-    sqlite,
-    vfiles,
+    files,
     vcmd,
     env,
     clock,
@@ -2130,8 +2281,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   v_search = ApiTest.send(
     Server,
     Api.get("/v1/vault/search").with_bearer("secret-op").with_query("q", "kyoto rail"),
-    sqlite,
-    vfiles,
+    files,
     Network.fake({}),
     env,
     clock,
@@ -2142,7 +2292,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   ha_test = ApiTest.send(
     Server,
     Api.post("/v1/connectors/hearth-arvo/test").with_bearer("secret-op"),
-    sqlite,
+    files,
     Network.fake({}),
     env,
     clock,
@@ -2156,7 +2306,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   dream_resp = ApiTest.send(
     Server,
     Api.post("/v1/memory/dream").with_bearer("secret-op"),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2165,7 +2315,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   rb_resp = ApiTest.send(
     Server,
     Api.post("/v1/memory/dream/#{dd.id}/rollback").with_bearer("secret-op"),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2185,7 +2335,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
         expires_days: Some(14)
       )
     ),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2197,7 +2347,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     Api.post("/v1/intents/evaluate").with_bearer("secret-op").with_json(
       EvaluateIntentsRequest(source: "gmail", text: "Contractor sent permit approval")
     ),
-    sqlite,
+    files,
     env,
     clock,
     srng
@@ -2209,11 +2359,88 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   audit_resp = ApiTest.send(
     Server,
     Api.get("/v1/analytics/audit").with_bearer("secret-op"),
-    sqlite,
-    vfiles,
+    files,
     env,
     clock,
     srng
   )
   assert audit_resp.status == 200 and audit_resp.text.contains?("Motet Weekly Self-Audit")
+
+  # 10. Layer 3/4 MoDB verification, audit, export, views manifest, grants, claims, and MCP verify
+  v_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/verify").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert v_resp.status == 200 and
+    Json.decode[ModbVerifySummary](v_resp.text) is Ok(vr) and
+    vr.ok? and
+    vr.secrets_ok?
+
+  a_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/audit").with_bearer("secret-op").with_query("limit", "10"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert a_resp.status == 200 and a_resp.text.contains?("entry_hash")
+
+  ex_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/export").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert ex_resp.status == 200 and
+    Json.decode[Export.PortableSnapshot](ex_resp.text) is Ok(ex_snap) and
+    not ex_snap.sha256.empty?
+
+  desc_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/describe").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert desc_resp.status == 200 and desc_resp.text.contains?("views")
+
+  grants_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/grants").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert grants_resp.status == 200
+
+  claims_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/claims").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert claims_resp.status == 200
+
+  mcp_ver = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_text(
+      "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"motet_verify\",\"arguments\":{}}}"
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_ver.status == 200 and mcp_ver.text.contains?("\"ok?\":true")
 end

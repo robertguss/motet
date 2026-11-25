@@ -3,6 +3,7 @@ import {
   Activity,
   Bell,
   Cpu,
+  Database,
   KeyRound,
   Link2,
   Plug,
@@ -24,6 +25,10 @@ import {
   fmtUsd,
   getStoredToken,
   HealthSummary,
+  ModbAuditEntry,
+  ModbClaim,
+  ModbGrant,
+  ModbVerifySummary,
   PolicyRule,
   PushSubscriptionItem,
   SessionEvent,
@@ -837,14 +842,59 @@ export const AnalyticsSystemView: React.FC<{
   const [rDec, setRDec] = useState<'allow' | 'ask_first' | 'deny'>('allow');
   const [rNote, setRNote] = useState('');
   const [auditMd, setAuditMd] = useState('');
+  const [modbVerify, setModbVerify] = useState<ModbVerifySummary | null>(null);
+  const [modbAudit, setModbAudit] = useState<ModbAuditEntry[]>([]);
+  const [modbGrants, setModbGrants] = useState<ModbGrant[]>([]);
+  const [modbClaims, setModbClaims] = useState<ModbClaim[]>([]);
+  const [verifyingModb, setVerifyingModb] = useState(false);
 
   async function loadAudit() {
     const rep = await apiOptional<{ summary_markdown: string } | null>('/v1/analytics/audit', null);
     if (rep?.summary_markdown) setAuditMd(rep.summary_markdown);
   }
 
+  async function loadModb(notify = false) {
+    setVerifyingModb(true);
+    try {
+      const [mv, ma, mg, mc] = await Promise.all([
+        apiOptional<ModbVerifySummary | null>('/v1/modb/verify', null),
+        apiOptional<ModbAuditEntry[]>('/v1/modb/audit?limit=12', []),
+        apiOptional<ModbGrant[]>('/v1/modb/grants', []),
+        apiOptional<ModbClaim[]>('/v1/modb/claims', []),
+      ]);
+      setModbVerify(mv);
+      setModbAudit(ma);
+      setModbGrants(mg);
+      setModbClaims(mc);
+      if (notify && mv) {
+        toast(
+          `MoDB ${mv['ok?'] ? 'verified' : 'failed'} · txid=${mv.txid} · ${mv.audit_entries} audit entries`
+        );
+      }
+    } finally {
+      setVerifyingModb(false);
+    }
+  }
+
+  async function exportModbSnapshot() {
+    try {
+      const snap = await api<{ sha256: string }>('/v1/modb/export');
+      const blob = new Blob([JSON.stringify(snap, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `motet-modb-export-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast(`Exported MoDB snapshot (sha256: ${String(snap.sha256 || '').slice(0, 12)}…)`);
+    } catch (err) {
+      toast((err as Error).message);
+    }
+  }
+
   useEffect(() => {
     loadAudit();
+    loadModb();
   }, []);
 
   async function saveGlobalSettings(e: React.FormEvent) {
@@ -939,6 +989,79 @@ export const AnalyticsSystemView: React.FC<{
           <MarkdownView content={auditMd} />
         </Card>
       )}
+
+      <Card>
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="flex items-center gap-2 font-bold text-sm">
+            <Database className="w-4 h-4 text-[var(--accent-hover)]" />
+            <span>MoDB Storage Engine &amp; Integrity</span>
+            <Badge tone={modbVerify?.['ok?'] ? 'ok' : modbVerify ? 'bad' : 'neutral'}>
+              {modbVerify ? (modbVerify['ok?'] ? 'Verified' : 'Error') : 'Loading…'}
+            </Badge>
+            {modbVerify && (
+              <Badge tone={modbVerify['secrets_ok?'] ? 'ok' : 'bad'}>
+                Secrets DB: {modbVerify['secrets_ok?'] ? 'Isolated & OK' : 'Error'}
+              </Badge>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={() => loadModb(true)} disabled={verifyingModb}>
+              {verifyingModb ? 'Verifying…' : 'Verify Integrity'}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={exportModbSnapshot}>
+              Export Snapshot
+            </Button>
+          </div>
+        </div>
+        {modbVerify && (
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
+            <div className="p-2 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)]">
+              <div className="text-[var(--fg-muted)]">CoW TxID</div>
+              <strong className="font-mono">{modbVerify.txid}</strong>
+            </div>
+            <div className="p-2 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)]">
+              <div className="text-[var(--fg-muted)]">B+Tree Pages</div>
+              <strong className="font-mono">{modbVerify.page_count}</strong>
+            </div>
+            <div className="p-2 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)]">
+              <div className="text-[var(--fg-muted)]">Audit Chain</div>
+              <strong className="font-mono">{modbVerify.audit_entries} entries</strong>
+            </div>
+            <div className="p-2 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)]">
+              <div className="text-[var(--fg-muted)]">Replay Log</div>
+              <strong className="font-mono">{modbVerify.call_count} calls</strong>
+            </div>
+            <div className="p-2 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)]">
+              <div className="text-[var(--fg-muted)]">Grants / Claims</div>
+              <strong className="font-mono">
+                {modbGrants.filter((g) => !g.revoked).length} / {modbClaims.length}
+              </strong>
+            </div>
+          </div>
+        )}
+        {modbAudit.length > 0 && (
+          <div className="flex flex-col gap-1.5">
+            <div className="text-xs font-semibold text-[var(--fg-muted)]">
+              Recent SHA-256 Audit Ledger Entries
+            </div>
+            {modbAudit.slice(0, 6).map((a) => (
+              <div
+                key={a.seq}
+                className="flex items-center justify-between gap-2 text-xs px-2.5 py-1.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)]"
+              >
+                <div className="truncate">
+                  <span className="font-mono text-[var(--fg-muted)]">#{a.seq}</span>{' '}
+                  <strong>{a.action}</strong>{' '}
+                  <span className="text-[var(--fg-muted)]">by {a.principal}</span> — {a.reason}
+                </div>
+                <span className="font-mono text-[10px] text-[var(--fg-subtle)] shrink-0">
+                  {a.entry_hash.slice(0, 10)}…
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
 
       <Card>
         <div className="flex items-center gap-2 font-bold text-sm">

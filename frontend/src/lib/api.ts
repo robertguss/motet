@@ -290,6 +290,52 @@ export interface DreamingDigest {
   'rolled_back?': boolean;
 }
 
+export interface ModbVerifySummary {
+  'ok?': boolean;
+  txid: number;
+  page_count: number;
+  bucket_count: number;
+  schema_version: number;
+  audit_entries: number;
+  last_audit_hash: string;
+  invariants_checked: number;
+  call_count: number;
+  'secrets_ok?': boolean;
+}
+
+export interface ModbAuditEntry {
+  seq: number;
+  txid: number;
+  schema_version: number;
+  principal: string;
+  action: string;
+  reason: string;
+  at: string;
+  summary: string;
+  prev_hash: string;
+  entry_hash: string;
+}
+
+export interface ModbGrant {
+  id: string;
+  parent_id?: string | null;
+  principal: string;
+  allowed_actions: string[];
+  max_calls: number;
+  used_calls: number;
+  expires_at: string;
+  revoked: boolean;
+}
+
+export interface ModbClaim {
+  resource: string;
+  holder: string;
+  grant_id: string;
+  reason: string;
+  acquired_at: string;
+  expires_at: string;
+}
+
 export function getStoredToken(): string {
   return localStorage.getItem('motet_token') || '';
 }
