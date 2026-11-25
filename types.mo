@@ -53,6 +53,11 @@ TelegramConfig(..),
 TelegramTestResult(..),
 PushSubscription(..),
 AnalyticsSummary(..),
+VaultFileReadResponse(..),
+VaultFileWriteRequest(..),
+VaultSearchResponse(..),
+PublishGdocRequest(..),
+PublishGdocResponse(..),
 provider_to_text,
 provider_from_text,
 effect_to_text,
@@ -508,6 +513,33 @@ struct AnalyticsSummary
   pending_approvals: Int
   active_bots: Int
   by_bot: List(BudgetSnapshot)
+end
+
+struct VaultFileReadResponse
+  path: Text
+  content: Text
+end
+
+struct VaultFileWriteRequest
+  path: Text
+  content: Text
+  commit_message: Option(Text)
+end
+
+struct VaultSearchResponse
+  query: Text
+  results: Text
+end
+
+struct PublishGdocRequest
+  account: Text
+  title: Text
+  content: Text
+end
+
+struct PublishGdocResponse
+  account: Text
+  url: Text
 end
 
 fn provider_to_text(p: ProviderKind) : Text

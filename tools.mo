@@ -6,6 +6,7 @@
 module Tools
 expose ToolRuntime(..), core_tool_defs, classify_tool_effect, extract_connector_name, execute_tool
 use Command
+use Connectors
 use Json
 use Llm{ToolDef}
 use Mcp
@@ -13,6 +14,7 @@ use Policy
 use Skills
 use Store
 use Types{BotConfig, ConnectorSpec, EffectClass, MotetError, ProviderKind}
+use VaultFs
 use Web
 
 struct ToolRuntime
@@ -122,6 +124,31 @@ fn core_tool_defs() : List(ToolDef)
         {
           "path": str_prop("Relative path inside workspace"),
           "content": str_prop("Full UTF-8 file content")
+        },
+        ["path", "content"]
+      )
+    ),
+    ToolDef(
+      name: "vault_search",
+      description: "Search the Git-backed personal Markdown vault (uses tobi/qmd hybrid search when running, with local Markdown fallback).",
+      schema: obj_schema({"query": str_prop("Search keywords or question")}, ["query"])
+    ),
+    ToolDef(
+      name: "vault_read",
+      description: "Read a Markdown file from the Git-backed personal vault (e.g. 'notes/ideas.md', 'daily/2026-11-25.md', 'pages/brief.md').",
+      schema: obj_schema(
+        {"path": str_prop("Relative Markdown path inside the personal vault")},
+        ["path"]
+      )
+    ),
+    ToolDef(
+      name: "vault_write",
+      description: "Write or update a Markdown note/page in the Git-backed personal vault (auto-commits to Git and refreshes qmd).",
+      schema: obj_schema(
+        {
+          "path": str_prop("Relative Markdown path (e.g. 'notes/trip.md', 'daily/2026-11-25.md')"),
+          "content": str_prop("Full Markdown content"),
+          "commit_message": str_prop("Optional short Git commit message")
         },
         ["path", "content"]
       )
@@ -264,6 +291,8 @@ fn classify_tool_effect(tool_name: Text, arguments_json: Text, connectors: List(
     tool_name == "skill_read" or
     tool_name == "file_read" or
     tool_name == "file_list" or
+    tool_name == "vault_read" or
+    tool_name == "vault_search" or
     tool_name == "connector_tools" or
     tool_name == "web_search" or
     tool_name == "web_fetch" or
@@ -282,7 +311,8 @@ fn classify_tool_effect(tool_name: Text, arguments_json: Text, connectors: List(
     tool_name == "skill_propose" or
     tool_name == "artifact_save" or
     tool_name == "schedule_checkin" or
-    tool_name == "file_write"
+    tool_name == "file_write" or
+    tool_name == "vault_write"
     return (WriteLocal, tool_name)
   end
 
@@ -467,6 +497,38 @@ fn execute_tool(
     end
   end
 
+  if tool_name == "vault_search"
+    q = args.text_at("query") or ""
+    settings = try Store.get_settings(db)
+    qmd_url = case try Store.get_connector(db, "qmd")
+      Some(sp) if sp.enabled?: Some(Mcp.resolve_connector_url(sp, rt.env))
+      Some(_) | None: None
+    end
+    return Ok(VaultFs.search_vault(rt.files.read_only, rt.network, settings.vault_path, q, qmd_url))
+  end
+
+  if tool_name == "vault_read"
+    path = args.text_at("path") or ""
+    settings = try Store.get_settings(db)
+    return case VaultFs.read_file(rt.files.read_only, settings.vault_path, path)
+      Ok(txt): Ok(txt)
+      Error(err): Ok("vault_error: #{err}")
+    end
+  end
+
+  if tool_name == "vault_write"
+    path = args.text_at("path") or ""
+    content = args.text_at("content") or ""
+    cmsg = args.text_at("commit_message") or "bot:#{bot.name} update #{path}"
+    settings = try Store.get_settings(db)
+    return case VaultFs.write_file(rt.files, rt.command, settings.vault_path, path, content, cmsg)
+      Ok(entry): Ok(
+        "saved personal vault file #{entry.path} (#{entry.size_bytes} bytes, git committed)"
+      )
+      Error(err): Ok("vault_error: #{err}")
+    end
+  end
+
   if tool_name == "cmd_run"
     prog = args.text_at("program") or ""
     cmd_args = (args.list_at("args") or []).filter_map(fn(v)
@@ -491,6 +553,10 @@ fn execute_tool(
       Some(spec):
         if not spec.enabled?
           Ok("connector_error: connector '#{cname}' is disabled")
+        else if Connectors.is_builtin_connector?(spec)
+          tools = Connectors.builtin_connector_tools(spec)
+          lines = tools.map(fn(t) "#{t.name} [#{t.effect_class}]: #{t.description}" end)
+          Ok(if lines.empty?: "no tools exposed" else: lines.join("\n"))
         else
           stored_tok = try resolve_stored_connector_token(db, rt.env, spec)
           case Mcp.list_tools(rt.network, rt.env, spec, stored_tok)
@@ -523,9 +589,17 @@ fn execute_tool(
         else
           rargs = (args.get("arguments") or Json.Object({})).to_text
           stored_tok = try resolve_stored_connector_token(db, rt.env, spec)
-          case Mcp.call_tool(rt.network, rt.env, spec, stored_tok, rtool, rargs)
-            Ok(out): Ok(out)
-            Error(err): Ok("connector_error: #{err}")
+          resolved_tok = Mcp.resolve_connector_token(spec, rt.env, stored_tok)
+          if Connectors.is_builtin_connector?(spec)
+            case Connectors.dispatch_builtin_tool(rt.network, spec, resolved_tok, rtool, rargs)
+              Ok(out): Ok(out)
+              Error(err): Ok("connector_error: #{err}")
+            end
+          else
+            case Mcp.call_tool(rt.network, rt.env, spec, stored_tok, rtool, rargs)
+              Ok(out): Ok(out)
+              Error(err): Ok("connector_error: #{err}")
+            end
           end
         end
     end

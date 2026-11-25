@@ -10,6 +10,7 @@ use Api
 use Brain
 use Budget{BudgetActor}
 use Command
+use Connectors
 use Json
 use Mcp{parse_host_port, resolve_connector_url}
 use Oauth
@@ -44,6 +45,8 @@ use Types{
   MotetError,
   PolicyRule,
   ProviderKind,
+  PublishGdocRequest,
+  PublishGdocResponse,
   PushSubscription,
   ResolveApprovalRequest,
   RoutineSpec,
@@ -63,11 +66,15 @@ use Types{
   ToggleRequest,
   TrustLevel,
   TurnReply,
+  VaultFileReadResponse,
+  VaultFileWriteRequest,
+  VaultSearchResponse,
   VaultSecretMeta,
   WebhookConfig,
   WebhookReceipt
 }
 use Vault
+use VaultFs{VaultFileEntry, VaultGitStatus}
 use WebUi
 
 struct Operator
@@ -130,6 +137,11 @@ api
   get "/v1/vault/secrets" get_vault_secrets
   post "/v1/vault/secrets" post_vault_secret
   delete "/v1/vault/secrets/:name" delete_vault_secret_by_name
+  get "/v1/vault/files" get_vault_files
+  get "/v1/vault/file" get_vault_file
+  post "/v1/vault/file" post_vault_file
+  get "/v1/vault/git/status" get_vault_git_status
+  get "/v1/vault/search" get_vault_search
 
   get "/v1/memory" get_memory
   post "/v1/memory" post_memory
@@ -148,6 +160,7 @@ api
   get "/v1/connectors" get_connectors
   get "/v1/connectors/auth" get_connectors_auth
   post "/v1/connectors" post_connector
+  post "/v1/connectors/gdocs/publish" post_gdocs_publish
   post "/v1/connectors/:name/toggle" post_toggle_connector
   post "/v1/connectors/:name/oauth/start" post_connector_oauth_start
   post "/v1/connectors/:name/test" post_test_connector
@@ -774,6 +787,78 @@ fn delete_vault_secret_by_name(_op: Operator, db: Sqlite.Database, clock: Clock,
   Ok(DeleteResult(deleted?: true))
 end
 
+## Lists Markdown files inside the Git-backed personal vault.
+fn get_vault_files(_op: Operator, db: Sqlite.Database, files: ReadFiles, clock: Clock) : Result(
+  List(VaultFileEntry),
+  MotetError
+)
+  try ensure_ready(db, clock)
+  settings = try Store.get_settings(db)
+  Ok(VaultFs.list_files(files, settings.vault_path))
+end
+
+## Reads a single Markdown note from the Git-backed personal vault.
+fn get_vault_file(_op: Operator, db: Sqlite.Database, files: ReadFiles, clock: Clock, path: Text) : Result(
+  VaultFileReadResponse,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  settings = try Store.get_settings(db)
+  content = try VaultFs.read_file(files, settings.vault_path, path)
+  Ok(VaultFileReadResponse(path: path.trim, content: content))
+end
+
+## Writes a Markdown note to the Git-backed personal vault and auto-commits + triggers qmd update.
+fn post_vault_file(
+  _op: Operator,
+  db: Sqlite.Database,
+  files: Files,
+  command: Command,
+  clock: Clock,
+  body: VaultFileWriteRequest
+) : Result(VaultFileEntry, MotetError)
+  try ensure_ready(db, clock)
+  settings = try Store.get_settings(db)
+  VaultFs.write_file(
+    files,
+    command,
+    settings.vault_path,
+    body.path,
+    body.content,
+    body.commit_message or ""
+  )
+end
+
+## Reports Git branch, dirty count, last commit, and configured remote for the personal vault.
+fn get_vault_git_status(_op: Operator, db: Sqlite.Database, command: Command, clock: Clock) : Result(
+  VaultGitStatus,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  settings = try Store.get_settings(db)
+  Ok(VaultFs.git_status(command, settings.vault_path, settings.vault_git_remote))
+end
+
+## Searches the personal vault via `tobi/qmd` sidecar (with local zero-dep Markdown fallback).
+fn get_vault_search(
+  _op: Operator,
+  db: Sqlite.Database,
+  files: ReadFiles,
+  network: Network,
+  env: Env,
+  clock: Clock,
+  q: Text
+) : Result(VaultSearchResponse, MotetError)
+  try ensure_ready(db, clock)
+  settings = try Store.get_settings(db)
+  qmd_url = case try Store.get_connector(db, "qmd")
+    Some(sp) if sp.enabled?: Some(resolve_connector_url(sp, env))
+    Some(_) | None: None
+  end
+  res = VaultFs.search_vault(files, network, settings.vault_path, q, qmd_url)
+  Ok(VaultSearchResponse(query: q, results: res))
+end
+
 ## Lists or keyword-searches persistent shared and bot-scoped memory.
 fn get_memory(
   _op: Operator,
@@ -1218,7 +1303,34 @@ fn delete_connector_auth(_op: Operator, db: Sqlite.Database, clock: Clock, name:
   Ok(DeleteResult(deleted?: true))
 end
 
-## Live connectivity check: initializes MCP session and lists tools exposed by a connector.
+## Publishes any Motet Page or report directly into a shareable Google Doc (work or personal account).
+fn post_gdocs_publish(
+  _op: Operator,
+  db: Sqlite.Database,
+  network: Network,
+  env: Env,
+  clock: Clock,
+  body: PublishGdocRequest
+) : Result(PublishGdocResponse, MotetError)
+  try ensure_ready(db, clock)
+  acct = if body.account.trim.ascii_lowercase == "work": "gdocs-work" else: "gdocs-personal"
+  spec = try (try Store.get_connector(db, acct)).or_fail(
+    ItemNotFound(message: "unknown Google Docs connector: #{acct}")
+  )
+  stored_tok = if not spec.auth_env.trim.empty?
+    case try Store.get_vault_secret(db, env, spec.auth_env.trim)
+      Some(v): Some(v)
+      None: try Store.get_connector_token_opened(db, env, spec.name)
+    end
+  else
+    try Store.get_connector_token_opened(db, env, spec.name)
+  end
+  token = try Mcp.resolve_connector_token(spec, env, stored_tok).or_fail(Unauthorized)
+  url = try Connectors.gdocs_publish_page(network, token, body.title, body.content)
+  Ok(PublishGdocResponse(account: acct, url: url))
+end
+
+## Live connectivity check: lists tools for built-in connectors or initializes remote MCP session.
 fn post_test_connector(
   _op: Operator,
   db: Sqlite.Database,
@@ -1231,6 +1343,18 @@ fn post_test_connector(
   spec = try (try Store.get_connector(db, name)).or_fail(
     ItemNotFound(message: "unknown connector: #{name}")
   )
+  if Connectors.is_builtin_connector?(spec)
+    tools = Connectors.builtin_connector_tools(spec)
+    return Ok(
+      ConnectorTestResult(
+        connector_name: spec.name,
+        ok?: true,
+        tool_count: tools.size,
+        tools: tools.map(fn(t) t.name end),
+        error: None
+      )
+    )
+  end
   stored_tok = if not spec.auth_env.trim.empty?
     case try Store.get_vault_secret(db, env, spec.auth_env.trim)
       Some(v): Some(v)
@@ -1847,4 +1971,59 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sched
   )
   assert bad_cb.status == 400 and bad_cb.text.contains?("Expired or Unknown Sign-In")
+
+  # 8. Phase 3: Git-backed Personal Vault API + Built-in everyday connector tool discovery
+  vfiles = Files.in_memory({})
+  vcmd = Command.fake({})
+  v_save = ApiTest.send(
+    Server,
+    Api.post("/v1/vault/file").with_bearer("secret-op").with_json(
+      VaultFileWriteRequest(
+        path: "notes/trip.md",
+        content: "# Kyoto\nBook rail pass.\n",
+        commit_message: Some("Add Kyoto note")
+      )
+    ),
+    sqlite,
+    vfiles,
+    vcmd,
+    env,
+    clock,
+    srng,
+    budget,
+    policy,
+    sched
+  )
+  assert v_save.status == 200 and v_save.text.contains?("notes/trip.md")
+
+  v_search = ApiTest.send(
+    Server,
+    Api.get("/v1/vault/search").with_bearer("secret-op").with_query("q", "kyoto rail"),
+    sqlite,
+    vfiles,
+    Network.fake({}),
+    env,
+    clock,
+    srng,
+    budget,
+    policy,
+    sched
+  )
+  assert v_search.status == 200 and v_search.text.contains?("notes/trip.md")
+
+  ha_test = ApiTest.send(
+    Server,
+    Api.post("/v1/connectors/hearth-arvo/test").with_bearer("secret-op"),
+    sqlite,
+    Network.fake({}),
+    env,
+    clock,
+    srng,
+    budget,
+    policy,
+    sched
+  )
+  assert ha_test.status == 200 and
+    ha_test.text.contains?("hearth_get_snapshot") and
+    ha_test.text.contains?("hearth_undo_event")
 end

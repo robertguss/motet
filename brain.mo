@@ -1141,7 +1141,7 @@ test "Brain pauses WriteExternal, supports edited approval + Always-Allow rule +
       "params": Json.Object({
         "protocolVersion": Json.String("2025-06-18"),
         "capabilities": Json.Object({}),
-        "clientInfo": Json.Object({"name": Json.String("motet"), "version": Json.String("0.1.0")})
+        "clientInfo": Json.Object({"name": Json.String("motet"), "version": Json.String("0.2.0")})
       })
     })
   ).within(30.seconds)

@@ -686,12 +686,120 @@ fn seed_defaults(db: Sqlite.Database, now_text: Text) : Result(Unit, MotetError)
       db,
       ConnectorSpec(
         name: "qmd",
-        kind: "mcp_http",
+        kind: "mcp_stateless",
         url: "http://127.0.0.1:8181/mcp",
         auth_env: "",
         allowed_host: "127.0.0.1:8181",
         default_effect: Read,
         enabled?: true
+      )
+    )
+    _c_gw = try upsert_connector(
+      db,
+      ConnectorSpec(
+        name: "gmail-work",
+        kind: "google_gmail",
+        url: "https://gmail.googleapis.com/gmail/v1",
+        auth_env: "GMAIL_WORK_TOKEN",
+        allowed_host: "gmail.googleapis.com:443",
+        default_effect: WriteExternal,
+        enabled?: false
+      )
+    )
+    _c_cw = try upsert_connector(
+      db,
+      ConnectorSpec(
+        name: "gcal-work",
+        kind: "google_gcal",
+        url: "https://www.googleapis.com/calendar/v3",
+        auth_env: "GCAL_WORK_TOKEN",
+        allowed_host: "www.googleapis.com:443",
+        default_effect: WriteExternal,
+        enabled?: false
+      )
+    )
+    _c_dw = try upsert_connector(
+      db,
+      ConnectorSpec(
+        name: "gdocs-work",
+        kind: "google_gdocs",
+        url: "https://docs.googleapis.com/v1",
+        auth_env: "GDOCS_WORK_TOKEN",
+        allowed_host: "docs.googleapis.com:443",
+        default_effect: WriteExternal,
+        enabled?: false
+      )
+    )
+    _c_notion = try upsert_connector(
+      db,
+      ConnectorSpec(
+        name: "notion",
+        kind: "mcp_http",
+        url: "https://mcp.notion.com/mcp",
+        auth_env: "NOTION_TOKEN",
+        allowed_host: "mcp.notion.com:443",
+        default_effect: WriteExternal,
+        enabled?: false
+      )
+    )
+    _c_gp = try upsert_connector(
+      db,
+      ConnectorSpec(
+        name: "gmail-personal",
+        kind: "google_gmail",
+        url: "https://gmail.googleapis.com/gmail/v1",
+        auth_env: "GMAIL_PERSONAL_TOKEN",
+        allowed_host: "gmail.googleapis.com:443",
+        default_effect: WriteExternal,
+        enabled?: false
+      )
+    )
+    _c_cp = try upsert_connector(
+      db,
+      ConnectorSpec(
+        name: "gcal-personal",
+        kind: "google_gcal",
+        url: "https://www.googleapis.com/calendar/v3",
+        auth_env: "GCAL_PERSONAL_TOKEN",
+        allowed_host: "www.googleapis.com:443",
+        default_effect: WriteExternal,
+        enabled?: false
+      )
+    )
+    _c_dp = try upsert_connector(
+      db,
+      ConnectorSpec(
+        name: "gdocs-personal",
+        kind: "google_gdocs",
+        url: "https://docs.googleapis.com/v1",
+        auth_env: "GDOCS_PERSONAL_TOKEN",
+        allowed_host: "docs.googleapis.com:443",
+        default_effect: WriteExternal,
+        enabled?: false
+      )
+    )
+    _c_td = try upsert_connector(
+      db,
+      ConnectorSpec(
+        name: "todoist",
+        kind: "todoist",
+        url: "https://api.todoist.com/rest/v2",
+        auth_env: "TODOIST_API_TOKEN",
+        allowed_host: "api.todoist.com:443",
+        default_effect: WriteExternal,
+        enabled?: false
+      )
+    )
+    _c_ha = try upsert_connector(
+      db,
+      ConnectorSpec(
+        name: "hearth-arvo",
+        kind: "hearth_arvo",
+        url: "https://hearth.exe.xyz/api/v1/agent",
+        auth_env: "HEARTH_API_TOKEN",
+        allowed_host: "hearth.exe.xyz:443",
+        default_effect: WriteExternal,
+        enabled?: false
       )
     )
     _c_t3 = try upsert_connector(
@@ -710,13 +818,46 @@ fn seed_defaults(db: Sqlite.Database, now_text: Text) : Result(Unit, MotetError)
 
   routines = try list_routines(db)
   if routines.empty?
-    _r = try upsert_routine(
+    _r1 = try upsert_routine_full(
       db,
       "chief",
-      "daily-morning-brief",
-      "Coordinate read-only summaries from work, personal, and finance for today's calendar, urgent emails, due Todoist items, and Hearth Safe-to-Spend + upcoming bills. Deliver one crisp morning brief.",
+      "morning-brief",
+      "Coordinate read-only summaries from work, personal, and finance for today's calendar, urgent emails, due Todoist items, and Hearth Arvo Safe-to-Spend + upcoming bills. Deliver one crisp morning brief.",
       86400,
+      "weekdays",
+      "07:30",
+      "America/Los_Angeles",
       true,
+      true,
+      "",
+      now_text
+    )
+    _r2 = try upsert_routine_full(
+      db,
+      "chief",
+      "evening-wrap",
+      "Summarize today's completed items, pending Needs-You drafts, tomorrow's first meeting, and any overdue Todoist tasks in 5 concise bullets.",
+      86400,
+      "weekdays",
+      "18:00",
+      "America/Los_Angeles",
+      true,
+      true,
+      "",
+      now_text
+    )
+    _r3 = try upsert_routine_full(
+      db,
+      "finance",
+      "receipt-renewal-sweep",
+      "Check recent Mercury transactions in Hearth Arvo and read-only personal Gmail receipts for upcoming subscription renewals or unusual charges. Queue any proposed envelope moves for approval; stay quiet if nothing changed.",
+      86400,
+      "daily",
+      "21:30",
+      "America/Los_Angeles",
+      true,
+      true,
+      "unread_events",
       now_text
     )
   end
