@@ -17,7 +17,7 @@ if [ -d "$REPO_DIR/frontend" ]; then
 fi
 
 echo "Syncing $REPO_DIR -> $HOST:~/motet ..."
-tar -C "$REPO_DIR" --exclude='.motet/*.sqlite*' --exclude='*.sqlite*' --exclude='*.bc' --exclude='frontend/node_modules' -cf - . | \
+tar -C "$REPO_DIR" --exclude='.git' --exclude='.motet/*.sqlite*' --exclude='*.sqlite*' --exclude='*.bc' --exclude='frontend/node_modules' -cf - . | \
   ssh "${SSH_OPTS[@]}" "$HOST" 'mkdir -p ~/motet ~/.local/share/motet/skills ~/.local/share/motet/public && tar -C ~/motet -xf -'
 
 ssh "${SSH_OPTS[@]}" "$HOST" 'bash -s' <<'REMOTE'
