@@ -1,29 +1,39 @@
-# Motet Architecture (`DESIGN.md`)
+# Motet v1 Architecture (`DESIGN.md`)
 
-Motet is built around late-2026 lessons from **Anthropic Managed Agents**, **xAI Grok Bot 1.0**, **Cognition Devin Bots**, **Nous Hermes Agent**, **OpenAI Dots**, and **Claude Duet**, adapted natively to Mo's capability and BEAM-actor runtime.
+Motet is a lean, always-on personal and executive AI agent roster written natively in pure **Mo 0.3.0** + pure-Mo **MoDB** for deployment on `exe.dev`, designed as a daily-driver replacement for Hermes Agent and Grok Bot without monolithic bloat.
 
-## 1. Decoupled Brain, Durable Session Log, and Pluggable Hands
+## 1. Six-Layer Architecture
 
 | Layer | Module(s) | Responsibility |
 | --- | --- | --- |
-| **Domain Contract** | `types.mo` | Pure `Json`-derivable records and enums shared across CLI, REST API, OpenAPI 3.1, and MCP. |
-| **BEAM Actors** | `budget.mo`, `policy.mo`, `scheduler.mo` | Pure, crash-recoverable state machines with machine-checked `promise` invariants: exact 128-bit `Decimal` USD spend caps, deterministic policy evaluation, and routine tick tracking. |
-| **Durable Session Log & Store** | `store.mo` | Pure-Mo Copy-on-Write B+Tree **MoDB** (`motet.modb` + physically isolated bare Layer 1/2 `motet-secrets.modb` for OAuth tokens/PKCE verifiers) storing bots, append-only session events + atomic inverted Unicode FTS index, tiered memory (`shared` + per-bot), routines, **Needs You** approvals, MCP connectors, policy rules, artifacts, and spend ledger — backed by a SHA-256 hash-chained audit ledger, commit-time invariants, attenuated Grants (`bot_delegate`), Claims leases (`run_due_routines`), Views/Onboarding, selective-undo Replay, and portable SHA-256 Export. |
-| **Progressive Skills** | `skills.mo` | `agentskills.io`-compatible `SKILL.md` index (Level 1 in Stable prompt) and on-demand loader (Level 2 via `skill_read`) with `user` vs `bot_proposed` provenance. |
-| **Dual LLM Client** | `llm.mo` | OpenAI-compatible Chat Completions + Anthropic Messages API (with explicit `cache_control` breakpoints on Stable & Context tiers) + host-pinned `Network` + `Clock.sleep` 429/529 backoff. |
-| **Pluggable Hands** | `tools.mo`, `mcp.mo` | (1) Confined Local Workspace Hand (`Files.within`, `.modb*` path exclusion, `Command.allow_programs` under Landlock/seccomp, zero sockets/env secrets); (2) Unified Streamable-HTTP MCP Connector Hand with **T3 Code** as Connector #1 and zero-code expansion to Slack, Notion, Linear, GitHub, Gmail. |
-| **Stateless Brain** | `brain.mo` | 3-tier cache-stable prompt assembly (`Stable → Context → Volatile`), multi-step tool loop, approval pausing + resume execution, attenuated delegation Grants, and lease-coordinated standing routine runner. |
-| **Surfaces** | `server.mo`, `web-ui.mo`, `main.mo` | API-first `mo serve` server (`/v1/*` + `/v1/modb/*` OpenAPI + SSE + responsive PWA Web UI + `/mcp` + `/webhooks/:source`) and installable `motet` CLI + `watch` loop sharing `motet.modb` via BSD `flock` + optimistic CoW snapshot reads. |
+| **Domain Contract** | `types.mo` | Pure `Json`-derivable records and enums shared across CLI, `/v1/*` REST, OpenAPI 3.1, and MCP. |
+| **Vault & Security Actors** | `vault.mo`, `policy.mo`, `budget.mo`, `oauth.mo` | Write-only AES-256-GCM Encrypted Vault (`Crypto.seal`/`Crypto.open`), HMAC-SHA256 webhook verification, strict per-bot specialist connector walls + read-only connector locks, 3-denial circuit breaker, machine-checked `PolicyActor` & `BudgetActor` invariants, and exact 128-bit `Decimal` USD + cache-hit accounting. |
+| **Pure-Mo MoDB Store & Physical Secrets Isolation** | `store.mo` | Crash-safe CoW B+Tree **MoDB** (`motet.modb` + physically isolated bare Layer 1/2 `motet-secrets.modb`). Stores specialist bots, canonical forever-chats, append-only session events + batched Unicode FTS inverted indexes (`event_tokens`, `memory_tokens`), async `bot_runs` + live steering queue, tiered memory + Dreaming snapshots, Standing Intents, IANA routines + occurrence ledger, editable **Needs You** approvals, webhook routes, artifacts, and spend/cache ledger — backed by a SHA-256 hash-chained audit ledger, commit-time `Ledger.schema` invariants, attenuated `Grants` (`bot_delegate`), `Claims` leases (`run_due_routines`), `Views` + `OnboardingManifest`, lossless `Replay`, and canonical SHA-256 `Export`. |
+| **Stateless Brain, Memory 2.0 & Intents** | `brain.mo`, `compaction.mo`, `memory.mo`, `intents.mo`, `llm.mo`, `skills.mo` | Cache-invariant 3-tier prompt assembly (`Stable → Context → Volatile`), native **Anthropic** (explicit `cache_control` + parallel `tool_result` merging) and native **Google Gemini** (`generateContent` + `x-goog-api-key`) wire adapters, Pre-Compaction Memory Flush + Warm-Request Compaction, host-stamped provenance taint gate + recall-loop suppression + Overnight Dreaming (`Light → REM → Deep` with 1-click Rollback), zero-LLM FTS Standing Intents, Skill Curator (`<= 60` char index + usage tracking), Weekly Self-Audit Anti-Job, editable approval execution + **auto-resume**, and live mid-run steering. |
+| **Pluggable Hands, Vault & Connectors** | `tools.mo`, `mcp.mo`, `connectors.mo`, `vault-fs.mo`, `web.mo` | Confined local workspace hand (`Files.within`, `.modb*`/`.sqlite*` path exclusion, `Command.allow_programs` under Landlock/seccomp), Git-backed Obsidian-compatible Personal Markdown Vault (`vault-fs.mo`) + sessionless Streamable HTTP / 2026-07-28 MCP & `POST /query` for `tobi/qmd`, plus built-in host-pinned everyday connectors (`gmail-work`/`personal`, `gcal-work`/`personal`, `gdocs-work`/`personal` with 1-click Page publish, Notion MCP, Todoist, and Hearth Arvo with Mercury sync & Undo). |
+| **Surfaces & Jobs** | `server.mo`, `frontend/`, `telegram.mo`, `web-ui.mo`, `main.mo`, `scheduler.mo` | API-first `mo serve` server (`--workers 16`, advisory `flock` + optimistic CoW snapshot reads), OpenAPI 3.1 (`/openapi.json`, `/docs`), React 19 + Vite + Tailwind CSS v4 Dashboard & PWA (`frontend/` → `public/` + MoDB Integrity & Audit panel + Web Push), lean Telegram channel (`telegram.mo`, text + inline Approve/Deny + `/<bot>` routing), IANA wall-clock scheduler (`scheduler.mo`), `/v1/modb/*`, `/mcp` (`motet_verify`, `motet_audit`), and HMAC-verified `/webhooks/:source`. |
 
-## 2. Host-Enforced Security Boundaries
+## 2. Strict Specialist Walls & Custom Bots
 
-1. **Credential & Secret Isolation (Vault Pattern):** API keys live in outer `Env` (`Network.allow_hosts`), while OAuth PKCE verifiers and Bearer access tokens live in physically separate bare-Layer-1/2 `motet-secrets.modb` — excluded from MoDB audit logs, replay logs, views, and portable exports, and blocked from bot file tools (`tools.mo`). Local `Command` children run with scrubbed environments and seccomp-blocked sockets — prompt-injected code cannot read or exfiltrate tokens.
-2. **Deterministic Effect Classes & Trust Levels:**
-   - Every tool (local or remote MCP) is classified into `Read`, `WriteLocal`, `WriteExternal`, or `Irreversible` before execution.
-   - Every trigger carries `Owner`, `Routine`, or `External` trust.
-   - Machine-checked `promise` invariants in `policy.mo` guarantee `External` triggers (webhooks/emails) never auto-allow `WriteExternal` or `Irreversible` actions, and unattended `Routine` runs never auto-allow `Irreversible` actions.
-3. **Needs You Inbox:** Any `AskFirst` action pauses durably in `motet.modb` until explicitly approved via CLI (`motet approve <id>`), HTTP API (`POST /v1/inbox/:id/approve`), or the Web UI/future Mac & iOS apps.
+Out of the box, Motet seeds a walled everyday roster while preserving dormant engineering presets (`builder`, `watcher`) for later:
 
-## 3. Path to Native Mac & iOS Apps
+- **`chief`** *(Primary, Chief of Staff)* — Unifies morning briefs and triage via read-only specialist delegation (`bot_delegate`, backed by attenuated MoDB `Grants`); routes external writes through each walled specialist.
+- **`work`** *(Work Executive)* — Walled strictly to `gmail-work`, `gcal-work`, `notion`, and `gdocs-work`.
+- **`personal`** *(Personal Life & Vault)* — Walled strictly to `gmail-personal`, `gcal-personal`, `todoist`, Git-backed Markdown via `qmd`, and `gdocs-personal`.
+- **`finance`** *(Household Finance)* — Walled strictly to `hearth-arvo` (Mercury sync + Undo), `gmail-personal` *(read-only lock)*, and `qmd`.
+- **`researcher`** *(Deep Research & Writing)* — Walled to web search/fetch, `qmd`, and shareable Google Docs.
+- **Unlimited Custom Bots** — Create, clone, toggle, or archive dedicated specialist bots via `POST /v1/bots`, `POST /v1/bots/:name/clone`, or the Dashboard Bot Builder.
 
-`server.mo` exposes a typed, Bearer-authenticated `/v1/*` REST + SSE contract with auto-generated OpenAPI 3.1 at `/openapi.json`. The bundled responsive Web UI (`GET /`) is strictly a thin client over `/v1/*` — so a future SwiftUI macOS/iOS app or Electron client plugs into the exact same server with zero backend changes.
+## 3. Host-Enforced Security Boundaries
+
+1. **Physical Secret Isolation (`motet-secrets.modb` + `vault.mo`):** AES-256-GCM Vault ciphertexts, OAuth PKCE verifiers, and Bearer access tokens live exclusively in bare Layer 1/2 `motet-secrets.modb` — physically excluded from MoDB audit ledgers, replay logs, `Views`, and `Export` snapshots, and blocked from bot file tools (`tools.mo`). Secrets are never returned by HTTP APIs or injected into LLM prompts — only resolved at outbound host-pinned `Network.allow_hosts` calls.
+2. **Strict Specialist Walls (`policy.mo` & `Modb.Grants`):** Machine-checked `promise` invariants guarantee a bot can never call an unmounted connector and can never invoke non-`Read` tools on any connector in `read_only_connectors`. `bot_delegate` mints attenuated child grants with no amplification.
+3. **Commit-Time Ledger & Claims Leases (`store.mo`):** Every state mutation in `motet.modb` is committed against `Ledger.schema` invariants (`bots_valid`, `routines_valid`, `budget_ledger_non_negative`, `memories_non_empty`), appended to a SHA-256 hash-chained audit ledger, and coordinated across concurrent workers with time-bounded `Claims` leases and advisory `flock`.
+4. **Trust & Effect Matrix:** `External` triggers (webhooks/emails) never auto-allow `WriteExternal` or `Irreversible` actions; unattended `Routine` runs never auto-allow `Irreversible` actions; 3 owner denials for a tool in one session trip the circuit breaker.
+5. **Editable Needs-You Approvals + Auto-Resume:** Any paused `AskFirst` action can be edited inline before execution, optionally saved as a narrow per-bot Allow rule, and automatically resumes the bot's turn with the execution outcome (or owner denial feedback).
+
+## 4. Phased Build & Storage Milestones
+
+- **Phase 1–4 Capabilities (Implemented):** AES-256-GCM Vault, OAuth CSPRNG + native SHA-256, Anthropic + Gemini wire adapters, editable approvals + auto-resume, canonical forever-chats, Warm-Request Compaction, React 19 + Tailwind CSS v4 Dashboard SPA & PWA (`frontend/` → `public/`) + Web Push, lean Telegram channel, IANA wall-clock scheduler, Git-backed personal Markdown vault + `qmd` + multi-account Google Workspace / Notion / Todoist / Hearth Arvo connectors, Memory Core 2.0 provenance taint gate + Overnight Dreaming + 1-click Rollback, FTS Standing Intents, Skill Curator, and Weekly Self-Audit Anti-Job.
+- **Pure-Mo MoDB Storage Upgrade (Implemented):** Replaced SQLite across all runtime modules (`store.mo`, `server.mo`, `main.mo`, `brain.mo`, `tools.mo`, `memory.mo`, `intents.mo`, `vault.mo`, `compaction.mo`, `telegram.mo`) with `motet.modb` + isolated `motet-secrets.modb`, added `/v1/modb/*`, `motet verify/audit/export/grants/claims`, `motet_verify`/`motet_audit` MCP tools, the Dashboard MoDB Integrity & Audit panel, and one-time `migrate-sqlite.mo`.
+- **Phase 5 (Future Optional Sidecars):** Docs/Sandbox & Playwright Browser local HTTP MCP sidecars.

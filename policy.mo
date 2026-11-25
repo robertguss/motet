@@ -1,8 +1,14 @@
-## Deterministic policy engine and "Needs You" approval-queue actor.
-## Host-enforced rules — never trusting the working LLM to police itself.
+## Deterministic policy engine, strict specialist connector walls, denial circuit breaker,
+## and "Needs You" approval-queue actor. Host-enforced — never trusting the LLM to police itself.
 module Policy
-expose PolicyActor, PolicyOutcome(..), PolicyStats(..), matches_pattern?, evaluate_action
-use Types{ApprovalDecision, EffectClass, PolicyRule, TrustLevel}
+expose PolicyActor,
+PolicyOutcome(..),
+PolicyStats(..),
+matches_pattern?,
+check_connector_wall,
+denial_breaker_tripped?,
+evaluate_action
+use Types{ApprovalDecision, BotConfig, EffectClass, PolicyRule, ProviderKind, TrustLevel}
 
 struct PolicyOutcome
   decision: ApprovalDecision
@@ -25,13 +31,13 @@ struct PolicyState
   resolved_inbox: Int
 end
 
-## Simple prefix/exact wildcard match (`*`, `t3.*`, or exact tool name).
+## Simple prefix/exact wildcard match (`*`, `gmail-work:*`, or exact tool name).
 fn matches_pattern?(pattern: Text, tool_name: Text) : Bool
   examples
     matches_pattern?("*", "file_write")
-    matches_pattern?("t3code:*", "t3code:t3_thread_launch")
+    matches_pattern?("gmail-work:*", "gmail-work:send_message")
     matches_pattern?("file_write", "file_write")
-    not matches_pattern?("t3code:*", "file_write")
+    not matches_pattern?("gmail-work:*", "gmail-personal:send_message")
   end
 
   p = pattern.trim
@@ -40,6 +46,52 @@ fn matches_pattern?(pattern: Text, tool_name: Text) : Bool
     Some(prefix): tool_name.starts_with?(prefix)
     None: p == tool_name
   end
+end
+
+## Enforces strict per-bot specialist walls BEFORE policy rule evaluation or Needs-You queueing:
+## - A bot can NEVER touch a connector outside its explicit `connectors` allowlist.
+## - A connector listed in `read_only_connectors` can NEVER execute non-Read effects.
+fn check_connector_wall(bot: BotConfig, connector_name: Text, effect: EffectClass) : Option(
+  PolicyOutcome
+)
+  promise "unmounted connectors and read-only wall write attempts are always denied"
+    (not bot.connectors.contains?(connector_name)) implies (
+      result is Some(o) and o.decision == Deny
+    )
+    (bot.read_only_connectors.contains?(connector_name) and effect != Read) implies (
+      result is Some(o) and o.decision == Deny
+    )
+  end
+
+  if not bot.connectors.contains?(connector_name)
+    return Some(
+      PolicyOutcome(
+        decision: Deny,
+        reason: "specialist wall blocked: bot '#{bot.name}' does not mount connector '#{connector_name}'"
+      )
+    )
+  end
+  if bot.read_only_connectors.contains?(connector_name) and effect != Read
+    return Some(
+      PolicyOutcome(
+        decision: Deny,
+        reason: "read-only connector wall: bot '#{bot.name}' only has read-only access to '#{connector_name}'"
+      )
+    )
+  end
+  None
+end
+
+## Circuit breaker (Hermes pattern): stops repeated retries after 3 owner denials in a session.
+fn denial_breaker_tripped?(denials_in_session: Int) : Bool
+  examples
+    not denial_breaker_tripped?(0)
+    not denial_breaker_tripped?(2)
+    denial_breaker_tripped?(3)
+    denial_breaker_tripped?(5)
+  end
+
+  denials_in_session >= 3
 end
 
 ## Evaluates deterministic host policy for one proposed tool action.
@@ -61,15 +113,14 @@ fn evaluate_action(
   end
 
   examples
-    evaluate_action("watcher", External, WriteExternal, "t3code:t3_thread_launch", false, [])
-      .decision ==
+    evaluate_action("work", External, WriteExternal, "gmail-work:send_message", false, []).decision ==
       AskFirst
-    evaluate_action("watcher", Routine, Read, "t3code:t3_thread_list", true, []).decision == Allow
-    evaluate_action("watcher", Routine, WriteLocal, "file_write", true, []).decision == AskFirst
-    evaluate_action("watcher", Routine, Irreversible, "t3code:pull_request_merge", true, [])
-      .decision ==
+    evaluate_action("finance", Routine, Read, "hearth-arvo:get_snapshot", true, []).decision ==
+      Allow
+    evaluate_action("personal", Routine, WriteLocal, "file_write", true, []).decision == AskFirst
+    evaluate_action("finance", Routine, Irreversible, "hearth-arvo:delete_tx", true, []).decision ==
       AskFirst
-    evaluate_action("chief", Owner, Irreversible, "t3code:pull_request_merge", false, []).decision ==
+    evaluate_action("work", Owner, Irreversible, "gmail-work:delete_thread", false, []).decision ==
       AskFirst
   end
 
@@ -100,10 +151,14 @@ fn evaluate_action(
     )
   end
 
-  # Check custom user rules (most specific bot match first, then "*" wildcard bot).
-  matched = rules.find(fn(r)
-    (r.bot_name == bot_name or r.bot_name == "*") and matches_pattern?(r.tool_pattern, tool_name)
-  end)
+  # Check custom user rules: exact bot rules first, then "*" wildcard rules.
+  bot_rule = rules.find(
+    fn(r) r.bot_name == bot_name and matches_pattern?(r.tool_pattern, tool_name) end
+  )
+  matched = case bot_rule
+    Some(r): Some(r)
+    None: rules.find(fn(r) r.bot_name == "*" and matches_pattern?(r.tool_pattern, tool_name) end)
+  end
   case matched
     Some(rule):
       if trust == Routine and routine_read_only? and effect != Read and rule.decision == Allow
@@ -234,10 +289,39 @@ fn stats(s: PolicyState, _now: Time) : PolicyStats
   to_stats(s)
 end
 
-test "PolicyActor tracks decisions and inbox resolutions"
+test "PolicyActor tracks decisions and check_connector_wall isolates Work, Personal, and Finance"
   pol = Actor.start(PolicyActor)
   s1 = pol.record_decision(AskFirst)
   assert s1.asked == 1 and s1.pending_inbox == 1
   s2 = pol.record_resolved
   assert s2.pending_inbox == 0 and s2.resolved_inbox == 1
+
+  finance = BotConfig(
+    name: "finance",
+    role: "Household Finance",
+    persona: "Finance",
+    is_primary?: false,
+    model_tier: "gemini_flash",
+    provider: Gemini,
+    endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
+    api_key_env: "GEMINI_API_KEY",
+    model: "gemini-2.5-flash",
+    workspace: ".",
+    allowed_programs: [],
+    allowed_hosts: ["generativelanguage.googleapis.com:443"],
+    connectors: ["hearth-arvo", "gmail-personal", "qmd"],
+    read_only_connectors: ["gmail-personal"],
+    daily_budget_usd: 3.0,
+    max_steps: 10,
+    active?: true
+  )
+  # Finance cannot touch work connectors
+  assert check_connector_wall(finance, "gmail-work", Read) is Some(d1) and d1.decision == Deny
+  assert check_connector_wall(finance, "notion", Read) is Some(d2) and d2.decision == Deny
+  # Finance can read personal Gmail receipts, but cannot send personal Gmail
+  assert check_connector_wall(finance, "gmail-personal", Read) == None
+  assert check_connector_wall(finance, "gmail-personal", WriteExternal) is Some(d3) and
+    d3.decision == Deny
+  # Finance can propose Hearth Arvo actions (policy will still gate WriteExternal)
+  assert check_connector_wall(finance, "hearth-arvo", WriteExternal) == None
 end

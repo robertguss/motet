@@ -2,11 +2,35 @@
 ## Level 1: compact index in stable system prompt.
 ## Level 2: full SKILL.md body loaded on demand via `skill_read`.
 module Skills
-expose valid_skill_name?, parse_skill_doc, index_skills, read_skill, save_skill
+expose valid_skill_name?, clamp_description, parse_skill_doc, index_skills, read_skill, save_skill
 use Types{MotetError, SkillDoc, SkillSummary}
 
 fn valid_skill_char?(c: Char) : Bool
   c.ascii_letter? or c.ascii_digit? or c == '-' or c == '_'
+end
+
+## Enforces the <= 60-char Skill Curator description budget so the stable prompt stays lean.
+fn clamp_description(desc: Text) : Text
+  promise "skill index descriptions never exceed 60 characters"
+    result.char_count <= 60
+  end
+
+  examples
+    clamp_description("Monitor T3 threads") == "Monitor T3 threads"
+    clamp_description(
+      "A very long skill description that definitely exceeds the sixty character curator limit"
+    ).char_count <=
+      60
+  end
+
+  clean = desc.trim
+  return "Reusable skill" if clean.empty?
+  chars = clean.chars
+  if chars.size <= 60
+    clean
+  else
+    "#{Text.from_chars(chars.take(57))}..."
+  end
 end
 
 ## Rejects empty names, path traversal, and non-slug characters.
@@ -86,9 +110,10 @@ fn index_skills(read_files: ReadFiles) : List(SkillSummary)
             out = out.append(
               SkillSummary(
                 name: doc.name,
-                description: doc.description,
+                description: clamp_description(doc.description),
                 provenance: doc.provenance,
-                path: skill_path
+                path: skill_path,
+                usage_count: 0
               )
             )
           Error(_): Unit
@@ -103,9 +128,10 @@ fn index_skills(read_files: ReadFiles) : List(SkillSummary)
                 out = out.append(
                   SkillSummary(
                     name: doc.name,
-                    description: doc.description,
+                    description: clamp_description(doc.description),
                     provenance: doc.provenance,
-                    path: skill_path
+                    path: skill_path,
+                    usage_count: 0
                   )
                 )
               Error(_): Unit
@@ -140,7 +166,7 @@ fn save_skill(files: Files, name: Text, description: Text, body: Text, provenanc
 )
   return Error(BadInput(message: "invalid skill name: #{name}")) if not valid_skill_name?(name)
   prov = if provenance.trim.empty?: "user" else: provenance.trim
-  desc = if description.trim.empty?: "Reusable skill" else: description.trim
+  desc = clamp_description(description)
   _mk_root = files.make_folder("skills")
   dir = "skills/#{name}"
   _mk_dir = files.make_folder(dir)
@@ -156,7 +182,7 @@ fn save_skill(files: Files, name: Text, description: Text, body: Text, provenanc
     ""
   ].join("\n")
   try files.write_text(path, doc_text).map_error(fn(e) StorageFailed(message: "#{e}") end)
-  Ok(SkillSummary(name: name, description: desc, provenance: prov, path: path))
+  Ok(SkillSummary(name: name, description: desc, provenance: prov, path: path, usage_count: 0))
 end
 
 test "skills index and load SKILL.md with provenance and traversal guards"

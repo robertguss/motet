@@ -1,13 +1,17 @@
-## Core domain types for Motet: bots, sessions, memory, skills, routines,
-## connectors, policy decisions, approvals, artifacts, and errors.
+## Core domain types for Motet v1: bots, strict specialist walls, async runs,
+## write-only vault metadata, sessions, memory, skills, wall-clock routines,
+## connectors, policy decisions, editable approvals, artifacts, channels, push,
+## settings, analytics, webhooks, and errors.
 module Types
 expose ProviderKind(..),
 EffectClass(..),
 TrustLevel(..),
 ApprovalDecision(..),
 ApprovalStatus(..),
+MotetError(..),
 BotConfig(..),
 CreateBotRequest(..),
+CloneBotRequest(..),
 PolicyRule(..),
 CreateRuleRequest(..),
 ConnectorSpec(..),
@@ -19,13 +23,21 @@ SaveSkillRequest(..),
 RoutineSpec(..),
 CreateRoutineRequest(..),
 ApprovalItem(..),
+ResolveApprovalRequest(..),
+ApprovalResolution(..),
 ArtifactItem(..),
 SessionSummary(..),
 SessionEvent(..),
 ToolCallReq(..),
 AskRequest(..),
+EnqueueRunRequest(..),
+SteerRunRequest(..),
+BotRun(..),
 TurnReply(..),
 BudgetSnapshot(..),
+VaultSecretMeta(..),
+SaveSecretRequest(..),
+WebhookConfig(..),
 WebhookReceipt(..),
 TickSummary(..),
 HealthSummary(..),
@@ -36,10 +48,25 @@ ConnectorAuthStatus(..),
 StartOAuthRequest(..),
 StartOAuthResponse(..),
 ConnectorTestResult(..),
+AppSettings(..),
+TelegramConfig(..),
+TelegramTestResult(..),
+PushSubscription(..),
+AnalyticsSummary(..),
+VaultFileReadResponse(..),
+VaultFileWriteRequest(..),
+VaultSearchResponse(..),
+PublishGdocRequest(..),
+PublishGdocResponse(..),
+StandingIntent(..),
+CreateIntentRequest(..),
+EvaluateIntentsRequest(..),
+EvaluateIntentsResponse(..),
+DreamingDigest(..),
+WeeklyAuditReport(..),
 ModbVerifySummary(..),
 ReplaySimulateRequest(..),
 RevokeGrantRequest(..),
-MotetError(..),
 provider_to_text,
 provider_from_text,
 effect_to_text,
@@ -54,6 +81,7 @@ approval_status_from_text
 enum ProviderKind
   OpenAiCompat
   Anthropic
+  Gemini
 end
 
 enum EffectClass
@@ -83,6 +111,17 @@ enum ApprovalStatus
   ExecutionFailed
 end
 
+enum MotetError
+  Unauthorized
+  ItemNotFound(message: Text)
+  BadInput(message: Text)
+  Conflict(message: Text)
+  BudgetExceeded(message: Text)
+  PolicyDenied(message: Text)
+  UpstreamFailed(message: Text)
+  StorageFailed(message: Text)
+end
+
 struct BotConfig
   name: Text
   role: Text
@@ -97,6 +136,7 @@ struct BotConfig
   allowed_programs: List(Text)
   allowed_hosts: List(Text)
   connectors: List(Text)
+  read_only_connectors: List(Text)
   daily_budget_usd: Decimal
   max_steps: Int
   active?: Bool
@@ -116,8 +156,18 @@ struct CreateBotRequest
   allowed_programs: Option(List(Text))
   allowed_hosts: Option(List(Text))
   connectors: Option(List(Text))
+  read_only_connectors: Option(List(Text))
   daily_budget_usd: Option(Decimal)
   max_steps: Option(Int)
+  active: Option(Bool)
+end
+
+struct CloneBotRequest
+  new_name: Text
+  role: Option(Text)
+  persona: Option(Text)
+  connectors: Option(List(Text))
+  read_only_connectors: Option(List(Text))
 end
 
 struct PolicyRule
@@ -151,6 +201,9 @@ struct MemoryEntry
   kind: Text
   content: Text
   provenance: Text
+  origin: Text
+  session_kind: Text
+  staged: Bool
   created_at: Text
 end
 
@@ -166,6 +219,7 @@ struct SkillSummary
   description: Text
   provenance: Text
   path: Text
+  usage_count: Int
 end
 
 struct SkillDoc
@@ -188,18 +242,30 @@ struct RoutineSpec
   name: Text
   prompt: Text
   interval_seconds: Int
+  schedule_kind: Text
+  schedule_expr: Text
+  timezone: Text
   read_only?: Bool
+  skip_memory?: Bool
+  precheck_kind: Text
   enabled?: Bool
   next_due_at: Text
   last_run_at: Option(Text)
+  run_count: Int
+  skip_count: Int
 end
 
 struct CreateRoutineRequest
   bot_name: Text
   name: Text
   prompt: Text
-  interval_seconds: Int
+  interval_seconds: Option(Int)
+  schedule_kind: Option(Text)
+  schedule_expr: Option(Text)
+  timezone: Option(Text)
   read_only: Option(Bool)
+  skip_memory: Option(Bool)
+  precheck_kind: Option(Text)
 end
 
 struct ApprovalItem
@@ -213,6 +279,14 @@ struct ApprovalItem
   status: ApprovalStatus
   result_text: Option(Text)
   created_at: Text
+end
+
+struct ResolveApprovalRequest
+  approve: Bool
+  edited_arguments_json: Option(Text)
+  reason: Option(Text)
+  auto_resume: Option(Bool)
+  always_allow: Option(Bool)
 end
 
 struct ArtifactItem
@@ -230,6 +304,8 @@ struct SessionSummary
   bot_name: Text
   title: Text
   trust: TrustLevel
+  canonical?: Bool
+  compaction_seq: Int
   created_at: Text
   updated_at: Text
   event_count: Int
@@ -244,6 +320,7 @@ struct SessionEvent
   content: Text
   tool_name: Option(Text)
   tool_call_id: Option(Text)
+  tool_calls_json: Option(Text)
   cost_usd: Decimal
   created_at: Text
 end
@@ -252,11 +329,40 @@ struct ToolCallReq
   id: Text
   name: Text
   arguments_json: Text
+  thought_signature: Option(Text)
 end
 
 struct AskRequest
   message: Text
   session_id: Option(Text)
+  use_canonical: Option(Bool)
+end
+
+struct EnqueueRunRequest
+  message: Text
+  session_id: Option(Text)
+  use_canonical: Option(Bool)
+end
+
+struct SteerRunRequest
+  mode: Text
+  message: Option(Text)
+end
+
+struct BotRun
+  id: Text
+  bot_name: Text
+  session_id: Text
+  trust: TrustLevel
+  routine_read_only?: Bool
+  status: Text
+  prompt: Text
+  steps: Int
+  spent_usd: Decimal
+  reply: Text
+  error: Option(Text)
+  created_at: Text
+  updated_at: Text
 end
 
 struct TurnReply
@@ -270,6 +376,12 @@ struct TurnReply
   stopped_reason: Option(Text)
 end
 
+struct ApprovalResolution
+  approval: ApprovalItem
+  resumed_turn: Option(TurnReply)
+  created_rule: Option(PolicyRule)
+end
+
 struct BudgetSnapshot
   bot_name: Text
   limit_usd: Decimal
@@ -278,6 +390,27 @@ struct BudgetSnapshot
   turns: Int
   input_tokens: Int
   output_tokens: Int
+  cached_input_tokens: Int
+end
+
+struct VaultSecretMeta
+  name: Text
+  scope: Text
+  updated_at: Text
+  source: Text
+end
+
+struct SaveSecretRequest
+  name: Text
+  value: Text
+  scope: Option(Text)
+end
+
+struct WebhookConfig
+  source: Text
+  target_bot: Text
+  secret_name: Text
+  enabled?: Bool
 end
 
 struct WebhookReceipt
@@ -285,11 +418,13 @@ struct WebhookReceipt
   session_id: Text
   routed_bot: Text
   event_id: Int
+  run_id: Option(Text)
 end
 
 struct TickSummary
   checked_at: Text
   routines_ran: Int
+  routines_skipped: Int
   approvals_created: Int
   results: List(Text)
 end
@@ -301,6 +436,11 @@ struct HealthSummary
   pending_approvals: Int
   connectors: Int
   routines: Int
+  queued_runs: Int
+  vault_secrets: Int
+  master_key_set?: Bool
+  telegram_enabled?: Bool
+  push_subscriptions: Int
 end
 
 struct ToggleRequest
@@ -341,6 +481,133 @@ struct ConnectorTestResult
   error: Option(Text)
 end
 
+struct AppSettings
+  timezone: Text
+  quiet_hours_start: Text
+  quiet_hours_end: Text
+  public_url: Text
+  vault_path: Text
+  vault_git_remote: Text
+  telegram_enabled?: Bool
+  telegram_allowed_user_id: Text
+  telegram_default_bot: Text
+end
+
+struct TelegramConfig
+  enabled?: Bool
+  allowed_user_id: Text
+  default_bot: Text
+  token_configured?: Bool
+  last_update_id: Int
+end
+
+struct TelegramTestResult
+  ok?: Bool
+  bot_username: Text
+  error: Option(Text)
+end
+
+struct PushSubscription
+  endpoint: Text
+  p256dh: Text
+  auth: Text
+  user_agent: Text
+  created_at: Text
+end
+
+struct AnalyticsSummary
+  day: Text
+  total_spent_usd: Decimal
+  total_input_tokens: Int
+  total_output_tokens: Int
+  total_cached_tokens: Int
+  cache_hit_pct: Int
+  routines_total_runs: Int
+  routines_total_skips: Int
+  pending_approvals: Int
+  active_bots: Int
+  by_bot: List(BudgetSnapshot)
+end
+
+struct VaultFileReadResponse
+  path: Text
+  content: Text
+end
+
+struct VaultFileWriteRequest
+  path: Text
+  content: Text
+  commit_message: Option(Text)
+end
+
+struct VaultSearchResponse
+  query: Text
+  results: Text
+end
+
+struct PublishGdocRequest
+  account: Text
+  title: Text
+  content: Text
+end
+
+struct PublishGdocResponse
+  account: Text
+  url: Text
+end
+
+struct StandingIntent
+  id: Int
+  bot_name: Text
+  name: Text
+  watch_terms: Text
+  instruction: Text
+  cooldown_seconds: Int
+  max_fires: Int
+  fire_count: Int
+  expires_at: Text
+  active?: Bool
+  last_fired_at: Option(Text)
+end
+
+struct CreateIntentRequest
+  bot_name: Text
+  name: Text
+  watch_terms: Text
+  instruction: Text
+  cooldown_seconds: Option(Int)
+  max_fires: Option(Int)
+  expires_days: Option(Int)
+end
+
+struct EvaluateIntentsRequest
+  source: Text
+  text: Text
+end
+
+struct EvaluateIntentsResponse
+  matched: Int
+  triggered_runs: List(Text)
+end
+
+struct DreamingDigest
+  id: Int
+  run_at: Text
+  summary: Text
+  promoted_count: Int
+  pruned_count: Int
+  rolled_back?: Bool
+end
+
+struct WeeklyAuditReport
+  generated_at: Text
+  total_routines: Int
+  zero_value_routines: List(Text)
+  unused_bot_skills: List(Text)
+  repeated_approval_tools: List(Text)
+  summary_markdown: Text
+end
+
 struct ModbVerifySummary
   ok?: Bool
   txid: Int
@@ -366,36 +633,36 @@ struct RevokeGrantRequest
   reason: Option(Text)
 end
 
-enum MotetError
-  Unauthorized
-  ItemNotFound(message: Text)
-  BadInput(message: Text)
-  Conflict(message: Text)
-  BudgetExceeded(message: Text)
-  PolicyDenied(message: Text)
-  UpstreamFailed(message: Text)
-  StorageFailed(message: Text)
-end
-
 fn provider_to_text(p: ProviderKind) : Text
   examples
     provider_to_text(OpenAiCompat) == "openai_compat"
     provider_to_text(Anthropic) == "anthropic"
+    provider_to_text(Gemini) == "gemini"
   end
 
   case p
     OpenAiCompat: "openai_compat"
     Anthropic: "anthropic"
+    Gemini: "gemini"
   end
 end
 
 fn provider_from_text(s: Text) : ProviderKind
   examples
     provider_from_text("anthropic") == Anthropic
+    provider_from_text("gemini") == Gemini
+    provider_from_text("google") == Gemini
     provider_from_text("openai_compat") == OpenAiCompat
   end
 
-  if s.trim.ascii_lowercase == "anthropic": Anthropic else: OpenAiCompat
+  low = s.trim.ascii_lowercase
+  if low == "anthropic"
+    Anthropic
+  else if low == "gemini" or low == "google"
+    Gemini
+  else
+    OpenAiCompat
+  end
 end
 
 fn effect_to_text(e: EffectClass) : Text

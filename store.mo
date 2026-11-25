@@ -4,8 +4,9 @@
 ## - Layer 3:   Tamper-evident SHA-256 hash-chained audit ledger, schema v1, commit invariants
 ## - Layer 4:   Attenuated `Grants`, `Claims` leases, `Views` + `OnboardingManifest`,
 ##              lossless `Replay`, and canonical SHA-256 `Export`.
-## - Security:  OAuth PKCE state and Bearer access tokens live ONLY in bare Layer 1/2
-##              `motet-secrets.modb`, physically excluded from audit, replay, views, and export.
+## - Security:  AES-256-GCM Vault ciphertexts, OAuth PKCE state, and Bearer access tokens live ONLY
+##              in bare Layer 1/2 `motet-secrets.modb`, physically excluded from audit, replay, views,
+##              and export.
 module Store
 expose default_db_path,
 default_secrets_path,
@@ -19,9 +20,21 @@ tokenize,
 motet_schema,
 motet_view_catalog,
 motet_replay_catalog,
+DreamingRunRow(..),
+RoutineRunRow(..),
+SkillUsageRow(..),
+BudgetLedgerRow(..),
+BotRunRow(..),
+VaultSecretRow(..),
+ConnectorTokenRow(..),
+MemoryRow(..),
+MigrationSnapshot(..),
 upsert_bot,
 get_bot,
 list_bots,
+set_bot_active,
+clone_bot,
+delete_bot,
 upsert_connector,
 get_connector,
 list_connectors,
@@ -31,40 +44,100 @@ OAuthPending(..),
 save_oauth_pending,
 take_oauth_pending,
 save_connector_token,
+save_connector_token_sealed,
 get_connector_token,
+get_connector_token_opened,
 get_connector_token_meta,
 delete_connector_token,
+save_vault_secret,
+get_vault_secret,
+resolve_secret,
+list_vault_secrets,
+delete_vault_secret,
 add_rule,
 list_rules,
 delete_rule,
 create_session,
+get_or_create_canonical_session,
+get_session,
+set_session_compaction_seq,
 list_sessions,
 append_event,
+append_event_full,
 list_events,
+list_events_after,
 search_events,
+count_session_tool_denials,
+has_events_since,
+list_recent_owner_user_messages,
 save_memory,
+save_memory_full,
 list_memories,
+list_staged_memories,
+promote_staged_memory,
+update_memory_content,
+archive_memory,
+restore_memory,
 search_memories,
 delete_memory,
+record_dreaming_run,
+list_dreaming_runs,
+get_dreaming_run,
+mark_dreaming_rolled_back,
+has_dreamed_today,
+create_intent,
+list_intents,
+cancel_intent,
+record_intent_fired,
+record_skill_usage,
+get_skill_usage_map,
 upsert_routine,
+upsert_routine_full,
 list_routines,
 list_due_routines,
+claim_routine_slot,
 mark_routine_ran,
+mark_routine_skipped,
 set_routine_enabled,
 delete_routine,
 create_approval,
 get_approval,
 list_approvals,
 update_approval,
+update_approval_args,
 dismiss_all_pending_approvals,
+list_repeated_executed_approvals,
 save_artifact,
 list_artifacts,
 record_spend_ledger,
+record_spend_ledger_full,
 bot_spend_total,
 bot_daily_spend,
 daily_budget_snapshots,
 utc_day_prefix,
+enqueue_run,
+claim_next_queued_run,
+get_run,
+list_runs,
+append_run_steer,
+take_run_steers,
+update_run_progress,
+finish_run,
+upsert_webhook_config,
+get_webhook_config,
+list_webhook_configs,
+delete_webhook_config,
+get_settings,
+save_settings,
+get_telegram_offset,
+set_telegram_offset,
+save_push_subscription,
+list_push_subscriptions,
+delete_push_subscription,
+analytics_summary,
 health_summary,
+import_snapshot,
+import_secrets_snapshot,
 bot_root_grant_id,
 ensure_bot_root_grant,
 delegate_bot_grant,
@@ -102,13 +175,17 @@ use Modb.Views{
   ViewField
 }
 use Types{
+  AnalyticsSummary,
+  AppSettings,
   ApprovalDecision,
   ApprovalItem,
   ApprovalStatus,
   ArtifactItem,
   BotConfig,
+  BotRun,
   BudgetSnapshot,
   ConnectorSpec,
+  DreamingDigest,
   EffectClass,
   HealthSummary,
   MemoryEntry,
@@ -116,13 +193,18 @@ use Types{
   MotetError,
   PolicyRule,
   ProviderKind,
+  PushSubscription,
   RoutineSpec,
   SessionEvent,
   SessionSummary,
+  StandingIntent,
   TrustLevel,
+  VaultSecretMeta,
+  WebhookConfig,
   approval_status_to_text
 }
 use Unicode16
+use Vault
 
 default_db_path = "motet.modb"
 default_secrets_path = "motet-secrets.modb"
@@ -142,16 +224,73 @@ fn open_at(files: Files, clock: Clock, path: Text, secrets_path: Text) : DbHandl
   DbHandle(files: files, clock: clock, path: path, secrets_path: secrets_path)
 end
 
-## Internal structs stored in typed MoDB tables.
+## Internal typed records stored in `motet.modb` and `motet-secrets.modb`.
+struct MemoryRow
+  id: Int
+  scope: Text
+  kind: Text
+  content: Text
+  provenance: Text
+  origin: Text
+  session_kind: Text
+  staged: Bool
+  archived?: Bool
+  created_at: Text
+end
+
+struct DreamingRunRow
+  id: Int
+  run_at: Text
+  summary: Text
+  promoted_count: Int
+  pruned_count: Int
+  rollback_snapshot_json: Text
+  rolled_back?: Bool
+end
+
+struct SkillUsageRow
+  skill_name: Text
+  read_count: Int
+  last_used_at: Text
+end
+
+struct RoutineRunRow
+  key: Text
+  id: Int
+  routine_id: Int
+  slot_key: Text
+  status: Text
+  detail: Text
+  created_at: Text
+end
+
 struct BudgetLedgerRow
   id: Int
   bot_name: Text
   session_id: Text
   input_tokens: Int
   output_tokens: Int
+  cached_input_tokens: Int
   cost_usd: Decimal
   created_at: Text
   day: Text
+end
+
+struct BotRunRow
+  id: Text
+  bot_name: Text
+  session_id: Text
+  trust: TrustLevel
+  routine_read_only?: Bool
+  status: Text
+  prompt: Text
+  steer_queue_json: Text
+  steps: Int
+  spent_usd: Decimal
+  reply: Text
+  error: Option(Text)
+  created_at: Text
+  updated_at: Text
 end
 
 struct OAuthPending
@@ -173,6 +312,34 @@ struct ConnectorTokenRow
   updated_at: Text
 end
 
+struct VaultSecretRow
+  name: Text
+  scope: Text
+  ciphertext: Text
+  updated_at: Text
+end
+
+struct MigrationSnapshot
+  bots: List(BotConfig)
+  connectors: List(ConnectorSpec)
+  policy_rules: List(PolicyRule)
+  sessions: List(SessionSummary)
+  events: List(SessionEvent)
+  memories: List(MemoryRow)
+  dreaming_runs: List(DreamingRunRow)
+  standing_intents: List(StandingIntent)
+  skill_usage: List(SkillUsageRow)
+  routines: List(RoutineSpec)
+  routine_runs: List(RoutineRunRow)
+  app_settings: Map(Text, Text)
+  push_subscriptions: List(PushSubscription)
+  approvals: List(ApprovalItem)
+  artifacts: List(ArtifactItem)
+  budget_ledger: List(BudgetLedgerRow)
+  bot_runs: List(BotRunRow)
+  webhook_configs: List(WebhookConfig)
+end
+
 ## Action argument structs for deterministic Replay recording.
 struct SeedDefaultsArgs
   now_text: Text
@@ -181,6 +348,15 @@ end
 struct ToggleNameArgs
   name: Text
   enabled: Option(Bool)
+end
+
+struct CloneBotArgs
+  source_name: Text
+  new_name: Text
+  role: Option(Text)
+  persona: Option(Text)
+  connectors: Option(List(Text))
+  read_only_connectors: Option(List(Text))
 end
 
 struct NameArgs
@@ -208,7 +384,13 @@ struct CreateSessionArgs
   bot_name: Text
   title: Text
   trust: TrustLevel
+  canonical: Bool
   now_text: Text
+end
+
+struct SetCompactionSeqArgs
+  session_id: Text
+  compaction_seq: Int
 end
 
 struct AppendEventArgs
@@ -218,6 +400,7 @@ struct AppendEventArgs
   content: Text
   tool_name: Option(Text)
   tool_call_id: Option(Text)
+  tool_calls_json: Option(Text)
   cost_usd: Decimal
   now_text: Text
 end
@@ -227,6 +410,42 @@ struct SaveMemoryArgs
   kind: Text
   content: Text
   provenance: Text
+  origin: Text
+  session_kind: Text
+  staged: Bool
+  now_text: Text
+end
+
+struct UpdateMemoryContentArgs
+  id: Int
+  content: Text
+end
+
+struct RecordDreamingArgs
+  run_at: Text
+  summary: Text
+  promoted_count: Int
+  pruned_count: Int
+  rollback_snapshot_json: Text
+end
+
+struct CreateIntentArgs
+  bot_name: Text
+  name: Text
+  watch_terms: Text
+  instruction: Text
+  cooldown_seconds: Int
+  max_fires: Int
+  expires_at: Text
+end
+
+struct RecordIntentFiredArgs
+  id: Int
+  now_text: Text
+end
+
+struct RecordSkillUsageArgs
+  skill_name: Text
   now_text: Text
 end
 
@@ -235,13 +454,29 @@ struct UpsertRoutineArgs
   name: Text
   prompt: Text
   interval_seconds: Int
+  schedule_kind: Text
+  schedule_expr: Text
+  timezone: Text
   read_only: Bool
+  skip_memory: Bool
+  precheck_kind: Text
   next_due_at: Text
+end
+
+struct ClaimRoutineSlotArgs
+  routine_id: Int
+  slot_key: Text
+  now_text: Text
 end
 
 struct MarkRoutineRanArgs
   id: Int
   now_text: Text
+  next_due_at: Text
+end
+
+struct MarkRoutineSkippedArgs
+  id: Int
   next_due_at: Text
 end
 
@@ -261,6 +496,11 @@ struct UpdateApprovalArgs
   result_text: Text
 end
 
+struct UpdateApprovalJsonArgs
+  id: Int
+  arguments_json: Text
+end
+
 struct SaveArtifactArgs
   bot_name: Text
   session_id: Text
@@ -275,8 +515,58 @@ struct RecordSpendArgs
   session_id: Text
   input_tokens: Int
   output_tokens: Int
+  cached_input_tokens: Int
   cost_usd: Decimal
   now_text: Text
+end
+
+struct EnqueueRunArgs
+  run_id: Text
+  bot_name: Text
+  session_id: Text
+  trust: TrustLevel
+  routine_read_only: Bool
+  prompt: Text
+  now_text: Text
+end
+
+struct ClaimRunArgs
+  run_id: Text
+  now_text: Text
+end
+
+struct AppendRunSteerArgs
+  run_id: Text
+  mode: Text
+  message: Text
+  now_text: Text
+end
+
+struct UpdateRunProgressArgs
+  run_id: Text
+  steps: Int
+  spent_usd: Decimal
+  now_text: Text
+end
+
+struct FinishRunArgs
+  run_id: Text
+  status: Text
+  steps: Int
+  spent_usd: Decimal
+  reply: Text
+  error_text: Text
+  now_text: Text
+end
+
+struct SavePushSubArgs
+  sub: PushSubscription
+  now_text: Text
+end
+
+struct SetSettingArgs
+  key: Text
+  value: Text
 end
 
 ## Error conversion helpers.
@@ -396,6 +686,50 @@ fn parse_time(ts: Text) : Time
   Time.parse(ts) or (Time.parse("2026-01-01T00:00:00Z") or stop "fallback epoch time")
 end
 
+## Row conversions between internal storage structs and public Types.
+fn mem_row_to_entry(r: MemoryRow) : MemoryEntry
+  MemoryEntry(
+    id: r.id,
+    scope: r.scope,
+    kind: r.kind,
+    content: r.content,
+    provenance: r.provenance,
+    origin: r.origin,
+    session_kind: r.session_kind,
+    staged: r.staged,
+    created_at: r.created_at
+  )
+end
+
+fn dream_row_to_digest(r: DreamingRunRow) : DreamingDigest
+  DreamingDigest(
+    id: r.id,
+    run_at: r.run_at,
+    summary: r.summary,
+    promoted_count: r.promoted_count,
+    pruned_count: r.pruned_count,
+    rolled_back?: r.rolled_back?
+  )
+end
+
+fn bot_run_row_to_public(r: BotRunRow) : BotRun
+  BotRun(
+    id: r.id,
+    bot_name: r.bot_name,
+    session_id: r.session_id,
+    trust: r.trust,
+    routine_read_only?: r.routine_read_only?,
+    status: r.status,
+    prompt: r.prompt,
+    steps: r.steps,
+    spent_usd: r.spent_usd,
+    reply: r.reply,
+    error: r.error,
+    created_at: r.created_at,
+    updated_at: r.updated_at
+  )
+end
+
 ## Typed tables and secondary indexes in `motet.modb`.
 fn seqs_table() : Table(Text, Int)
   Table.text_key[Int]("_motet_seqs")
@@ -429,12 +763,24 @@ fn events_table() : Table(Int, SessionEvent)
   Table.int_key[SessionEvent]("events").with_index(events_by_session_index())
 end
 
-fn memories_by_scope_index() : Index(Int, MemoryEntry, Text)
-  Table.text_index[Int, MemoryEntry]("memories_by_scope", fn(m) m.scope end)
+fn memories_by_scope_index() : Index(Int, MemoryRow, Text)
+  Table.text_index[Int, MemoryRow]("memories_by_scope", fn(m) m.scope end)
 end
 
-fn memories_table() : Table(Int, MemoryEntry)
-  Table.int_key[MemoryEntry]("memories").with_index(memories_by_scope_index())
+fn memories_table() : Table(Int, MemoryRow)
+  Table.int_key[MemoryRow]("memories").with_index(memories_by_scope_index())
+end
+
+fn dreaming_runs_table() : Table(Int, DreamingRunRow)
+  Table.int_key[DreamingRunRow]("dreaming_runs")
+end
+
+fn intents_table() : Table(Int, StandingIntent)
+  Table.int_key[StandingIntent]("standing_intents")
+end
+
+fn skill_usage_table() : Table(Text, SkillUsageRow)
+  Table.text_key[SkillUsageRow]("skill_usage")
 end
 
 fn routines_by_bot_name_index() : Index(Int, RoutineSpec, Text)
@@ -446,6 +792,22 @@ end
 
 fn routines_table() : Table(Int, RoutineSpec)
   Table.int_key[RoutineSpec]("routines").with_index(routines_by_bot_name_index())
+end
+
+fn routine_runs_by_routine_index() : Index(Text, RoutineRunRow, Int)
+  Table.int_index[Text, RoutineRunRow]("routine_runs_by_routine", fn(r) r.routine_id end)
+end
+
+fn routine_runs_table() : Table(Text, RoutineRunRow)
+  Table.text_key[RoutineRunRow]("routine_runs").with_index(routine_runs_by_routine_index())
+end
+
+fn app_settings_table() : Table(Text, Text)
+  Table.text_key[Text]("app_settings")
+end
+
+fn push_subscriptions_table() : Table(Text, PushSubscription)
+  Table.text_key[PushSubscription]("push_subscriptions")
 end
 
 fn approvals_by_status_index() : Index(Int, ApprovalItem, Text)
@@ -481,6 +843,24 @@ fn budget_ledger_table() : Table(Int, BudgetLedgerRow)
   )
 end
 
+fn bot_runs_by_status_index() : Index(Text, BotRunRow, Text)
+  Table.text_index[Text, BotRunRow]("bot_runs_by_status", fn(r) r.status end)
+end
+
+fn bot_runs_by_bot_index() : Index(Text, BotRunRow, Text)
+  Table.text_index[Text, BotRunRow]("bot_runs_by_bot", fn(r) r.bot_name end)
+end
+
+fn bot_runs_table() : Table(Text, BotRunRow)
+  Table.text_key[BotRunRow]("bot_runs").with_index(bot_runs_by_status_index()).with_index(
+    bot_runs_by_bot_index()
+  )
+end
+
+fn webhook_configs_table() : Table(Text, WebhookConfig)
+  Table.text_key[WebhookConfig]("webhook_configs")
+end
+
 ## Physical isolation: secrets tables live ONLY in bare Layer 1+2 `motet-secrets.modb`.
 fn oauth_pending_table() : Table(Text, OAuthPending)
   Table.text_key[OAuthPending]("oauth_pending")
@@ -488,6 +868,10 @@ end
 
 fn connector_tokens_table() : Table(Text, ConnectorTokenRow)
   Table.text_key[ConnectorTokenRow]("connector_tokens")
+end
+
+fn vault_secrets_table() : Table(Text, VaultSecretRow)
+  Table.text_key[VaultSecretRow]("vault_secrets")
 end
 
 ## Pure-Mo Unicode tokenizer for inverted keyword indexing.
@@ -624,7 +1008,7 @@ fn motet_schema() : Schema
       "budget_ledger_non_negative",
       budget_ledger_table(),
       fn(id, r)
-        if r.cost_usd < 0.0 or r.input_tokens < 0 or r.output_tokens < 0
+        if r.cost_usd < 0.0 or r.input_tokens < 0 or r.output_tokens < 0 or r.cached_input_tokens < 0
           Some("budget_ledger ##{id} values must be non-negative")
         else
           None
@@ -646,13 +1030,13 @@ fn motet_schema() : Schema
   )
 end
 
-## Replay action implementations (every mutation to `motet.modb` domain buckets flows here).
+## Phase 1-4 everyday starter bots, connectors, and routines.
 fn starter_bots() : List(BotConfig)
   [
     BotConfig(
       name: "chief",
       role: "Chief of Staff",
-      persona: "You are Chief, the user's primary Motet teammate. Coordinate specialist bots (watcher, builder), keep updates crisp, remember preferences, and escalate only real judgment calls.",
+      persona: "You are Chief, the user's primary Motet teammate. Coordinate walled specialist bots (work, personal, finance, researcher) via read-only delegation for unified morning briefs and daily triage, and route any external writes through the right walled specialist. Keep updates crisp, remember preferences, and escalate only real judgment calls.",
       is_primary?: true,
       model_tier: "smart",
       provider: Anthropic,
@@ -660,35 +1044,94 @@ fn starter_bots() : List(BotConfig)
       api_key_env: "ANTHROPIC_API_KEY",
       model: "claude-sonnet-5-5",
       workspace: ".",
-      allowed_programs: ["mo", "git"],
+      allowed_programs: [],
       allowed_hosts: ["api.anthropic.com:443"],
-      connectors: ["t3code"],
+      connectors: ["qmd"],
+      read_only_connectors: ["qmd"],
       daily_budget_usd: 5.00,
       max_steps: 10,
       active?: true
     ),
     BotConfig(
-      name: "watcher",
-      role: "Project & Thread Monitor",
-      persona: "You are Watcher, a fast read-only sentinel monitoring projects, PRs, CI, and active T3 Code threads. Spot stalls, failures, and regressions early; summarize concisely and flag actionable items.",
+      name: "work",
+      role: "Work Executive",
+      persona: "You are Work, the user's strictly walled professional executive assistant. Handle work Gmail triage, reply drafts, work Google Calendar prep, Notion docs/databases, and shareable work Google Docs. Never cross into personal accounts.",
       is_primary?: false,
-      model_tier: "fast",
+      model_tier: "smart",
       provider: Anthropic,
       endpoint: "https://api.anthropic.com/v1/messages",
       api_key_env: "ANTHROPIC_API_KEY",
-      model: "claude-haiku-5-5",
+      model: "claude-sonnet-5-5",
       workspace: ".",
-      allowed_programs: ["git", "mo"],
+      allowed_programs: [],
       allowed_hosts: ["api.anthropic.com:443"],
-      connectors: ["t3code"],
-      daily_budget_usd: 2.00,
-      max_steps: 8,
+      connectors: ["gmail-work", "gcal-work", "notion", "gdocs-work"],
+      read_only_connectors: [],
+      daily_budget_usd: 5.00,
+      max_steps: 10,
+      active?: true
+    ),
+    BotConfig(
+      name: "personal",
+      role: "Personal Life & Vault",
+      persona: "You are Personal, the user's strictly walled personal assistant. Manage personal Gmail, personal Google Calendar, Todoist tasks and reminders, Git-backed personal Markdown notes via qmd, and personal Google Docs.",
+      is_primary?: false,
+      model_tier: "smart",
+      provider: Anthropic,
+      endpoint: "https://api.anthropic.com/v1/messages",
+      api_key_env: "ANTHROPIC_API_KEY",
+      model: "claude-sonnet-5-5",
+      workspace: ".",
+      allowed_programs: ["git"],
+      allowed_hosts: ["api.anthropic.com:443"],
+      connectors: ["gmail-personal", "gcal-personal", "todoist", "qmd", "gdocs-personal"],
+      read_only_connectors: [],
+      daily_budget_usd: 5.00,
+      max_steps: 10,
+      active?: true
+    ),
+    BotConfig(
+      name: "finance",
+      role: "Household Finance",
+      persona: "You are Finance, a strictly walled household finance specialist connected to Hearth Arvo (with live Mercury sync and transactional Undo) and read-only personal Gmail receipt search. Track Safe-to-Spend, envelopes, upcoming paycheck bills, and subscription renewals; propose moves or categorizations clearly for owner approval.",
+      is_primary?: false,
+      model_tier: "gemini_flash",
+      provider: Gemini,
+      endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
+      api_key_env: "GEMINI_API_KEY",
+      model: "gemini-3-flash-preview",
+      workspace: ".",
+      allowed_programs: [],
+      allowed_hosts: ["generativelanguage.googleapis.com:443"],
+      connectors: ["hearth-arvo", "gmail-personal", "qmd"],
+      read_only_connectors: ["gmail-personal"],
+      daily_budget_usd: 3.00,
+      max_steps: 10,
+      active?: true
+    ),
+    BotConfig(
+      name: "researcher",
+      role: "Deep Research & Writing",
+      persona: "You are Researcher, a deep research and long-form synthesis specialist. Search the live web and personal Markdown vault via qmd, produce structured Pages and reports, and prepare clean Google Docs for sharing.",
+      is_primary?: false,
+      model_tier: "gemini_pro",
+      provider: Gemini,
+      endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
+      api_key_env: "GEMINI_API_KEY",
+      model: "gemini-3.1-pro-preview",
+      workspace: ".",
+      allowed_programs: [],
+      allowed_hosts: ["generativelanguage.googleapis.com:443"],
+      connectors: ["qmd", "gdocs-personal", "gdocs-work"],
+      read_only_connectors: [],
+      daily_budget_usd: 6.00,
+      max_steps: 12,
       active?: true
     ),
     BotConfig(
       name: "builder",
-      role: "Software Engineering Lead",
-      persona: "You are Builder, a Devin-Bot-style engineering lead. Own repo goals end-to-end: inspect state, keep writes single-threaded via isolated T3 Code worktree threads, verify tests, and bring reviewed PRs to the user.",
+      role: "Software Engineering Lead (Dormant)",
+      persona: "You are Builder, a software engineering lead for isolated T3 Code worktree threads and repo tasks. Currently dormant until re-enabled.",
       is_primary?: false,
       model_tier: "opus",
       provider: Anthropic,
@@ -699,17 +1142,201 @@ fn starter_bots() : List(BotConfig)
       allowed_programs: ["mo", "git"],
       allowed_hosts: ["api.anthropic.com:443"],
       connectors: ["t3code"],
+      read_only_connectors: [],
       daily_budget_usd: 10.00,
       max_steps: 14,
-      active?: true
+      active?: false
+    ),
+    BotConfig(
+      name: "watcher",
+      role: "Engineering Monitor (Dormant)",
+      persona: "You are Watcher, a fast read-only sentinel for projects, PRs, CI, and T3 Code threads. Currently dormant until re-enabled.",
+      is_primary?: false,
+      model_tier: "fast",
+      provider: Anthropic,
+      endpoint: "https://api.anthropic.com/v1/messages",
+      api_key_env: "ANTHROPIC_API_KEY",
+      model: "claude-haiku-5-5",
+      workspace: ".",
+      allowed_programs: ["git", "mo"],
+      allowed_hosts: ["api.anthropic.com:443"],
+      connectors: ["t3code"],
+      read_only_connectors: ["t3code"],
+      daily_budget_usd: 2.00,
+      max_steps: 8,
+      active?: false
     )
   ]
 end
 
+fn starter_connectors() : List(ConnectorSpec)
+  [
+    ConnectorSpec(
+      name: "qmd",
+      kind: "mcp_stateless",
+      url: "http://127.0.0.1:8181/mcp",
+      auth_env: "",
+      allowed_host: "127.0.0.1:8181",
+      default_effect: Read,
+      enabled?: true
+    ),
+    ConnectorSpec(
+      name: "gmail-work",
+      kind: "google_gmail",
+      url: "https://gmail.googleapis.com/gmail/v1",
+      auth_env: "GMAIL_WORK_TOKEN",
+      allowed_host: "gmail.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "gcal-work",
+      kind: "google_gcal",
+      url: "https://www.googleapis.com/calendar/v3",
+      auth_env: "GCAL_WORK_TOKEN",
+      allowed_host: "www.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "gdocs-work",
+      kind: "google_gdocs",
+      url: "https://docs.googleapis.com/v1",
+      auth_env: "GDOCS_WORK_TOKEN",
+      allowed_host: "docs.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "notion",
+      kind: "mcp_http",
+      url: "https://mcp.notion.com/mcp",
+      auth_env: "NOTION_TOKEN",
+      allowed_host: "mcp.notion.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "gmail-personal",
+      kind: "google_gmail",
+      url: "https://gmail.googleapis.com/gmail/v1",
+      auth_env: "GMAIL_PERSONAL_TOKEN",
+      allowed_host: "gmail.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "gcal-personal",
+      kind: "google_gcal",
+      url: "https://www.googleapis.com/calendar/v3",
+      auth_env: "GCAL_PERSONAL_TOKEN",
+      allowed_host: "www.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "gdocs-personal",
+      kind: "google_gdocs",
+      url: "https://docs.googleapis.com/v1",
+      auth_env: "GDOCS_PERSONAL_TOKEN",
+      allowed_host: "docs.googleapis.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "todoist",
+      kind: "todoist",
+      url: "https://api.todoist.com/api/v1",
+      auth_env: "TODOIST_API_TOKEN",
+      allowed_host: "api.todoist.com:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "hearth-arvo",
+      kind: "hearth_arvo",
+      url: "https://hearth.exe.xyz/api/v1/agent",
+      auth_env: "HEARTH_API_TOKEN",
+      allowed_host: "hearth.exe.xyz:443",
+      default_effect: WriteExternal,
+      enabled?: false
+    ),
+    ConnectorSpec(
+      name: "t3code",
+      kind: "mcp_http",
+      url: "http://127.0.0.1:3773/mcp",
+      auth_env: "T3_MCP_TOKEN",
+      allowed_host: "127.0.0.1:3773",
+      default_effect: WriteExternal,
+      enabled?: false
+    )
+  ]
+end
+
+fn starter_routines(now_text: Text) : List(UpsertRoutineArgs)
+  [
+    UpsertRoutineArgs(
+      bot_name: "chief",
+      name: "morning-brief",
+      prompt: "Coordinate read-only summaries from work, personal, and finance for today's calendar, urgent emails, due Todoist items, and Hearth Arvo Safe-to-Spend + upcoming bills. Deliver one crisp morning brief.",
+      interval_seconds: 86400,
+      schedule_kind: "weekdays",
+      schedule_expr: "07:30",
+      timezone: "America/Los_Angeles",
+      read_only: true,
+      skip_memory: true,
+      precheck_kind: "",
+      next_due_at: now_text
+    ),
+    UpsertRoutineArgs(
+      bot_name: "chief",
+      name: "evening-wrap",
+      prompt: "Summarize today's completed items, pending Needs-You drafts, tomorrow's first meeting, and any overdue Todoist tasks in 5 concise bullets.",
+      interval_seconds: 86400,
+      schedule_kind: "weekdays",
+      schedule_expr: "18:00",
+      timezone: "America/Los_Angeles",
+      read_only: true,
+      skip_memory: true,
+      precheck_kind: "",
+      next_due_at: now_text
+    ),
+    UpsertRoutineArgs(
+      bot_name: "finance",
+      name: "receipt-renewal-sweep",
+      prompt: "Check recent Mercury transactions in Hearth Arvo and read-only personal Gmail receipts for upcoming subscription renewals or unusual charges. Queue any proposed envelope moves for approval; stay quiet if nothing changed.",
+      interval_seconds: 86400,
+      schedule_kind: "daily",
+      schedule_expr: "21:30",
+      timezone: "America/Los_Angeles",
+      read_only: true,
+      skip_memory: true,
+      precheck_kind: "unread_events",
+      next_due_at: now_text
+    ),
+    UpsertRoutineArgs(
+      bot_name: "chief",
+      name: "weekly-self-audit",
+      prompt: "Run the weekly anti-job self-audit: review routine run/skip noise ratio, unused bot-proposed skills, and repeated approval tools that could become narrow Allow rules. Deliver one concise Sunday scorecard.",
+      interval_seconds: 604800,
+      schedule_kind: "weekly",
+      schedule_expr: "sun@19:00",
+      timezone: "America/Los_Angeles",
+      read_only: true,
+      skip_memory: true,
+      precheck_kind: "",
+      next_due_at: now_text
+    )
+  ]
+end
+
+## Replay action implementations (every mutation to `motet.modb` domain buckets flows here).
 fn tx_upsert_routine_inner(tx: WriteTx, a: UpsertRoutineArgs) : Result((WriteTx, RoutineSpec), Text)
   tbl = routines_table()
   idx = routines_by_bot_name_index()
   secs = if a.interval_seconds >= 10: a.interval_seconds else: 60
+  sk = if a.schedule_kind.trim.empty?: "interval" else: a.schedule_kind.trim.ascii_lowercase
+  tz = if a.timezone.trim.empty?: "America/Los_Angeles" else: a.timezone.trim
   comp_key = "#{a.bot_name}\u{1f}#{a.name}"
   case try wrap_t(Table.tx_lookup_unique(tx, tbl, idx, comp_key))
     Some((_k, existing)):
@@ -719,10 +1346,17 @@ fn tx_upsert_routine_inner(tx: WriteTx, a: UpsertRoutineArgs) : Result((WriteTx,
         name: a.name,
         prompt: a.prompt,
         interval_seconds: secs,
+        schedule_kind: sk,
+        schedule_expr: a.schedule_expr.trim,
+        timezone: tz,
         read_only?: a.read_only,
+        skip_memory?: a.skip_memory,
+        precheck_kind: a.precheck_kind.trim,
         enabled?: true,
         next_due_at: a.next_due_at,
-        last_run_at: existing.last_run_at
+        last_run_at: existing.last_run_at,
+        run_count: existing.run_count,
+        skip_count: existing.skip_count
       )
       t1 = try wrap_t(Table.put(tx, tbl, next_r.id, next_r))
       Ok((t1, next_r))
@@ -734,10 +1368,17 @@ fn tx_upsert_routine_inner(tx: WriteTx, a: UpsertRoutineArgs) : Result((WriteTx,
         name: a.name,
         prompt: a.prompt,
         interval_seconds: secs,
+        schedule_kind: sk,
+        schedule_expr: a.schedule_expr.trim,
+        timezone: tz,
         read_only?: a.read_only,
+        skip_memory?: a.skip_memory,
+        precheck_kind: a.precheck_kind.trim,
         enabled?: true,
         next_due_at: a.next_due_at,
-        last_run_at: None
+        last_run_at: None,
+        run_count: 0,
+        skip_count: 0
       )
       t2 = try wrap_t(Table.put(t1, tbl, id, next_r))
       Ok((t2, next_r))
@@ -758,33 +1399,18 @@ fn action_seed_defaults(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
   ctbl = connectors_table()
   existing_conns = try wrap_t(Table.tx_scan(cur_tx, ctbl, None, None, 1))
   if existing_conns.empty?
-    c0 = ConnectorSpec(
-      name: "t3code",
-      kind: "mcp_http",
-      url: "http://127.0.0.1:3773/mcp",
-      auth_env: "T3_MCP_TOKEN",
-      allowed_host: "127.0.0.1:3773",
-      default_effect: WriteExternal,
-      enabled?: true
-    )
-    cur_tx = try wrap_t(Table.put(cur_tx, ctbl, c0.name, c0))
+    for c in starter_connectors()
+      cur_tx = try wrap_t(Table.put(cur_tx, ctbl, c.name, c))
+    end
   end
 
   rtbl = routines_table()
   existing_routines = try wrap_t(Table.tx_scan(cur_tx, rtbl, None, None, 1))
   if existing_routines.empty?
-    (t_r, _r) = try tx_upsert_routine_inner(
-      cur_tx,
-      UpsertRoutineArgs(
-        bot_name: "watcher",
-        name: "t3-thread-pulse",
-        prompt: "Check active T3 Code projects and threads via the t3code connector and summarize any failed, stalled, or waiting threads concisely in your reply. Do not call write tools unless an action genuinely requires owner approval.",
-        interval_seconds: 900,
-        read_only: true,
-        next_due_at: a.now_text
-      )
-    )
-    cur_tx = t_r
+    for ra in starter_routines(a.now_text)
+      (t_r, _r) = try tx_upsert_routine_inner(cur_tx, ra)
+      cur_tx = t_r
+    end
   end
 
   cur_tx = try wrap_t(Table.put(cur_tx, seqs_table(), "_seeded", 1))
@@ -795,6 +1421,86 @@ fn action_upsert_bot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
   bot = try Json.decode[BotConfig](Json.encode(args).bytes).map_error(json_arg_err)
   t1 = try wrap_t(Table.put(tx, bots_table(), bot.name, bot))
   Ok((t1, bot.to_json))
+end
+
+fn action_set_bot_active(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[ToggleNameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bots_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.name))).or_fail(
+    "item_not_found: unknown bot: #{a.name}"
+  )
+  next_act = case a.enabled
+    Some(v): v
+    None: not cur.active?
+  end
+  updated = BotConfig(
+    name: cur.name,
+    role: cur.role,
+    persona: cur.persona,
+    is_primary?: cur.is_primary?,
+    model_tier: cur.model_tier,
+    provider: cur.provider,
+    endpoint: cur.endpoint,
+    api_key_env: cur.api_key_env,
+    model: cur.model,
+    workspace: cur.workspace,
+    allowed_programs: cur.allowed_programs,
+    allowed_hosts: cur.allowed_hosts,
+    connectors: cur.connectors,
+    read_only_connectors: cur.read_only_connectors,
+    daily_budget_usd: cur.daily_budget_usd,
+    max_steps: cur.max_steps,
+    active?: next_act
+  )
+  t1 = try wrap_t(Table.put(tx, tbl, updated.name, updated))
+  Ok((t1, updated.to_json))
+end
+
+fn action_clone_bot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[CloneBotArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  clean_new = a.new_name.trim
+  return Error("bad_input: new_name cannot be empty") if clean_new.empty?
+  tbl = bots_table()
+  src = try (try wrap_t(Table.tx_get(tx, tbl, a.source_name))).or_fail(
+    "item_not_found: unknown source bot: #{a.source_name}"
+  )
+  if (try wrap_t(Table.tx_get(tx, tbl, clean_new))) is Some(_)
+    return Error("conflict: bot '#{clean_new}' already exists")
+  end
+  cloned = BotConfig(
+    name: clean_new,
+    role: a.role or src.role,
+    persona: a.persona or src.persona,
+    is_primary?: false,
+    model_tier: src.model_tier,
+    provider: src.provider,
+    endpoint: src.endpoint,
+    api_key_env: src.api_key_env,
+    model: src.model,
+    workspace: src.workspace,
+    allowed_programs: src.allowed_programs,
+    allowed_hosts: src.allowed_hosts,
+    connectors: a.connectors or src.connectors,
+    read_only_connectors: a.read_only_connectors or src.read_only_connectors,
+    daily_budget_usd: src.daily_budget_usd,
+    max_steps: src.max_steps,
+    active?: true
+  )
+  t1 = try wrap_t(Table.put(tx, tbl, cloned.name, cloned))
+  Ok((t1, cloned.to_json))
+end
+
+fn action_delete_bot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[NameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bots_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.name))).or_fail(
+    "item_not_found: unknown bot: #{a.name}"
+  )
+  if cur.is_primary?
+    return Error("conflict: cannot delete primary bot '#{a.name}'")
+  end
+  t1 = try wrap_t(Table.delete(tx, tbl, a.name))
+  Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
 end
 
 fn action_upsert_connector(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
@@ -861,6 +1567,8 @@ fn action_create_session(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text
       bot_name: existing.bot_name,
       title: existing.title,
       trust: existing.trust,
+      canonical?: existing.canonical? or a.canonical,
+      compaction_seq: existing.compaction_seq,
       created_at: existing.created_at,
       updated_at: a.now_text,
       event_count: existing.event_count
@@ -870,6 +1578,8 @@ fn action_create_session(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text
       bot_name: a.bot_name,
       title: a.title,
       trust: a.trust,
+      canonical?: a.canonical,
+      compaction_seq: 0,
       created_at: a.now_text,
       updated_at: a.now_text,
       event_count: 0
@@ -877,6 +1587,28 @@ fn action_create_session(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text
   end
   t1 = try wrap_t(Table.put(tx, tbl, next_s.id, next_s))
   Ok((t1, next_s.to_json))
+end
+
+fn action_set_session_compaction_seq(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[SetCompactionSeqArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = sessions_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.session_id))
+    Some(cur):
+      updated = SessionSummary(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        title: cur.title,
+        trust: cur.trust,
+        canonical?: cur.canonical?,
+        compaction_seq: a.compaction_seq,
+        created_at: cur.created_at,
+        updated_at: cur.updated_at,
+        event_count: cur.event_count
+      )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
 end
 
 fn action_append_event(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
@@ -892,6 +1624,7 @@ fn action_append_event(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
     content: a.content,
     tool_name: a.tool_name,
     tool_call_id: a.tool_call_id,
+    tool_calls_json: a.tool_calls_json,
     cost_usd: a.cost_usd,
     created_at: a.now_text
   )
@@ -904,6 +1637,8 @@ fn action_append_event(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
         bot_name: sess.bot_name,
         title: sess.title,
         trust: sess.trust,
+        canonical?: sess.canonical?,
+        compaction_seq: sess.compaction_seq,
         created_at: sess.created_at,
         updated_at: a.now_text,
         event_count: sess.event_count + 1
@@ -920,18 +1655,107 @@ end
 fn action_save_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
   a = try Json.decode[SaveMemoryArgs](Json.encode(args).bytes).map_error(json_arg_err)
   (t1, id) = try wrap_t(tx_next_id(tx, "memories"))
-  entry = MemoryEntry(
+  row = MemoryRow(
     id: id,
     scope: a.scope,
     kind: a.kind,
     content: a.content,
     provenance: a.provenance,
+    origin: a.origin,
+    session_kind: a.session_kind,
+    staged: a.staged,
+    archived?: false,
     created_at: a.now_text
   )
-  t2 = try wrap_t(Table.put(t1, memories_table(), id, entry))
+  t2 = try wrap_t(Table.put(t1, memories_table(), id, row))
   tokens = tokenize("#{a.scope} #{a.kind} #{a.content}").take(64)
   t3 = try wrap_t(tx_index_tokens(t2, "memory_tokens", tokens, id))
-  Ok((t3, entry.to_json))
+  Ok((t3, mem_row_to_entry(row).to_json))
+end
+
+fn action_promote_staged_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = memories_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.id))).or_fail(
+    "item_not_found: memory ##{a.id} not found"
+  )
+  next_row = if cur.archived?
+    cur
+  else
+    MemoryRow(
+      id: cur.id,
+      scope: cur.scope,
+      kind: cur.kind,
+      content: cur.content,
+      provenance: cur.provenance,
+      origin: "owner",
+      session_kind: cur.session_kind,
+      staged: false,
+      archived?: cur.archived?,
+      created_at: cur.created_at
+    )
+  end
+  t1 = try wrap_t(Table.put(tx, tbl, a.id, next_row))
+  Ok((t1, mem_row_to_entry(next_row).to_json))
+end
+
+fn action_update_memory_content(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[UpdateMemoryContentArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = memories_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.id))).or_fail(
+    "item_not_found: memory ##{a.id} not found"
+  )
+  clean = a.content.trim
+  old_toks = tokenize("#{cur.scope} #{cur.kind} #{cur.content}").take(64)
+  t1 = try wrap_t(tx_delete_tokens(tx, "memory_tokens", old_toks, a.id))
+  updated = MemoryRow(
+    id: cur.id,
+    scope: cur.scope,
+    kind: cur.kind,
+    content: clean,
+    provenance: cur.provenance,
+    origin: cur.origin,
+    session_kind: cur.session_kind,
+    staged: cur.staged,
+    archived?: cur.archived?,
+    created_at: cur.created_at
+  )
+  t2 = try wrap_t(Table.put(t1, tbl, a.id, updated))
+  new_toks = tokenize("#{cur.scope} #{cur.kind} #{clean}").take(64)
+  t3 = try wrap_t(tx_index_tokens(t2, "memory_tokens", new_toks, a.id))
+  Ok((t3, mem_row_to_entry(updated).to_json))
+end
+
+fn set_memory_archived_tx(tx: WriteTx, id: Int, archived?: Bool) : Result((WriteTx, Json), Text)
+  tbl = memories_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, id))
+    Some(cur):
+      updated = MemoryRow(
+        id: cur.id,
+        scope: cur.scope,
+        kind: cur.kind,
+        content: cur.content,
+        provenance: cur.provenance,
+        origin: cur.origin,
+        session_kind: cur.session_kind,
+        staged: cur.staged,
+        archived?: archived?,
+        created_at: cur.created_at
+      )
+      try wrap_t(Table.put(tx, tbl, id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_archive_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  set_memory_archived_tx(tx, a.id, true)
+end
+
+fn action_restore_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  set_memory_archived_tx(tx, a.id, false)
 end
 
 fn action_delete_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
@@ -947,10 +1771,152 @@ fn action_delete_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
   Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
 end
 
+fn action_record_dreaming_run(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[RecordDreamingArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  (t1, id) = try wrap_t(tx_next_id(tx, "dreaming_runs"))
+  row = DreamingRunRow(
+    id: id,
+    run_at: a.run_at,
+    summary: a.summary,
+    promoted_count: a.promoted_count,
+    pruned_count: a.pruned_count,
+    rollback_snapshot_json: a.rollback_snapshot_json,
+    rolled_back?: false
+  )
+  t2 = try wrap_t(Table.put(t1, dreaming_runs_table(), id, row))
+  Ok((t2, dream_row_to_digest(row).to_json))
+end
+
+fn action_mark_dreaming_rolled_back(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = dreaming_runs_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      updated = DreamingRunRow(
+        id: cur.id,
+        run_at: cur.run_at,
+        summary: cur.summary,
+        promoted_count: cur.promoted_count,
+        pruned_count: cur.pruned_count,
+        rollback_snapshot_json: cur.rollback_snapshot_json,
+        rolled_back?: true
+      )
+      try wrap_t(Table.put(tx, tbl, cur.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_create_intent(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[CreateIntentArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  (t1, id) = try wrap_t(tx_next_id(tx, "standing_intents"))
+  it = StandingIntent(
+    id: id,
+    bot_name: a.bot_name,
+    name: a.name,
+    watch_terms: a.watch_terms,
+    instruction: a.instruction,
+    cooldown_seconds: a.cooldown_seconds,
+    max_fires: a.max_fires,
+    fire_count: 0,
+    expires_at: a.expires_at,
+    active?: true,
+    last_fired_at: None
+  )
+  t2 = try wrap_t(Table.put(t1, intents_table(), id, it))
+  Ok((t2, it.to_json))
+end
+
+fn action_cancel_intent(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = intents_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      updated = StandingIntent(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        name: cur.name,
+        watch_terms: cur.watch_terms,
+        instruction: cur.instruction,
+        cooldown_seconds: cur.cooldown_seconds,
+        max_fires: cur.max_fires,
+        fire_count: cur.fire_count,
+        expires_at: cur.expires_at,
+        active?: false,
+        last_fired_at: cur.last_fired_at
+      )
+      try wrap_t(Table.put(tx, tbl, cur.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_record_intent_fired(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[RecordIntentFiredArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = intents_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      updated = StandingIntent(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        name: cur.name,
+        watch_terms: cur.watch_terms,
+        instruction: cur.instruction,
+        cooldown_seconds: cur.cooldown_seconds,
+        max_fires: cur.max_fires,
+        fire_count: cur.fire_count + 1,
+        expires_at: cur.expires_at,
+        active?: cur.active?,
+        last_fired_at: Some(a.now_text)
+      )
+      try wrap_t(Table.put(tx, tbl, cur.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_record_skill_usage(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[RecordSkillUsageArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  clean = a.skill_name.trim
+  tbl = skill_usage_table()
+  next_row = case try wrap_t(Table.tx_get(tx, tbl, clean))
+    Some(cur): SkillUsageRow(
+      skill_name: clean,
+      read_count: cur.read_count + 1,
+      last_used_at: a.now_text
+    )
+    None: SkillUsageRow(skill_name: clean, read_count: 1, last_used_at: a.now_text)
+  end
+  t1 = try wrap_t(Table.put(tx, tbl, clean, next_row))
+  Ok((t1, next_row.to_json))
+end
+
 fn action_upsert_routine(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
   a = try Json.decode[UpsertRoutineArgs](Json.encode(args).bytes).map_error(json_arg_err)
   (t1, r) = try tx_upsert_routine_inner(tx, a)
   Ok((t1, r.to_json))
+end
+
+fn action_claim_routine_slot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[ClaimRoutineSlotArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  comp = "#{a.routine_id}\u{1f}#{a.slot_key}"
+  tbl = routine_runs_table()
+  case try wrap_t(Table.tx_get(tx, tbl, comp))
+    Some(_): Ok((tx, Json.Boolean(false)))
+    None:
+      (t1, id) = try wrap_t(tx_next_id(tx, "routine_runs"))
+      row = RoutineRunRow(
+        key: comp,
+        id: id,
+        routine_id: a.routine_id,
+        slot_key: a.slot_key,
+        status: "claimed",
+        detail: "",
+        created_at: a.now_text
+      )
+      t2 = try wrap_t(Table.put(t1, tbl, comp, row))
+      Ok((t2, Json.Boolean(true)))
+  end
 end
 
 fn action_mark_routine_ran(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
@@ -964,10 +1930,46 @@ fn action_mark_routine_ran(tx: WriteTx, args: Json) : Result((WriteTx, Json), Te
         name: cur.name,
         prompt: cur.prompt,
         interval_seconds: cur.interval_seconds,
+        schedule_kind: cur.schedule_kind,
+        schedule_expr: cur.schedule_expr,
+        timezone: cur.timezone,
         read_only?: cur.read_only?,
+        skip_memory?: cur.skip_memory?,
+        precheck_kind: cur.precheck_kind,
         enabled?: cur.enabled?,
         next_due_at: a.next_due_at,
-        last_run_at: Some(a.now_text)
+        last_run_at: Some(a.now_text),
+        run_count: cur.run_count + 1,
+        skip_count: cur.skip_count
+      )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_mark_routine_skipped(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[MarkRoutineSkippedArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = routines_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      updated = RoutineSpec(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        name: cur.name,
+        prompt: cur.prompt,
+        interval_seconds: cur.interval_seconds,
+        schedule_kind: cur.schedule_kind,
+        schedule_expr: cur.schedule_expr,
+        timezone: cur.timezone,
+        read_only?: cur.read_only?,
+        skip_memory?: cur.skip_memory?,
+        precheck_kind: cur.precheck_kind,
+        enabled?: cur.enabled?,
+        next_due_at: a.next_due_at,
+        last_run_at: cur.last_run_at,
+        run_count: cur.run_count,
+        skip_count: cur.skip_count + 1
       )
       try wrap_t(Table.put(tx, tbl, updated.id, updated))
     None: tx
@@ -991,10 +1993,17 @@ fn action_set_routine_enabled(tx: WriteTx, args: Json) : Result((WriteTx, Json),
     name: cur.name,
     prompt: cur.prompt,
     interval_seconds: cur.interval_seconds,
+    schedule_kind: cur.schedule_kind,
+    schedule_expr: cur.schedule_expr,
+    timezone: cur.timezone,
     read_only?: cur.read_only?,
+    skip_memory?: cur.skip_memory?,
+    precheck_kind: cur.precheck_kind,
     enabled?: next_en,
     next_due_at: cur.next_due_at,
-    last_run_at: cur.last_run_at
+    last_run_at: cur.last_run_at,
+    run_count: cur.run_count,
+    skip_count: cur.skip_count
   )
   t1 = try wrap_t(Table.put(tx, tbl, updated.id, updated))
   Ok((t1, updated.to_json))
@@ -1002,7 +2011,13 @@ end
 
 fn action_delete_routine(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
   a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
-  t1 = try wrap_t(Table.delete(tx, routines_table(), a.id))
+  rtbl = routine_runs_table()
+  rrows = try wrap_t(Table.tx_lookup(tx, rtbl, routine_runs_by_routine_index(), a.id))
+  var cur_tx = tx
+  for (rkey, _rr) in rrows
+    cur_tx = try wrap_t(Table.delete(cur_tx, rtbl, rkey))
+  end
+  t1 = try wrap_t(Table.delete(cur_tx, routines_table(), a.id))
   Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
 end
 
@@ -1078,6 +2093,29 @@ fn action_update_approval(tx: WriteTx, args: Json) : Result((WriteTx, Json), Tex
   Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
 end
 
+fn action_update_approval_args(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[UpdateApprovalJsonArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = approvals_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
+    Some(cur):
+      updated = ApprovalItem(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        session_id: cur.session_id,
+        tool_name: cur.tool_name,
+        arguments_json: a.arguments_json,
+        effect_class: cur.effect_class,
+        reason: cur.reason,
+        status: cur.status,
+        result_text: cur.result_text,
+        created_at: cur.created_at
+      )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
 fn action_dismiss_all_pending_approvals(tx: WriteTx, _args: Json) : Result((WriteTx, Json), Text)
   tbl = approvals_table()
   pending = try wrap_t(Table.tx_lookup(tx, tbl, approvals_by_status_index(), "pending"))
@@ -1127,6 +2165,7 @@ fn action_record_spend_ledger(tx: WriteTx, args: Json) : Result((WriteTx, Json),
     session_id: a.session_id,
     input_tokens: a.input_tokens,
     output_tokens: a.output_tokens,
+    cached_input_tokens: a.cached_input_tokens,
     cost_usd: a.cost_usd,
     created_at: a.now_text,
     day: utc_day_prefix(a.now_text)
@@ -1135,37 +2174,481 @@ fn action_record_spend_ledger(tx: WriteTx, args: Json) : Result((WriteTx, Json),
   Ok((t2, row.to_json))
 end
 
+fn action_enqueue_run(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[EnqueueRunArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  row = BotRunRow(
+    id: a.run_id,
+    bot_name: a.bot_name,
+    session_id: a.session_id,
+    trust: a.trust,
+    routine_read_only?: a.routine_read_only,
+    status: "queued",
+    prompt: a.prompt,
+    steer_queue_json: "[]",
+    steps: 0,
+    spent_usd: 0.0,
+    reply: "",
+    error: None,
+    created_at: a.now_text,
+    updated_at: a.now_text
+  )
+  t1 = try wrap_t(Table.put(tx, bot_runs_table(), row.id, row))
+  Ok((t1, bot_run_row_to_public(row).to_json))
+end
+
+fn action_claim_run(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[ClaimRunArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bot_runs_table()
+  case try wrap_t(Table.tx_get(tx, tbl, a.run_id))
+    Some(cur) if cur.status == "queued":
+      updated = BotRunRow(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        session_id: cur.session_id,
+        trust: cur.trust,
+        routine_read_only?: cur.routine_read_only?,
+        status: "running",
+        prompt: cur.prompt,
+        steer_queue_json: cur.steer_queue_json,
+        steps: cur.steps,
+        spent_usd: cur.spent_usd,
+        reply: cur.reply,
+        error: cur.error,
+        created_at: cur.created_at,
+        updated_at: a.now_text
+      )
+      t1 = try wrap_t(Table.put(tx, tbl, updated.id, updated))
+      Ok((t1, bot_run_row_to_public(updated).to_json))
+    Some(_) | None:
+      Ok((tx, Json.Null))
+  end
+end
+
+fn action_append_run_steer(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[AppendRunSteerArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bot_runs_table()
+  cur = try (try wrap_t(Table.tx_get(tx, tbl, a.run_id))).or_fail(
+    "item_not_found: run not found: #{a.run_id}"
+  )
+  if cur.status != "queued" and cur.status != "running"
+    return Error("conflict: run #{a.run_id} is already #{cur.status}")
+  end
+  cur_arr = case Json.parse(cur.steer_queue_json)
+    Ok(Json.Array(items)): items
+    Ok(_) | Error(_): []
+  end
+  entry = Json.Object({
+    "mode": Json.String(a.mode.trim.ascii_lowercase),
+    "message": Json.String(a.message.trim)
+  })
+  next_json = Json.Array(cur_arr.append(entry)).to_text
+  updated = BotRunRow(
+    id: cur.id,
+    bot_name: cur.bot_name,
+    session_id: cur.session_id,
+    trust: cur.trust,
+    routine_read_only?: cur.routine_read_only?,
+    status: cur.status,
+    prompt: cur.prompt,
+    steer_queue_json: next_json,
+    steps: cur.steps,
+    spent_usd: cur.spent_usd,
+    reply: cur.reply,
+    error: cur.error,
+    created_at: cur.created_at,
+    updated_at: a.now_text
+  )
+  t1 = try wrap_t(Table.put(tx, tbl, updated.id, updated))
+  Ok((t1, bot_run_row_to_public(updated).to_json))
+end
+
+fn action_take_run_steers(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[NameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bot_runs_table()
+  case try wrap_t(Table.tx_get(tx, tbl, a.name))
+    None: Ok((tx, Json.String("[]")))
+    Some(cur):
+      raw = cur.steer_queue_json
+      if raw == "[]" or raw.trim.empty?
+        Ok((tx, Json.String("[]")))
+      else
+        updated = BotRunRow(
+          id: cur.id,
+          bot_name: cur.bot_name,
+          session_id: cur.session_id,
+          trust: cur.trust,
+          routine_read_only?: cur.routine_read_only?,
+          status: cur.status,
+          prompt: cur.prompt,
+          steer_queue_json: "[]",
+          steps: cur.steps,
+          spent_usd: cur.spent_usd,
+          reply: cur.reply,
+          error: cur.error,
+          created_at: cur.created_at,
+          updated_at: cur.updated_at
+        )
+        t1 = try wrap_t(Table.put(tx, tbl, updated.id, updated))
+        Ok((t1, Json.String(raw)))
+      end
+  end
+end
+
+fn action_update_run_progress(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[UpdateRunProgressArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bot_runs_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.run_id))
+    Some(cur):
+      updated = BotRunRow(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        session_id: cur.session_id,
+        trust: cur.trust,
+        routine_read_only?: cur.routine_read_only?,
+        status: cur.status,
+        prompt: cur.prompt,
+        steer_queue_json: cur.steer_queue_json,
+        steps: a.steps,
+        spent_usd: a.spent_usd,
+        reply: cur.reply,
+        error: cur.error,
+        created_at: cur.created_at,
+        updated_at: a.now_text
+      )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_finish_run(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[FinishRunArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  tbl = bot_runs_table()
+  t1 = case try wrap_t(Table.tx_get(tx, tbl, a.run_id))
+    Some(cur):
+      err_opt = if a.error_text.empty?: None else: Some(a.error_text)
+      updated = BotRunRow(
+        id: cur.id,
+        bot_name: cur.bot_name,
+        session_id: cur.session_id,
+        trust: cur.trust,
+        routine_read_only?: cur.routine_read_only?,
+        status: a.status,
+        prompt: cur.prompt,
+        steer_queue_json: cur.steer_queue_json,
+        steps: a.steps,
+        spent_usd: a.spent_usd,
+        reply: a.reply,
+        error: err_opt,
+        created_at: cur.created_at,
+        updated_at: a.now_text
+      )
+      try wrap_t(Table.put(tx, tbl, updated.id, updated))
+    None: tx
+  end
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_upsert_webhook_config(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  cfg = try Json.decode[WebhookConfig](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.put(tx, webhook_configs_table(), cfg.source, cfg))
+  Ok((t1, cfg.to_json))
+end
+
+fn action_delete_webhook_config(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[NameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.delete(tx, webhook_configs_table(), a.name))
+  Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
+end
+
+fn action_set_setting_val(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[SetSettingArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.put(tx, app_settings_table(), a.key, a.value))
+  Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_save_settings(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  s = try Json.decode[AppSettings](Json.encode(args).bytes).map_error(json_arg_err)
+  stbl = app_settings_table()
+  prev_raw = (try wrap_t(Table.tx_get(tx, stbl, "timezone"))) or "America/Los_Angeles"
+  prev_tz = if prev_raw.trim.empty?: "America/Los_Angeles" else: prev_raw.trim
+  next_tz = s.timezone.trim
+
+  var cur_tx = tx
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "timezone", next_tz))
+  if not next_tz.empty? and next_tz != prev_tz
+    rtbl = routines_table()
+    rrows = try wrap_t(Table.tx_scan(cur_tx, rtbl, None, None, 0))
+    for (_rid, r) in rrows
+      if r.timezone == prev_tz
+        updated_r = RoutineSpec(
+          id: r.id,
+          bot_name: r.bot_name,
+          name: r.name,
+          prompt: r.prompt,
+          interval_seconds: r.interval_seconds,
+          schedule_kind: r.schedule_kind,
+          schedule_expr: r.schedule_expr,
+          timezone: next_tz,
+          read_only?: r.read_only?,
+          skip_memory?: r.skip_memory?,
+          precheck_kind: r.precheck_kind,
+          enabled?: r.enabled?,
+          next_due_at: r.next_due_at,
+          last_run_at: r.last_run_at,
+          run_count: r.run_count,
+          skip_count: r.skip_count
+        )
+        cur_tx = try wrap_t(Table.put(cur_tx, rtbl, updated_r.id, updated_r))
+      end
+    end
+  end
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "quiet_hours_start", s.quiet_hours_start.trim))
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "quiet_hours_end", s.quiet_hours_end.trim))
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "public_url", s.public_url.trim))
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "vault_path", s.vault_path.trim))
+  cur_tx = try wrap_t(Table.put(cur_tx, stbl, "vault_git_remote", s.vault_git_remote.trim))
+  cur_tx = try wrap_t(
+    Table.put(cur_tx, stbl, "telegram_enabled", if s.telegram_enabled?: "1" else: "0")
+  )
+  cur_tx = try wrap_t(
+    Table.put(cur_tx, stbl, "telegram_allowed_user_id", s.telegram_allowed_user_id.trim)
+  )
+  cur_tx = try wrap_t(
+    Table.put(cur_tx, stbl, "telegram_default_bot", s.telegram_default_bot.trim)
+  )
+  Ok((cur_tx, Json.Object({"ok": Json.Boolean(true)})))
+end
+
+fn action_save_push_subscription(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[SavePushSubArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  ep = a.sub.endpoint.trim
+  return Error("bad_input: push endpoint required") if ep.empty?
+  sub = PushSubscription(
+    endpoint: ep,
+    p256dh: a.sub.p256dh.trim,
+    auth: a.sub.auth.trim,
+    user_agent: a.sub.user_agent.trim,
+    created_at: a.now_text
+  )
+  t1 = try wrap_t(Table.put(tx, push_subscriptions_table(), ep, sub))
+  Ok((t1, sub.to_json))
+end
+
+fn action_delete_push_subscription(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  a = try Json.decode[NameArgs](Json.encode(args).bytes).map_error(json_arg_err)
+  t1 = try wrap_t(Table.delete(tx, push_subscriptions_table(), a.name.trim))
+  Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
+end
+
+fn max_int_val(a: Int, b: Int) : Int
+  if a >= b: a else: b
+end
+
+fn action_import_snapshot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
+  snap = try Json.decode[MigrationSnapshot](Json.encode(args).bytes).map_error(json_arg_err)
+  var cur_tx = tx
+
+  for b in snap.bots
+    cur_tx = try wrap_t(Table.put(cur_tx, bots_table(), b.name, b))
+  end
+  for c in snap.connectors
+    cur_tx = try wrap_t(Table.put(cur_tx, connectors_table(), c.name, c))
+  end
+
+  var max_rule_id = 0
+  for r in snap.policy_rules
+    max_rule_id = max_int_val(max_rule_id, r.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, policy_rules_table(), r.id, r))
+  end
+
+  var ev_counts = {}
+  var max_seqs = {}
+  var max_ev_id = 0
+  for ev in snap.events
+    max_ev_id = max_int_val(max_ev_id, ev.id)
+    cur_cnt = ev_counts.get(ev.session_id) or 0
+    ev_counts = ev_counts.set(ev.session_id, cur_cnt + 1)
+    prev_seq = max_seqs.get(ev.session_id) or 0
+    max_seqs = max_seqs.set(ev.session_id, max_int_val(prev_seq, ev.seq))
+    cur_tx = try wrap_t(Table.put(cur_tx, events_table(), ev.id, ev))
+    tname = ev.tool_name or ""
+    tokens = tokenize("#{ev.kind} #{tname} #{ev.content}").take(64)
+    cur_tx = try wrap_t(tx_index_tokens(cur_tx, "event_tokens", tokens, ev.id))
+  end
+
+  for s in snap.sessions
+    cnt = max_int_val(s.event_count, ev_counts.get(s.id) or 0)
+    fixed_s = SessionSummary(
+      id: s.id,
+      bot_name: s.bot_name,
+      title: s.title,
+      trust: s.trust,
+      canonical?: s.canonical?,
+      compaction_seq: s.compaction_seq,
+      created_at: s.created_at,
+      updated_at: s.updated_at,
+      event_count: cnt
+    )
+    cur_tx = try wrap_t(Table.put(cur_tx, sessions_table(), fixed_s.id, fixed_s))
+  end
+
+  var max_mem_id = 0
+  for m in snap.memories
+    max_mem_id = max_int_val(max_mem_id, m.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, memories_table(), m.id, m))
+    tokens = tokenize("#{m.scope} #{m.kind} #{m.content}").take(64)
+    cur_tx = try wrap_t(tx_index_tokens(cur_tx, "memory_tokens", tokens, m.id))
+  end
+
+  var max_dream_id = 0
+  for dr in snap.dreaming_runs
+    max_dream_id = max_int_val(max_dream_id, dr.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, dreaming_runs_table(), dr.id, dr))
+  end
+
+  var max_intent_id = 0
+  for it in snap.standing_intents
+    max_intent_id = max_int_val(max_intent_id, it.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, intents_table(), it.id, it))
+  end
+
+  for su in snap.skill_usage
+    cur_tx = try wrap_t(Table.put(cur_tx, skill_usage_table(), su.skill_name, su))
+  end
+
+  var max_routine_id = 0
+  for rt in snap.routines
+    max_routine_id = max_int_val(max_routine_id, rt.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, routines_table(), rt.id, rt))
+  end
+
+  var max_rrun_id = 0
+  for rr in snap.routine_runs
+    max_rrun_id = max_int_val(max_rrun_id, rr.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, routine_runs_table(), rr.key, rr))
+  end
+
+  for (sk, sv) in snap.app_settings.entries
+    cur_tx = try wrap_t(Table.put(cur_tx, app_settings_table(), sk, sv))
+  end
+  for ps in snap.push_subscriptions
+    cur_tx = try wrap_t(Table.put(cur_tx, push_subscriptions_table(), ps.endpoint, ps))
+  end
+
+  var max_app_id = 0
+  for ap in snap.approvals
+    max_app_id = max_int_val(max_app_id, ap.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, approvals_table(), ap.id, ap))
+  end
+
+  var max_art_id = 0
+  for ar in snap.artifacts
+    max_art_id = max_int_val(max_art_id, ar.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, artifacts_table(), ar.id, ar))
+  end
+
+  var max_bud_id = 0
+  for bl in snap.budget_ledger
+    max_bud_id = max_int_val(max_bud_id, bl.id)
+    cur_tx = try wrap_t(Table.put(cur_tx, budget_ledger_table(), bl.id, bl))
+  end
+
+  for br in snap.bot_runs
+    cur_tx = try wrap_t(Table.put(cur_tx, bot_runs_table(), br.id, br))
+  end
+  for wc in snap.webhook_configs
+    cur_tx = try wrap_t(Table.put(cur_tx, webhook_configs_table(), wc.source, wc))
+  end
+
+  seqtbl = seqs_table()
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "policy_rules", max_rule_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "events", max_ev_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "memories", max_mem_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "dreaming_runs", max_dream_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "standing_intents", max_intent_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "routines", max_routine_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "routine_runs", max_rrun_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "approvals", max_app_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "artifacts", max_art_id))
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "budget_ledger", max_bud_id))
+  for (sid, mseq) in max_seqs.entries
+    cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "event_seq:#{sid}", mseq))
+  end
+  cur_tx = try wrap_t(Table.put(cur_tx, seqtbl, "_seeded", 1))
+  Ok((cur_tx, Json.Object({"imported": Json.Boolean(true)})))
+end
+
 ## Complete lossless ReplayCatalog covering every domain write in `motet.modb`.
 fn motet_replay_catalog() : ReplayCatalog
   Replay.catalog().with_action("seed_defaults", action_seed_defaults).with_action(
     "upsert_bot",
     action_upsert_bot
-  ).with_action("upsert_connector", action_upsert_connector).with_action(
-    "set_connector_enabled",
-    action_set_connector_enabled
-  ).with_action("delete_connector", action_delete_connector).with_action(
-    "add_rule",
-    action_add_rule
-  ).with_action("delete_rule", action_delete_rule).with_action(
-    "create_session",
-    action_create_session
-  ).with_action("append_event", action_append_event).with_action("save_memory", action_save_memory)
-    .with_action("delete_memory", action_delete_memory).with_action(
+  ).with_action("set_bot_active", action_set_bot_active).with_action(
+    "clone_bot",
+    action_clone_bot
+  ).with_action("delete_bot", action_delete_bot).with_action(
+    "upsert_connector",
+    action_upsert_connector
+  ).with_action("set_connector_enabled", action_set_connector_enabled).with_action(
+    "delete_connector",
+    action_delete_connector
+  ).with_action("add_rule", action_add_rule).with_action("delete_rule", action_delete_rule)
+    .with_action("create_session", action_create_session).with_action(
+      "set_session_compaction_seq",
+      action_set_session_compaction_seq
+    ).with_action("append_event", action_append_event).with_action("save_memory", action_save_memory)
+    .with_action("promote_staged_memory", action_promote_staged_memory).with_action(
+      "update_memory_content",
+      action_update_memory_content
+    ).with_action("archive_memory", action_archive_memory).with_action(
+      "restore_memory",
+      action_restore_memory
+    ).with_action("delete_memory", action_delete_memory).with_action(
+      "record_dreaming_run",
+      action_record_dreaming_run
+    ).with_action("mark_dreaming_rolled_back", action_mark_dreaming_rolled_back).with_action(
+      "create_intent",
+      action_create_intent
+    ).with_action("cancel_intent", action_cancel_intent).with_action(
+      "record_intent_fired",
+      action_record_intent_fired
+    ).with_action("record_skill_usage", action_record_skill_usage).with_action(
       "upsert_routine",
       action_upsert_routine
-    ).with_action("mark_routine_ran", action_mark_routine_ran).with_action(
+    ).with_action("claim_routine_slot", action_claim_routine_slot).with_action(
+      "mark_routine_ran",
+      action_mark_routine_ran
+    ).with_action("mark_routine_skipped", action_mark_routine_skipped).with_action(
       "set_routine_enabled",
       action_set_routine_enabled
     ).with_action("delete_routine", action_delete_routine).with_action(
       "create_approval",
       action_create_approval
     ).with_action("update_approval", action_update_approval).with_action(
-      "dismiss_all_pending_approvals",
-      action_dismiss_all_pending_approvals
-    ).with_action("save_artifact", action_save_artifact).with_action(
+      "update_approval_args",
+      action_update_approval_args
+    ).with_action("dismiss_all_pending_approvals", action_dismiss_all_pending_approvals)
+    .with_action("save_artifact", action_save_artifact).with_action(
       "record_spend_ledger",
       action_record_spend_ledger
-    )
+    ).with_action("enqueue_run", action_enqueue_run).with_action("claim_run", action_claim_run)
+    .with_action("append_run_steer", action_append_run_steer).with_action(
+      "take_run_steers",
+      action_take_run_steers
+    ).with_action("update_run_progress", action_update_run_progress).with_action(
+      "finish_run",
+      action_finish_run
+    ).with_action("upsert_webhook_config", action_upsert_webhook_config).with_action(
+      "delete_webhook_config",
+      action_delete_webhook_config
+    ).with_action("set_setting_val", action_set_setting_val).with_action(
+      "save_settings",
+      action_save_settings
+    ).with_action("save_push_subscription", action_save_push_subscription).with_action(
+      "delete_push_subscription",
+      action_delete_push_subscription
+    ).with_action("import_snapshot", action_import_snapshot)
 end
 
 ## Grant-scoped ViewCatalog + k-anonymous Release catalog (secrets excluded physically).
@@ -1220,13 +2703,14 @@ fn motet_view_catalog() : ViewCatalog
         ViewField(name: "kind", field_type: "text", description: "profile | rule | fact | work_log"),
         ViewField(name: "content", field_type: "text", description: "Memory text"),
         ViewField(name: "provenance", field_type: "text", description: "Originating principal"),
+        ViewField(name: "staged", field_type: "bool", description: "Whether awaiting owner approval"),
         ViewField(name: "created_at", field_type: "text", description: "Creation timestamp")
       ],
       narrows: None,
       load: fn(st)
         rows = try Table.all(st, memories_table()).map_error(fn(e) e.to_text end)
         Ok(
-          rows.map(fn(p)
+          rows.filter(fn(p) not p.1.archived? end).map(fn(p)
             m = p.1
             {
               "id": Json.int(m.id),
@@ -1234,6 +2718,7 @@ fn motet_view_catalog() : ViewCatalog
               "kind": Json.String(m.kind),
               "content": Json.String(m.content),
               "provenance": Json.String(m.provenance),
+              "staged": Json.Boolean(m.staged),
               "created_at": Json.String(m.created_at)
             }
           end)
@@ -1250,6 +2735,7 @@ fn motet_view_catalog() : ViewCatalog
         ViewField(name: "bot_name", field_type: "text", description: "Owning bot name"),
         ViewField(name: "title", field_type: "text", description: "Session summary title"),
         ViewField(name: "trust", field_type: "text", description: "owner | routine | external"),
+        ViewField(name: "canonical", field_type: "bool", description: "Canonical forever-chat flag"),
         ViewField(name: "created_at", field_type: "text", description: "Creation timestamp"),
         ViewField(name: "updated_at", field_type: "text", description: "Last activity timestamp"),
         ViewField(
@@ -1269,6 +2755,7 @@ fn motet_view_catalog() : ViewCatalog
               "bot_name": Json.String(s.bot_name),
               "title": Json.String(s.title),
               "trust": Json.String(Types.trust_to_text(s.trust)),
+              "canonical": Json.Boolean(s.canonical?),
               "created_at": Json.String(s.created_at),
               "updated_at": Json.String(s.updated_at),
               "event_count": Json.int(s.event_count)
@@ -1330,7 +2817,7 @@ fn motet_view_catalog() : ViewCatalog
           Json.Object({
             "bots": Json.int(bs.size),
             "sessions": Json.int(ss.size),
-            "memories": Json.int(ms.size),
+            "memories": Json.int(ms.filter(fn(p) not p.1.archived? end).size),
             "artifacts": Json.int(arts.size),
             "total_spend_usd": Json.String(total_spend.to_fixed(6))
           })
@@ -1573,7 +3060,7 @@ fn ensure_seeded(db: DbHandle, now_text: Text) : Result(Unit, MotetError)
           cur_ldb,
           "system:motet",
           "seed_defaults",
-          "seed default bots, connector, and routine",
+          "seed default bots, connectors, and routines",
           now,
           SeedDefaultsArgs(now_text: now_text).to_json
         )
@@ -1633,15 +3120,80 @@ fn list_bots(db: DbHandle) : Result(List(BotConfig), MotetError)
       bots = rows.map(fn(p) p.1 end)
       Ok(
         bots.sort_by(fn(b)
-          rank = if b.is_primary?: "0" else: "1"
-          "#{rank}:#{b.name}"
+          act = if b.active?: "0" else: "1"
+          pri = if b.is_primary?: "0" else: "1"
+          "#{act}:#{pri}:#{b.name}"
         end)
       )
     end
   )
 end
 
-## Connectors & physically isolated OAuth secrets (`motet-secrets.modb`).
+fn set_bot_active(db: DbHandle, name: Text, active_opt: Option(Bool)) : Result(
+  BotConfig,
+  MotetError
+)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "set_bot_active",
+    "toggle bot #{name}",
+    ToggleNameArgs(name: name, enabled: active_opt).to_json
+  )
+  Json.decode[BotConfig](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn clone_bot(
+  db: DbHandle,
+  source_name: Text,
+  new_name: Text,
+  role_opt: Option(Text),
+  persona_opt: Option(Text),
+  connectors_opt: Option(List(Text)),
+  ro_connectors_opt: Option(List(Text))
+) : Result(BotConfig, MotetError)
+  now = db.clock.now
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (ldb1, rep) = try exec_replay_on(
+        ldb,
+        "operator",
+        "clone_bot",
+        "clone bot #{source_name} -> #{new_name.trim}",
+        now,
+        CloneBotArgs(
+          source_name: source_name,
+          new_name: new_name,
+          role: role_opt,
+          persona: persona_opt,
+          connectors: connectors_opt,
+          read_only_connectors: ro_connectors_opt
+        ).to_json
+      )
+      saved = try Json.decode[BotConfig](Json.encode(rep).bytes).map_error(reply_decode_err)
+      (_ldb2, _g) = try ensure_bot_root_grant_on(ldb1, saved.name, now)
+      Ok(saved)
+    end
+  )
+end
+
+fn delete_bot(db: DbHandle, name: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "delete_bot",
+    "delete bot #{name}",
+    NameArgs(name: name).to_json
+  )
+  Ok(Unit)
+end
+
+## Connectors & physically isolated secrets (`motet-secrets.modb`).
 fn upsert_connector(db: DbHandle, spec: ConnectorSpec) : Result(ConnectorSpec, MotetError)
   rep = try exec_replay(
     db,
@@ -1656,9 +3208,7 @@ end
 fn get_connector(db: DbHandle, name: Text) : Result(Option(ConnectorSpec), MotetError)
   with_db_read(
     db,
-    fn(ldb)
-      Table.get(Ledger.store(ldb), connectors_table(), name).map_error(table_err)
-    end
+    fn(ldb) Table.get(Ledger.store(ldb), connectors_table(), name).map_error(table_err) end
   )
 end
 
@@ -1779,6 +3329,21 @@ fn save_connector_token(
   )
 end
 
+## Encrypts an OAuth access token with AES-256-GCM before persisting in isolated `motet-secrets.modb`.
+fn save_connector_token_sealed(
+  db: DbHandle,
+  env: Env,
+  srng: SecureRandom,
+  connector_name: Text,
+  access_token: Text,
+  scope: Text,
+  expires_at: Text,
+  now_text: Text
+) : Result(Unit, MotetError)
+  sealed = try Vault.seal_text(env, srng, "oauth:#{connector_name}", access_token)
+  save_connector_token(db, connector_name, sealed, scope, expires_at, now_text)
+end
+
 fn get_connector_token(db: DbHandle, connector_name: Text) : Result(Option(Text), MotetError)
   if not db.files.read_only.exists?(db.secrets_path)
     return Ok(None)
@@ -1794,6 +3359,19 @@ fn get_connector_token(db: DbHandle, connector_name: Text) : Result(Option(Text)
       end
     end
   )
+end
+
+## Reads and decrypts a stored OAuth token (transparently supporting legacy plaintext rows).
+fn get_connector_token_opened(db: DbHandle, env: Env, connector_name: Text) : Result(
+  Option(Text),
+  MotetError
+)
+  case try get_connector_token(db, connector_name)
+    None: Ok(None)
+    Some(raw):
+      plain = try Vault.open_or_legacy(env, "oauth:#{connector_name}", raw)
+      Ok(Some(plain))
+  end
 end
 
 fn get_connector_token_meta(db: DbHandle, connector_name: Text) : Result(
@@ -1816,6 +3394,143 @@ fn get_connector_token_meta(db: DbHandle, connector_name: Text) : Result(
   )
 end
 
+## Write-only AES-256-GCM Vault secret storage in isolated `motet-secrets.modb`.
+fn save_vault_secret(
+  db: DbHandle,
+  env: Env,
+  srng: SecureRandom,
+  name: Text,
+  scope: Text,
+  plaintext: Text,
+  now_text: Text
+) : Result(VaultSecretMeta, MotetError)
+  clean_name = name.trim
+  return Error(BadInput(message: "secret name cannot be empty")) if clean_name.empty?
+  return Error(BadInput(message: "secret value cannot be empty")) if plaintext.trim.empty?
+  clean_scope = if scope.trim.empty?: "global" else: scope.trim
+  sealed = try Vault.seal_text(env, srng, "secret:#{clean_name}", plaintext.trim)
+  try Modb.with_exclusive_lock(
+    db.files,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      row = VaultSecretRow(
+        name: clean_name,
+        scope: clean_scope,
+        ciphertext: sealed,
+        updated_at: now_text
+      )
+      tx0 = Modb.begin_write(st)
+      tx1 = try Table.put(tx0, vault_secrets_table(), clean_name, row).map_error(table_err)
+      _s1 = try Modb.commit(tx1).map_error(modb_err)
+      Ok(Unit)
+    end
+  )
+  Ok(VaultSecretMeta(name: clean_name, scope: clean_scope, updated_at: now_text, source: "vault"))
+end
+
+fn get_vault_secret(db: DbHandle, env: Env, name: Text) : Result(Option(Text), MotetError)
+  clean = name.trim
+  return Ok(None) if clean.empty? or not db.files.read_only.exists?(db.secrets_path)
+  ct_opt = try Modb.with_shared_lock(
+    db.files.read_only,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      case try Table.get(st, vault_secrets_table(), clean).map_error(table_err)
+        Some(r): Ok(Some(r.ciphertext))
+        None: Ok(None)
+      end
+    end
+  )
+  case ct_opt
+    None: Ok(None)
+    Some(ct):
+      plain = try Vault.open_text(env, "secret:#{clean}", ct)
+      Ok(Some(plain))
+  end
+end
+
+## Resolves a named secret: checks AES-256-GCM Vault first, falling back to host Env.
+fn resolve_secret(db: DbHandle, env: Env, name: Text) : Result(Option(Text), MotetError)
+  clean = name.trim
+  return Ok(None) if clean.empty?
+  case try get_vault_secret(db, env, clean)
+    Some(v) if not v.trim.empty?: Ok(Some(v.trim))
+    Some(_) | None:
+      case env.get(clean)
+        Some(ev) if not ev.trim.empty?: Ok(Some(ev.trim))
+        Some(_) | None: Ok(None)
+      end
+  end
+end
+
+## Lists write-only Vault secret metadata (NEVER includes plaintext values).
+fn list_vault_secrets(db: DbHandle, env: Env) : Result(List(VaultSecretMeta), MotetError)
+  var out = if not db.files.read_only.exists?(db.secrets_path)
+    []
+  else
+    try Modb.with_shared_lock(
+      db.files.read_only,
+      db.secrets_path,
+      modb_err,
+      fn(st)
+        rows = try Table.all(st, vault_secrets_table()).map_error(table_err)
+        Ok(
+          rows.map(fn(p)
+            r = p.1
+            VaultSecretMeta(
+              name: r.name,
+              scope: r.scope,
+              updated_at: r.updated_at,
+              source: "vault"
+            )
+          end)
+        )
+      end
+    )
+  end
+  known_env = [
+    ("ANTHROPIC_API_KEY", "llm"),
+    ("GEMINI_API_KEY", "llm"),
+    ("TELEGRAM_BOT_TOKEN", "channel"),
+    ("TODOIST_API_TOKEN", "connector"),
+    ("HEARTH_API_TOKEN", "connector"),
+    ("T3_MCP_TOKEN", "connector")
+  ]
+  for pair in known_env
+    kname = pair.0
+    kscope = pair.1
+    already = out.any?(fn(m) m.name == kname end)
+    if not already
+      case env.get(kname)
+        Some(v) if not v.trim.empty?: out = out.append(
+          VaultSecretMeta(name: kname, scope: kscope, updated_at: "", source: "env")
+        )
+        Some(_) | None: Unit
+      end
+    end
+  end
+  Ok(out)
+end
+
+fn delete_vault_secret(db: DbHandle, name: Text) : Result(Unit, MotetError)
+  if not db.files.read_only.exists?(db.secrets_path)
+    return Ok(Unit)
+  end
+  Modb.with_exclusive_lock(
+    db.files,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      tx0 = Modb.begin_write(st)
+      tx1 = try Table.delete(tx0, vault_secrets_table(), name.trim).map_error(table_err)
+      _s1 = try Modb.commit(tx1).map_error(modb_err)
+      Ok(Unit)
+    end
+  )
+end
+
 ## Policy Rules.
 fn add_rule(
   db: DbHandle,
@@ -1828,7 +3543,7 @@ fn add_rule(
     db,
     "operator",
     "add_rule",
-    "add policy rule #{bot_name}:#{tool_pattern}",
+    "add #{decision} rule #{bot_name}:#{tool_pattern}",
     AddRuleArgs(bot_name: bot_name, tool_pattern: tool_pattern, decision: decision, note: note)
       .to_json
   )
@@ -1875,10 +3590,54 @@ fn create_session(
       bot_name: bot_name,
       title: title,
       trust: trust,
+      canonical: false,
       now_text: now_text
     ).to_json
   )
   Json.decode[SessionSummary](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn get_or_create_canonical_session(db: DbHandle, bot_name: Text, now_text: Text) : Result(
+  SessionSummary,
+  MotetError
+)
+  cid = "#{bot_name}-main"
+  rep = try exec_replay(
+    db,
+    "bot:#{bot_name}",
+    "create_session",
+    "open canonical session #{cid}",
+    CreateSessionArgs(
+      id: cid,
+      bot_name: bot_name,
+      title: "#{bot_name} · Main Chat",
+      trust: Owner,
+      canonical: true,
+      now_text: now_text
+    ).to_json
+  )
+  Json.decode[SessionSummary](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn get_session(db: DbHandle, session_id: Text) : Result(Option(SessionSummary), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) Table.get(Ledger.store(ldb), sessions_table(), session_id).map_error(table_err) end
+  )
+end
+
+fn set_session_compaction_seq(db: DbHandle, session_id: Text, compaction_seq: Int) : Result(
+  Unit,
+  MotetError
+)
+  _res = try exec_replay(
+    db,
+    "session:#{session_id}",
+    "set_session_compaction_seq",
+    "checkpoint compaction @#{compaction_seq} on #{session_id}",
+    SetCompactionSeqArgs(session_id: session_id, compaction_seq: compaction_seq).to_json
+  )
+  Ok(Unit)
 end
 
 fn list_sessions(db: DbHandle, bot_filter: Option(Text)) : Result(List(SessionSummary), MotetError)
@@ -1892,13 +3651,16 @@ fn list_sessions(db: DbHandle, bot_filter: Option(Text)) : Result(List(SessionSu
         )
         None: try Table.all(st, sessions_table()).map_error(table_err)
       end
-      sorted = rows.map(fn(p) p.1 end).sort_by(fn(s) "#{s.updated_at}:#{s.id}" end).reverse
+      sorted = rows.map(fn(p) p.1 end).sort_by(fn(s)
+        cflag = if s.canonical?: "1" else: "0"
+        "#{cflag}:#{s.updated_at}:#{s.id}"
+      end).reverse
       Ok(sorted.take(50))
     end
   )
 end
 
-fn append_event(
+fn append_event_full(
   db: DbHandle,
   session_id: Text,
   kind: Text,
@@ -1906,6 +3668,7 @@ fn append_event(
   content: Text,
   tool_name: Option(Text),
   tool_call_id: Option(Text),
+  tool_calls_json: Option(Text),
   cost_usd: Decimal,
   now_text: Text
 ) : Result(SessionEvent, MotetError)
@@ -1921,11 +3684,37 @@ fn append_event(
       content: content,
       tool_name: tool_name,
       tool_call_id: tool_call_id,
+      tool_calls_json: tool_calls_json,
       cost_usd: cost_usd,
       now_text: now_text
     ).to_json
   )
   Json.decode[SessionEvent](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn append_event(
+  db: DbHandle,
+  session_id: Text,
+  kind: Text,
+  role: Text,
+  content: Text,
+  tool_name: Option(Text),
+  tool_call_id: Option(Text),
+  cost_usd: Decimal,
+  now_text: Text
+) : Result(SessionEvent, MotetError)
+  append_event_full(
+    db,
+    session_id,
+    kind,
+    role,
+    content,
+    tool_name,
+    tool_call_id,
+    None,
+    cost_usd,
+    now_text
+  )
 end
 
 fn list_events(db: DbHandle, session_id: Text, limit: Int) : Result(List(SessionEvent), MotetError)
@@ -1939,7 +3728,30 @@ fn list_events(db: DbHandle, session_id: Text, limit: Int) : Result(List(Session
         events_by_session_index(),
         session_id
       ).map_error(table_err)
-      Ok(rows.map(fn(p) p.1 end).take(cap))
+      sorted = rows.map(fn(p) p.1 end).sort_by(fn(ev) ev.seq end)
+      Ok(sorted.take(cap))
+    end
+  )
+end
+
+fn list_events_after(db: DbHandle, session_id: Text, after_seq: Int, limit: Int) : Result(
+  List(SessionEvent),
+  MotetError
+)
+  cap = if limit > 0 and limit <= 500: limit else: 200
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.lookup(
+        Ledger.store(ldb),
+        events_table(),
+        events_by_session_index(),
+        session_id
+      ).map_error(table_err)
+      filtered = rows.map(fn(p) p.1 end).filter(fn(ev) ev.seq > after_seq end).sort_by(fn(ev)
+        ev.seq
+      end)
+      Ok(filtered.take(cap))
     end
   )
 end
@@ -1972,13 +3784,74 @@ fn search_events(db: DbHandle, query: Text, limit: Int) : Result(List(SessionEve
   )
 end
 
-## Durable Memories + inverted FTS search.
-fn save_memory(
+fn count_session_tool_denials(db: DbHandle, session_id: Text, tool_name: Text) : Result(
+  Int,
+  MotetError
+)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.lookup(
+        Ledger.store(ldb),
+        events_table(),
+        events_by_session_index(),
+        session_id
+      ).map_error(table_err)
+      cnt = rows.filter(fn(p)
+        ev = p.1
+        ev.kind == "approval_denied" and (tool_name == "" or (ev.tool_name or "") == tool_name)
+      end).size
+      Ok(cnt)
+    end
+  )
+end
+
+fn has_events_since(db: DbHandle, since: Text) : Result(Bool, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), events_table()).map_error(table_err)
+      Ok(rows.any?(fn(p) p.1.created_at > since end))
+    end
+  )
+end
+
+fn list_recent_owner_user_messages(db: DbHandle, limit: Int) : Result(List(Text), MotetError)
+  cap = if limit > 0 and limit <= 200: limit else: 40
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      srows = try Table.all(st, sessions_table()).map_error(table_err)
+      var owner_sessions = {}
+      for (sid, s) in srows
+        if s.trust == Owner
+          owner_sessions = owner_sessions.set(sid, true)
+        end
+      end
+      erows = try Table.all(st, events_table()).map_error(table_err)
+      var out = []
+      for (_id, ev) in erows.reverse
+        break if out.size >= cap
+        if ev.kind == "message" and ev.role == "user" and (owner_sessions.get(ev.session_id) or false)
+          out = out.append(ev.content)
+        end
+      end
+      Ok(out)
+    end
+  )
+end
+
+## Durable Memories (taint-gated, staging, archive/restore) + Dreaming + inverted FTS search.
+fn save_memory_full(
   db: DbHandle,
   scope: Text,
   kind: Text,
   content: Text,
   provenance: Text,
+  origin: Text,
+  session_kind: Text,
+  staged?: Bool,
   now_text: Text
 ) : Result(MemoryEntry, MotetError)
   rep = try exec_replay(
@@ -1991,10 +3864,24 @@ fn save_memory(
       kind: kind,
       content: content,
       provenance: provenance,
+      origin: origin,
+      session_kind: session_kind,
+      staged: staged?,
       now_text: now_text
     ).to_json
   )
   Json.decode[MemoryEntry](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn save_memory(
+  db: DbHandle,
+  scope: Text,
+  kind: Text,
+  content: Text,
+  provenance: Text,
+  now_text: Text
+) : Result(MemoryEntry, MotetError)
+  save_memory_full(db, scope, kind, content, provenance, "owner", "direct", false, now_text)
 end
 
 fn list_memories(db: DbHandle, scope_opt: Option(Text), limit: Int) : Result(
@@ -2011,9 +3898,73 @@ fn list_memories(db: DbHandle, scope_opt: Option(Text), limit: Int) : Result(
           .map_error(table_err)
         None: try Table.all(st, memories_table()).map_error(table_err)
       end
-      Ok(rows.map(fn(p) p.1 end).reverse.take(cap))
+      active = rows.map(fn(p) p.1 end).filter(fn(m) not m.staged and not m.archived? end)
+        .reverse
+        .take(cap)
+      Ok(active.map(mem_row_to_entry))
     end
   )
+end
+
+fn list_staged_memories(db: DbHandle, limit: Int) : Result(List(MemoryEntry), MotetError)
+  cap = if limit > 0 and limit <= 200: limit else: 50
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), memories_table()).map_error(table_err)
+      staged = rows.map(fn(p) p.1 end).filter(fn(m) m.staged and not m.archived? end)
+        .reverse
+        .take(cap)
+      Ok(staged.map(mem_row_to_entry))
+    end
+  )
+end
+
+fn promote_staged_memory(db: DbHandle, id: Int) : Result(MemoryEntry, MotetError)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "promote_staged_memory",
+    "promote staged memory ##{id}",
+    IdArgs(id: id).to_json
+  )
+  Json.decode[MemoryEntry](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn update_memory_content(db: DbHandle, id: Int, new_content: Text) : Result(
+  MemoryEntry,
+  MotetError
+)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "update_memory_content",
+    "patch memory ##{id}",
+    UpdateMemoryContentArgs(id: id, content: new_content.trim).to_json
+  )
+  Json.decode[MemoryEntry](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn archive_memory(db: DbHandle, id: Int) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:dreaming",
+    "archive_memory",
+    "archive memory ##{id}",
+    IdArgs(id: id).to_json
+  )
+  Ok(Unit)
+end
+
+fn restore_memory(db: DbHandle, id: Int) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "restore_memory",
+    "restore archived memory ##{id}",
+    IdArgs(id: id).to_json
+  )
+  Ok(Unit)
 end
 
 fn search_memories(db: DbHandle, scope_opt: Option(Text), query: Text) : Result(
@@ -2033,7 +3984,7 @@ fn search_memories(db: DbHandle, scope_opt: Option(Text), query: Text) : Result(
       for mid in ids
         break if hits.size >= 20
         case try Table.get(st, memories_table(), mid).map_error(table_err)
-          Some(m):
+          Some(m) if not m.staged and not m.archived?:
             scope_ok = case scope_opt
               Some(s): m.scope == s or m.scope == "shared"
               None: true
@@ -2041,10 +3992,10 @@ fn search_memories(db: DbHandle, scope_opt: Option(Text), query: Text) : Result(
             if scope_ok
               doc = tokenize("#{m.scope} #{m.kind} #{m.content}")
               if rest.all?(fn(t) doc.contains?(t) end)
-                hits = hits.append(m)
+                hits = hits.append(mem_row_to_entry(m))
               end
             end
-          None: Unit
+          Some(_) | None: Unit
         end
       end
       Ok(hits)
@@ -2063,7 +4014,194 @@ fn delete_memory(db: DbHandle, id: Int) : Result(Unit, MotetError)
   Ok(Unit)
 end
 
-## Standing Routines.
+fn record_dreaming_run(
+  db: DbHandle,
+  run_at: Text,
+  summary: Text,
+  promoted_count: Int,
+  pruned_count: Int,
+  rollback_snapshot_json: Text
+) : Result(DreamingDigest, MotetError)
+  rep = try exec_replay(
+    db,
+    "system:dreaming",
+    "record_dreaming_run",
+    "record dreaming digest (+#{promoted_count}/-#{pruned_count})",
+    RecordDreamingArgs(
+      run_at: run_at,
+      summary: summary,
+      promoted_count: promoted_count,
+      pruned_count: pruned_count,
+      rollback_snapshot_json: rollback_snapshot_json
+    ).to_json
+  )
+  Json.decode[DreamingDigest](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn list_dreaming_runs(db: DbHandle, limit: Int) : Result(List(DreamingRunRow), MotetError)
+  cap = if limit > 0 and limit <= 50: limit else: 15
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), dreaming_runs_table()).map_error(table_err)
+      Ok(rows.map(fn(p) p.1 end).reverse.take(cap))
+    end
+  )
+end
+
+fn get_dreaming_run(db: DbHandle, id: Int) : Result(Option(DreamingRunRow), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) Table.get(Ledger.store(ldb), dreaming_runs_table(), id).map_error(table_err) end
+  )
+end
+
+fn mark_dreaming_rolled_back(db: DbHandle, id: Int) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "mark_dreaming_rolled_back",
+    "rollback dreaming run ##{id}",
+    IdArgs(id: id).to_json
+  )
+  Ok(Unit)
+end
+
+fn has_dreamed_today(db: DbHandle, day_prefix: Text) : Result(Bool, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), dreaming_runs_table()).map_error(table_err)
+      Ok(rows.any?(fn(p) not p.1.rolled_back? and p.1.run_at.starts_with?(day_prefix) end))
+    end
+  )
+end
+
+## Standing Intents.
+fn create_intent(
+  db: DbHandle,
+  bot_name: Text,
+  name: Text,
+  watch_terms: Text,
+  instruction: Text,
+  cooldown_seconds: Int,
+  max_fires: Int,
+  expires_at: Text
+) : Result(StandingIntent, MotetError)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "create_intent",
+    "create standing intent #{bot_name}:#{name}",
+    CreateIntentArgs(
+      bot_name: bot_name,
+      name: name,
+      watch_terms: watch_terms,
+      instruction: instruction,
+      cooldown_seconds: cooldown_seconds,
+      max_fires: max_fires,
+      expires_at: expires_at
+    ).to_json
+  )
+  Json.decode[StandingIntent](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn list_intents(db: DbHandle, only_active?: Bool) : Result(List(StandingIntent), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), intents_table()).map_error(table_err)
+      items = rows.map(fn(p) p.1 end).reverse
+      Ok(if only_active?: items.filter(fn(i) i.active? end) else: items)
+    end
+  )
+end
+
+fn cancel_intent(db: DbHandle, id: Int) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "cancel_intent",
+    "cancel standing intent ##{id}",
+    IdArgs(id: id).to_json
+  )
+  Ok(Unit)
+end
+
+fn record_intent_fired(db: DbHandle, id: Int, now_text: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:intents",
+    "record_intent_fired",
+    "record fire on intent ##{id}",
+    RecordIntentFiredArgs(id: id, now_text: now_text).to_json
+  )
+  Ok(Unit)
+end
+
+## Skill usage tracking.
+fn record_skill_usage(db: DbHandle, skill_name: Text, now_text: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:skills",
+    "record_skill_usage",
+    "record usage of skill #{skill_name.trim}",
+    RecordSkillUsageArgs(skill_name: skill_name, now_text: now_text).to_json
+  )
+  Ok(Unit)
+end
+
+fn get_skill_usage_map(db: DbHandle) : Result(Map(Text, Int), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), skill_usage_table()).map_error(table_err)
+      var m = {}
+      for (sname, row) in rows
+        m = m.set(sname, row.read_count)
+      end
+      Ok(m)
+    end
+  )
+end
+
+## Standing Routines + at-most-once slot claims.
+fn upsert_routine_full(
+  db: DbHandle,
+  bot_name: Text,
+  name: Text,
+  prompt: Text,
+  interval_seconds: Int,
+  schedule_kind: Text,
+  schedule_expr: Text,
+  timezone: Text,
+  read_only?: Bool,
+  skip_memory?: Bool,
+  precheck_kind: Text,
+  next_due_at: Text
+) : Result(RoutineSpec, MotetError)
+  rep = try exec_replay(
+    db,
+    "bot:#{bot_name}",
+    "upsert_routine",
+    "schedule routine #{bot_name}:#{name}",
+    UpsertRoutineArgs(
+      bot_name: bot_name,
+      name: name,
+      prompt: prompt,
+      interval_seconds: interval_seconds,
+      schedule_kind: schedule_kind,
+      schedule_expr: schedule_expr,
+      timezone: timezone,
+      read_only: read_only?,
+      skip_memory: skip_memory?,
+      precheck_kind: precheck_kind,
+      next_due_at: next_due_at
+    ).to_json
+  )
+  Json.decode[RoutineSpec](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
 fn upsert_routine(
   db: DbHandle,
   bot_name: Text,
@@ -2073,21 +4211,20 @@ fn upsert_routine(
   read_only?: Bool,
   next_due_at: Text
 ) : Result(RoutineSpec, MotetError)
-  rep = try exec_replay(
+  upsert_routine_full(
     db,
-    "bot:#{bot_name}",
-    "upsert_routine",
-    "upsert routine #{bot_name}:#{name}",
-    UpsertRoutineArgs(
-      bot_name: bot_name,
-      name: name,
-      prompt: prompt,
-      interval_seconds: interval_seconds,
-      read_only: read_only?,
-      next_due_at: next_due_at
-    ).to_json
+    bot_name,
+    name,
+    prompt,
+    interval_seconds,
+    "interval",
+    "",
+    "America/Los_Angeles",
+    read_only?,
+    true,
+    "",
+    next_due_at
   )
-  Json.decode[RoutineSpec](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
 fn list_routines(db: DbHandle) : Result(List(RoutineSpec), MotetError)
@@ -2105,9 +4242,36 @@ fn list_due_routines(db: DbHandle, now_text: Text) : Result(List(RoutineSpec), M
     db,
     fn(ldb)
       rows = try Table.all(Ledger.store(ldb), routines_table()).map_error(table_err)
-      Ok(rows.map(fn(p) p.1 end).filter(fn(r) r.enabled? and r.next_due_at <= now_text end))
+      due = rows.map(fn(p) p.1 end).filter(fn(r)
+        r.enabled? and (r.schedule_kind != "interval" or r.next_due_at <= now_text)
+      end)
+      Ok(due)
     end
   )
+end
+
+fn claim_routine_slot(db: DbHandle, routine_id: Int, slot_key: Text, now_text: Text) : Result(
+  Bool,
+  MotetError
+)
+  comp = "#{routine_id}\u{1f}#{slot_key}"
+  if db.files.read_only.exists?(db.path)
+    fast = with_db_read(
+      db,
+      fn(ldb) Table.get(Ledger.store(ldb), routine_runs_table(), comp).map_error(table_err) end
+    )
+    if fast is Ok(Some(_))
+      return Ok(false)
+    end
+  end
+  rep = try exec_replay(
+    db,
+    "system:scheduler",
+    "claim_routine_slot",
+    "claim routine ##{routine_id} slot #{slot_key}",
+    ClaimRoutineSlotArgs(routine_id: routine_id, slot_key: slot_key, now_text: now_text).to_json
+  )
+  Json.decode[Bool](Json.encode(rep).bytes).map_error(reply_decode_err)
 end
 
 fn mark_routine_ran(db: DbHandle, id: Int, now_text: Text, next_due_at: Text) : Result(
@@ -2116,10 +4280,21 @@ fn mark_routine_ran(db: DbHandle, id: Int, now_text: Text, next_due_at: Text) : 
 )
   _res = try exec_replay(
     db,
-    "scheduler",
+    "system:scheduler",
     "mark_routine_ran",
-    "routine ##{id} finished",
+    "mark routine ##{id} ran",
     MarkRoutineRanArgs(id: id, now_text: now_text, next_due_at: next_due_at).to_json
+  )
+  Ok(Unit)
+end
+
+fn mark_routine_skipped(db: DbHandle, id: Int, next_due_at: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:scheduler",
+    "mark_routine_skipped",
+    "mark routine ##{id} skipped",
+    MarkRoutineSkippedArgs(id: id, next_due_at: next_due_at).to_json
   )
   Ok(Unit)
 end
@@ -2160,7 +4335,7 @@ fn create_approval(
   reason: Text,
   now_text: Text
 ) : Result(ApprovalItem, MotetError)
-  now = db.clock.now
+  now = parse_time(now_text)
   Ledger.locked(
     db.files,
     db.path,
@@ -2202,9 +4377,7 @@ end
 fn get_approval(db: DbHandle, id: Int) : Result(Option(ApprovalItem), MotetError)
   with_db_read(
     db,
-    fn(ldb)
-      Table.get(Ledger.store(ldb), approvals_table(), id).map_error(table_err)
-    end
+    fn(ldb) Table.get(Ledger.store(ldb), approvals_table(), id).map_error(table_err) end
   )
 end
 
@@ -2239,6 +4412,17 @@ fn update_approval(db: DbHandle, id: Int, status: ApprovalStatus, result_text: T
   Ok(Unit)
 end
 
+fn update_approval_args(db: DbHandle, id: Int, arguments_json: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "update_approval_args",
+    "edit draft args for approval ##{id}",
+    UpdateApprovalJsonArgs(id: id, arguments_json: arguments_json).to_json
+  )
+  Ok(Unit)
+end
+
 fn dismiss_all_pending_approvals(db: DbHandle) : Result(Int, MotetError)
   now = db.clock.now
   Ledger.locked(
@@ -2264,6 +4448,42 @@ fn dismiss_all_pending_approvals(db: DbHandle) : Result(Int, MotetError)
         Json.Object({})
       )
       Json.decode[Int](Json.encode(rep).bytes).map_error(reply_decode_err)
+    end
+  )
+end
+
+fn list_repeated_executed_approvals(db: DbHandle, min_count: Int, limit: Int) : Result(
+  List((Text, Text, Int)),
+  MotetError
+)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.lookup(
+        Ledger.store(ldb),
+        approvals_table(),
+        approvals_by_status_index(),
+        "executed"
+      ).map_error(table_err)
+      var counts = {}
+      var labels = {}
+      for (_id, a) in rows
+        k = "#{a.bot_name}\u{1f}#{a.tool_name}"
+        cur = counts.get(k) or 0
+        counts = counts.set(k, cur + 1)
+        labels = labels.set(k, (a.bot_name, a.tool_name))
+      end
+      var items = []
+      for (k, c) in counts.entries
+        if c >= min_count
+          case labels.get(k)
+            Some((bn, tn)): items = items.append((bn, tn, c))
+            None: Unit
+          end
+        end
+      end
+      sorted = items.sort_by(fn(it) it.2 end).reverse
+      Ok(sorted.take(limit))
     end
   )
 end
@@ -2312,12 +4532,13 @@ fn list_artifacts(db: DbHandle, bot_filter: Option(Text)) : Result(List(Artifact
 end
 
 ## Exact Decimal USD spend ledger.
-fn record_spend_ledger(
+fn record_spend_ledger_full(
   db: DbHandle,
   bot_name: Text,
   session_id: Text,
   input_tokens: Int,
   output_tokens: Int,
+  cached_input_tokens: Int,
   cost_usd: Decimal,
   now_text: Text
 ) : Result(Unit, MotetError)
@@ -2331,11 +4552,33 @@ fn record_spend_ledger(
       session_id: session_id,
       input_tokens: input_tokens,
       output_tokens: output_tokens,
+      cached_input_tokens: cached_input_tokens,
       cost_usd: cost_usd,
       now_text: now_text
     ).to_json
   )
   Ok(Unit)
+end
+
+fn record_spend_ledger(
+  db: DbHandle,
+  bot_name: Text,
+  session_id: Text,
+  input_tokens: Int,
+  output_tokens: Int,
+  cost_usd: Decimal,
+  now_text: Text
+) : Result(Unit, MotetError)
+  record_spend_ledger_full(
+    db,
+    bot_name,
+    session_id,
+    input_tokens,
+    output_tokens,
+    0,
+    cost_usd,
+    now_text
+  )
 end
 
 fn bot_spend_total(db: DbHandle, bot_name: Text) : Result(Decimal, MotetError)
@@ -2383,8 +4626,9 @@ fn daily_budget_snapshots(db: DbHandle, day_prefix: Text) : Result(List(BudgetSn
       st = Ledger.store(ldb)
       bot_rows = try Table.all(st, bots_table()).map_error(table_err)
       bots = bot_rows.map(fn(p) p.1 end).sort_by(fn(b)
-        rank = if b.is_primary?: "0" else: "1"
-        "#{rank}:#{b.name}"
+        act = if b.active?: "0" else: "1"
+        pri = if b.is_primary?: "0" else: "1"
+        "#{act}:#{pri}:#{b.name}"
       end)
       var out = []
       for b in bots
@@ -2397,10 +4641,12 @@ fn daily_budget_snapshots(db: DbHandle, day_prefix: Text) : Result(List(BudgetSn
         var spent = 0.0
         var in_toks = 0
         var out_toks = 0
+        var cached_toks = 0
         var turns = 0
         for (_id, r) in rows
           in_toks = in_toks.saturating_add(r.input_tokens)
           out_toks = out_toks.saturating_add(r.output_tokens)
+          cached_toks = cached_toks.saturating_add(r.cached_input_tokens)
           spent = (spent + r.cost_usd).round(6)
           turns += 1
         end
@@ -2413,7 +4659,8 @@ fn daily_budget_snapshots(db: DbHandle, day_prefix: Text) : Result(List(BudgetSn
             remaining_usd: rem,
             turns: turns,
             input_tokens: in_toks,
-            output_tokens: out_toks
+            output_tokens: out_toks,
+            cached_input_tokens: cached_toks
           )
         )
       end
@@ -2422,28 +4669,506 @@ fn daily_budget_snapshots(db: DbHandle, day_prefix: Text) : Result(List(BudgetSn
   )
 end
 
-fn health_summary(db: DbHandle) : Result(HealthSummary, MotetError)
+## Async Bot Runs & Live Steering Queue.
+fn enqueue_run(
+  db: DbHandle,
+  run_id: Text,
+  bot_name: Text,
+  session_id: Text,
+  trust: TrustLevel,
+  routine_read_only?: Bool,
+  prompt: Text,
+  now_text: Text
+) : Result(BotRun, MotetError)
+  rep = try exec_replay(
+    db,
+    "bot:#{bot_name}",
+    "enqueue_run",
+    "enqueue async run #{run_id}",
+    EnqueueRunArgs(
+      run_id: run_id,
+      bot_name: bot_name,
+      session_id: session_id,
+      trust: trust,
+      routine_read_only: routine_read_only?,
+      prompt: prompt,
+      now_text: now_text
+    ).to_json
+  )
+  Json.decode[BotRun](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn get_run(db: DbHandle, run_id: Text) : Result(Option(BotRun), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      row_opt = try Table.get(Ledger.store(ldb), bot_runs_table(), run_id).map_error(table_err)
+      Ok(row_opt.map(bot_run_row_to_public))
+    end
+  )
+end
+
+fn list_runs(db: DbHandle, bot_filter: Option(Text), limit: Int) : Result(List(BotRun), MotetError)
+  cap = if limit > 0 and limit <= 100: limit else: 30
   with_db_read(
     db,
     fn(ldb)
       st = Ledger.store(ldb)
-      bots = try Table.count(st, bots_table()).map_error(table_err)
-      pend = try Table.lookup(st, approvals_table(), approvals_by_status_index(), "pending")
-        .map_error(table_err)
-      conns = try Table.all(st, connectors_table()).map_error(table_err)
-      routines = try Table.all(st, routines_table()).map_error(table_err)
-      en_conns = conns.filter(fn(p) p.1.enabled? end).size
-      en_routines = routines.filter(fn(p) p.1.enabled? end).size
+      rows = case bot_filter
+        Some(b): try Table.lookup(st, bot_runs_table(), bot_runs_by_bot_index(), b).map_error(
+          table_err
+        )
+        None: try Table.all(st, bot_runs_table()).map_error(table_err)
+      end
+      sorted = rows.map(fn(p) bot_run_row_to_public(p.1) end).sort_by(fn(r)
+        "#{r.created_at}:#{r.id}"
+      end).reverse
+      Ok(sorted.take(cap))
+    end
+  )
+end
+
+fn claim_next_queued_run(db: DbHandle, now_text: Text) : Result(Option(BotRun), MotetError)
+  if db.files.read_only.exists?(db.path)
+    fast = with_db_read(
+      db,
+      fn(ldb)
+        Table.lookup(Ledger.store(ldb), bot_runs_table(), bot_runs_by_status_index(), "queued")
+          .map_error(table_err)
+      end
+    )
+    if fast is Ok(qs) and qs.empty?
+      return Ok(None)
+    end
+  end
+  now = parse_time(now_text)
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      queued = try Table.lookup(
+        Ledger.store(ldb),
+        bot_runs_table(),
+        bot_runs_by_status_index(),
+        "queued"
+      ).map_error(table_err)
+      return Ok(None) if queued.empty?
+      oldest = (queued.map(fn(p) p.1 end).sort_by(fn(r) "#{r.created_at}:#{r.id}" end)).first
+      case oldest
+        None: Ok(None)
+        Some(target):
+          (_next_ldb, rep) = try exec_replay_on(
+            ldb,
+            "system:worker",
+            "claim_run",
+            "claim queued run #{target.id}",
+            now,
+            ClaimRunArgs(run_id: target.id, now_text: now_text).to_json
+          )
+          Json.decode[Option(BotRun)](Json.encode(rep).bytes).map_error(reply_decode_err)
+      end
+    end
+  )
+end
+
+fn append_run_steer(db: DbHandle, run_id: Text, mode: Text, message: Text, now_text: Text) : Result(
+  BotRun,
+  MotetError
+)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "append_run_steer",
+    "steer #{mode} on #{run_id}",
+    AppendRunSteerArgs(run_id: run_id, mode: mode, message: message, now_text: now_text).to_json
+  )
+  Json.decode[BotRun](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn parse_steer_json(raw: Text) : List((Text, Text))
+  return [] if raw == "[]" or raw.trim.empty?
+  items = case Json.parse(raw)
+    Ok(Json.Array(arr)): arr
+    Ok(_) | Error(_): []
+  end
+  items.filter_map(fn(v)
+    case v.text_at("mode")
+      Some(m): Some((m, v.text_at("message") or ""))
+      None: None
+    end
+  end)
+end
+
+fn take_run_steers(db: DbHandle, run_id: Text) : Result(List((Text, Text)), MotetError)
+  if db.files.read_only.exists?(db.path)
+    fast = with_db_read(
+      db,
+      fn(ldb) Table.get(Ledger.store(ldb), bot_runs_table(), run_id).map_error(table_err) end
+    )
+    case fast
+      Ok(Some(r)) if r.steer_queue_json == "[]" or r.steer_queue_json.trim.empty?: return Ok([])
+      Ok(None): return Ok([])
+      Ok(_) | Error(_): Unit
+    end
+  end
+  rep = try exec_replay(
+    db,
+    "system:worker",
+    "take_run_steers",
+    "drain steers for #{run_id}",
+    NameArgs(name: run_id).to_json
+  )
+  raw = try Json.decode[Text](Json.encode(rep).bytes).map_error(reply_decode_err)
+  Ok(parse_steer_json(raw))
+end
+
+fn update_run_progress(
+  db: DbHandle,
+  run_id: Text,
+  steps: Int,
+  spent_usd: Decimal,
+  now_text: Text
+) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:worker",
+    "update_run_progress",
+    "progress #{run_id} step #{steps}",
+    UpdateRunProgressArgs(run_id: run_id, steps: steps, spent_usd: spent_usd, now_text: now_text)
+      .to_json
+  )
+  Ok(Unit)
+end
+
+fn finish_run(
+  db: DbHandle,
+  run_id: Text,
+  status: Text,
+  steps: Int,
+  spent_usd: Decimal,
+  reply: Text,
+  error_text: Text,
+  now_text: Text
+) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:worker",
+    "finish_run",
+    "finish #{run_id} -> #{status}",
+    FinishRunArgs(
+      run_id: run_id,
+      status: status,
+      steps: steps,
+      spent_usd: spent_usd,
+      reply: reply,
+      error_text: error_text,
+      now_text: now_text
+    ).to_json
+  )
+  Ok(Unit)
+end
+
+## Webhook Routing & HMAC Config.
+fn upsert_webhook_config(db: DbHandle, cfg: WebhookConfig) : Result(WebhookConfig, MotetError)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "upsert_webhook_config",
+    "upsert webhook #{cfg.source}",
+    cfg.to_json
+  )
+  Json.decode[WebhookConfig](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn get_webhook_config(db: DbHandle, source: Text) : Result(Option(WebhookConfig), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) Table.get(Ledger.store(ldb), webhook_configs_table(), source).map_error(table_err) end
+  )
+end
+
+fn list_webhook_configs(db: DbHandle) : Result(List(WebhookConfig), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), webhook_configs_table()).map_error(table_err)
+      Ok(rows.map(fn(p) p.1 end))
+    end
+  )
+end
+
+fn delete_webhook_config(db: DbHandle, source: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "delete_webhook_config",
+    "delete webhook #{source}",
+    NameArgs(name: source).to_json
+  )
+  Ok(Unit)
+end
+
+## App Settings, Telegram Offset, Push Subscriptions, Analytics & Health.
+fn read_setting_val_from_store(st: Modb.Store, key: Text, fallback: Text) : Result(Text, MotetError)
+  val_opt = try Table.get(st, app_settings_table(), key).map_error(table_err)
+  Ok(
+    case val_opt
+      Some(v) if not v.empty?: v
+      Some(_) | None: fallback
+    end
+  )
+end
+
+fn set_setting_val(db: DbHandle, key: Text, value: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "system:settings",
+    "set_setting_val",
+    "set setting #{key}",
+    SetSettingArgs(key: key, value: value).to_json
+  )
+  Ok(Unit)
+end
+
+fn get_settings(db: DbHandle) : Result(AppSettings, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      tz = try read_setting_val_from_store(st, "timezone", "America/Los_Angeles")
+      qs = try read_setting_val_from_store(st, "quiet_hours_start", "22:00")
+      qe = try read_setting_val_from_store(st, "quiet_hours_end", "07:00")
+      pub = try read_setting_val_from_store(st, "public_url", "")
+      vp = try read_setting_val_from_store(st, "vault_path", "vault")
+      vgr = try read_setting_val_from_store(st, "vault_git_remote", "")
+      tg_en = (try read_setting_val_from_store(st, "telegram_enabled", "0")) == "1"
+      tg_uid = try read_setting_val_from_store(st, "telegram_allowed_user_id", "")
+      tg_bot = try read_setting_val_from_store(st, "telegram_default_bot", "chief")
       Ok(
-        HealthSummary(
-          status: "ok",
-          version: "0.2.0",
-          bots: bots,
-          pending_approvals: pend.size,
-          connectors: en_conns,
-          routines: en_routines
+        AppSettings(
+          timezone: tz,
+          quiet_hours_start: qs,
+          quiet_hours_end: qe,
+          public_url: pub,
+          vault_path: vp,
+          vault_git_remote: vgr,
+          telegram_enabled?: tg_en,
+          telegram_allowed_user_id: tg_uid,
+          telegram_default_bot: tg_bot
         )
       )
+    end
+  )
+end
+
+fn save_settings(db: DbHandle, s: AppSettings) : Result(AppSettings, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "save_settings",
+    "update system settings",
+    s.to_json
+  )
+  get_settings(db)
+end
+
+fn get_telegram_offset(db: DbHandle) : Result(Int, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      raw = try read_setting_val_from_store(Ledger.store(ldb), "telegram_last_update_id", "0")
+      Ok(raw.to_int or 0)
+    end
+  )
+end
+
+fn set_telegram_offset(db: DbHandle, offset: Int) : Result(Unit, MotetError)
+  set_setting_val(db, "telegram_last_update_id", "#{offset}")
+end
+
+fn save_push_subscription(db: DbHandle, sub: PushSubscription, now_text: Text) : Result(
+  PushSubscription,
+  MotetError
+)
+  rep = try exec_replay(
+    db,
+    "operator",
+    "save_push_subscription",
+    "register push subscription",
+    SavePushSubArgs(sub: sub, now_text: now_text).to_json
+  )
+  Json.decode[PushSubscription](Json.encode(rep).bytes).map_error(reply_decode_err)
+end
+
+fn list_push_subscriptions(db: DbHandle) : Result(List(PushSubscription), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      rows = try Table.all(Ledger.store(ldb), push_subscriptions_table()).map_error(table_err)
+      sorted = rows.map(fn(p) p.1 end).sort_by(fn(s) "#{s.created_at}:#{s.endpoint}" end).reverse
+      Ok(sorted)
+    end
+  )
+end
+
+fn delete_push_subscription(db: DbHandle, endpoint: Text) : Result(Unit, MotetError)
+  _res = try exec_replay(
+    db,
+    "operator",
+    "delete_push_subscription",
+    "delete push subscription",
+    NameArgs(name: endpoint).to_json
+  )
+  Ok(Unit)
+end
+
+fn analytics_summary(db: DbHandle, day_prefix: Text) : Result(AnalyticsSummary, MotetError)
+  by_bot = try daily_budget_snapshots(db, day_prefix)
+  var tot_usd = 0.0
+  var tot_in = 0
+  var tot_out = 0
+  var tot_cached = 0
+  for b in by_bot
+    tot_usd = (tot_usd + b.spent_usd).round(6)
+    tot_in = tot_in.saturating_add(b.input_tokens)
+    tot_out = tot_out.saturating_add(b.output_tokens)
+    tot_cached = tot_cached.saturating_add(b.cached_input_tokens)
+  end
+  cache_pct = if tot_in > 0: (tot_cached * 100) / tot_in else: 0
+  routines = try list_routines(db)
+  var r_runs = 0
+  var r_skips = 0
+  for r in routines
+    r_runs = r_runs.saturating_add(r.run_count)
+    r_skips = r_skips.saturating_add(r.skip_count)
+  end
+  pending = (try list_approvals(db, true)).size
+  active_bots = (try list_bots(db)).filter(fn(b) b.active? end).size
+  Ok(
+    AnalyticsSummary(
+      day: day_prefix,
+      total_spent_usd: tot_usd,
+      total_input_tokens: tot_in,
+      total_output_tokens: tot_out,
+      total_cached_tokens: tot_cached,
+      cache_hit_pct: cache_pct,
+      routines_total_runs: r_runs,
+      routines_total_skips: r_skips,
+      pending_approvals: pending,
+      active_bots: active_bots,
+      by_bot: by_bot
+    )
+  )
+end
+
+fn health_summary(db: DbHandle, env: Env) : Result(HealthSummary, MotetError)
+  (bots, pending, conns, routines, qruns, psubs, tg_en) = try with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      bs = try Table.all(st, bots_table()).map_error(table_err)
+      active_bs = bs.filter(fn(p) p.1.active? end).size
+      pend = try Table.lookup(st, approvals_table(), approvals_by_status_index(), "pending")
+        .map_error(table_err)
+      cs = try Table.all(st, connectors_table()).map_error(table_err)
+      en_conns = cs.filter(fn(p) p.1.enabled? end).size
+      rs = try Table.all(st, routines_table()).map_error(table_err)
+      en_routines = rs.filter(fn(p) p.1.enabled? end).size
+      qs = try Table.lookup(st, bot_runs_table(), bot_runs_by_status_index(), "queued").map_error(
+        table_err
+      )
+      runs = try Table.lookup(st, bot_runs_table(), bot_runs_by_status_index(), "running")
+        .map_error(table_err)
+      ps = try Table.count(st, push_subscriptions_table()).map_error(table_err)
+      tg = (try read_setting_val_from_store(st, "telegram_enabled", "0")) == "1"
+      Ok((active_bs, pend.size, en_conns, en_routines, qs.size + runs.size, ps, tg))
+    end
+  )
+  vsecs = if not db.files.read_only.exists?(db.secrets_path)
+    0
+  else
+    case Modb.with_shared_lock(
+      db.files.read_only,
+      db.secrets_path,
+      modb_err,
+      fn(st) Table.count(st, vault_secrets_table()).map_error(table_err) end
+    )
+      Ok(n): n
+      Error(_): 0
+    end
+  end
+  Ok(
+    HealthSummary(
+      status: "ok",
+      version: "0.2.0",
+      bots: bots,
+      pending_approvals: pending,
+      connectors: conns,
+      routines: routines,
+      queued_runs: qruns,
+      vault_secrets: vsecs,
+      master_key_set?: Vault.master_key_configured?(env),
+      telegram_enabled?: tg_en,
+      push_subscriptions: psubs
+    )
+  )
+end
+
+## One-time migration import helpers (for `migrate-sqlite.mo`).
+fn import_snapshot(db: DbHandle, snap: MigrationSnapshot) : Result(Unit, MotetError)
+  now = db.clock.now
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (ldb1, _rep) = try exec_replay_on(
+        ldb,
+        "system:migration",
+        "import_snapshot",
+        "import SQLite snapshot (#{snap.sessions.size} sessions, #{snap.events.size} events)",
+        now,
+        snap.to_json
+      )
+      bots = try Table.all(Ledger.store(ldb1), bots_table()).map_error(table_err)
+      var cur_ldb = ldb1
+      for (_k, b) in bots
+        (next_ldb, _g) = try ensure_bot_root_grant_on(cur_ldb, b.name, now)
+        cur_ldb = next_ldb
+      end
+      Ok(Unit)
+    end
+  )
+end
+
+fn import_secrets_snapshot(
+  db: DbHandle,
+  pendings: List(OAuthPending),
+  tokens: List(ConnectorTokenRow),
+  secrets: List(VaultSecretRow)
+) : Result(Unit, MotetError)
+  Modb.with_exclusive_lock(
+    db.files,
+    db.secrets_path,
+    modb_err,
+    fn(st)
+      var tx = Modb.begin_write(st)
+      for p in pendings
+        tx = try Table.put(tx, oauth_pending_table(), p.state, p).map_error(table_err)
+      end
+      for t in tokens
+        tx = try Table.put(tx, connector_tokens_table(), t.connector_name, t).map_error(table_err)
+      end
+      for s in secrets
+        tx = try Table.put(tx, vault_secrets_table(), s.name, s).map_error(table_err)
+      end
+      _s1 = try Modb.commit(tx).map_error(modb_err)
+      Ok(Unit)
     end
   )
 end
@@ -2646,120 +5371,91 @@ fn discard_replay_proposal(db: DbHandle, id: Text, principal: Text, now: Time) :
   )
 end
 
-test "store seeds default roster, persists append-only events, and searches FTS tokens"
+test "store seeds specialist roster, seals vault secrets & OAuth tokens, supports canonical chats and async runs"
   files = Files.in_memory({})
-  t0 = Time.parse("2026-11-22T00:00:00Z") or stop "time"
+  t0 = Time.parse("2026-11-25T00:00:00Z") or stop "time"
   now = t0.to_text
   clock = Clock.fixed(t0)
   db = open(files, clock)
+  env = Env.of({"MOTET_MASTER_KEY": "test-master-key-123"})
+  srng = SecureRandom.seeded(99)
 
   assert seed_defaults(db, now) is Ok(Unit)
   assert list_bots(db) is Ok(bots)
-  assert bots.size == 3
-  assert create_session(db, "sess-1", "chief", "PR triage", Owner, now) is Ok(_)
+  assert bots.size == 7
+  assert bots.filter(fn(b) b.active? end).size == 5
+
+  # Finance specialist wall check: gmail-personal is strictly read-only
+  assert get_bot(db, "finance") is Ok(Some(fin))
+  assert fin.connectors.contains?("hearth-arvo") and fin.read_only_connectors == ["gmail-personal"]
+
+  # Bot clone & toggle lifecycle
+  assert clone_bot(db, "researcher", "travel", Some("Travel Planner"), None, None, None) is Ok(trv)
+  assert trv.name == "travel" and trv.provider == Gemini and trv.active?
+  assert set_bot_active(db, "travel", Some(false)) is Ok(trv_off) and not trv_off.active?
+
+  # Write-only Vault secret seal + resolve (physically isolated in motet-secrets.modb!)
+  assert save_vault_secret(db, env, srng, "GEMINI_API_KEY", "llm", "gem-secret-abc", now) is
+    Ok(meta)
+  assert meta.name == "GEMINI_API_KEY" and meta.source == "vault"
+  assert resolve_secret(db, env, "GEMINI_API_KEY") == Ok(Some("gem-secret-abc"))
+  assert save_connector_token_sealed(db, env, srng, "notion", "ntn-live-tok", "read", "", now) is
+    Ok(Unit)
+  assert get_connector_token(db, "notion") is Ok(Some(raw_ct)) and raw_ct.starts_with?("enc:v1:")
+  assert get_connector_token_opened(db, env, "notion") == Ok(Some("ntn-live-tok"))
+
+  # Secrets MUST NEVER appear in portable export, audit ledger, or views!
+  assert export_snapshot(db, t0) is Ok(snap)
+  snap_json = Json.encode(snap)
+  assert not snap_json.contains?("gem-secret-abc") and not snap_json.contains?("ntn-live-tok")
+  assert audit_tail(db, 100) is Ok(aud)
+  aud_json = Json.encode(aud)
+  assert not aud_json.contains?("gem-secret-abc") and not aud_json.contains?("ntn-live-tok")
+
+  # Canonical forever-chat + incremental event tailing + FTS
+  assert get_or_create_canonical_session(db, "chief", now) is Ok(canon)
+  assert canon.id == "chief-main" and canon.canonical?
   assert append_event(
     db,
-    "sess-1",
+    canon.id,
     "message",
     "user",
-    "Check PR 412 latency regression",
+    "Check Mercury receipts",
     None,
     None,
     0.0,
     now
   ) is
-    Ok(_)
-  assert search_events(db, "latency regression", 10) is Ok(hits)
-  assert hits.size == 1
-  assert save_memory(db, "shared", "profile", "Timezone is America/New_York", "user", now) is Ok(m1)
-  assert search_memories(db, Some("chief"), "New_York") is Ok(mems)
-  assert mems.size == 1
-  assert delete_memory(db, m1.id) is Ok(Unit)
-  assert list_memories(db, None, 10) is Ok(mems_after) and mems_after.empty?
+    Ok(e1)
+  assert append_event(db, canon.id, "status", "system", "Reading finance", None, None, 0.0, now) is
+    Ok(e2)
+  assert list_events_after(db, canon.id, e1.seq, 50) is Ok(tail) and
+    tail.size == 1 and
+    tail.first is Some(t_last) and
+    t_last.seq == e2.seq
+  assert search_events(db, "Mercury receipts", 10) is Ok(hits) and hits.size == 1
 
-  # Approval deduplication (exact + read-only routine coalesce) and bulk dismiss
-  assert create_approval(
-    db,
-    "watcher",
-    "s1",
-    "memory_save",
-    "{\"content\":\"run 1\"}",
-    WriteLocal,
-    "read-only routine paused local write",
-    now
-  ) is
-    Ok(a1)
-  assert create_approval(
-    db,
-    "watcher",
-    "s2",
-    "memory_save",
-    "{\"content\":\"run 2\"}",
-    WriteLocal,
-    "read-only routine paused local write",
-    "2026-11-22T00:15:00Z"
-  ) is
-    Ok(a2)
-  assert a1.id == a2.id and a2.session_id == "s2"
-  assert dismiss_all_pending_approvals(db) is Ok(1)
-  assert list_approvals(db, true) is Ok(pend) and pend.empty?
+  # Async run enqueue + atomic claim + live steer queue
+  assert enqueue_run(db, "run-1", "chief", canon.id, Owner, false, "Morning brief", now) is Ok(r1)
+  assert r1.status == "queued"
+  assert claim_next_queued_run(db, now) is Ok(Some(claimed)) and claimed.status == "running"
+  assert claim_next_queued_run(db, now) == Ok(None)
+  assert append_run_steer(db, "run-1", "steer", "Skip calendar details", now) is Ok(_)
+  assert take_run_steers(db, "run-1") == Ok([("steer", "Skip calendar details")])
+  assert take_run_steers(db, "run-1") == Ok([])
 
-  # Cross-process daily budget ledger aggregation
-  assert record_spend_ledger(db, "watcher", "s1", 1000, 200, 0.0002, now) is Ok(Unit)
-  assert daily_budget_snapshots(db, utc_day_prefix(now)) is Ok(snaps) and snaps.size == 3
-  assert bot_daily_spend(db, "watcher", "2026-11-22") == Ok(0.0002)
+  # Cache-aware daily budget ledger
+  assert record_spend_ledger_full(db, "chief", canon.id, 1000, 100, 800, 0.00156, now) is Ok(Unit)
+  assert daily_budget_snapshots(db, utc_day_prefix(now)) is Ok(snaps)
+  assert snaps.find(fn(s) s.bot_name == "chief" end) is Some(cs) and cs.cached_input_tokens == 800
 
-  # Routine & connector toggle/delete
-  assert set_routine_enabled(db, 1, Some(false)) is Ok(rt_off) and not rt_off.enabled?
-  assert set_connector_enabled(db, "t3code", Some(false)) is Ok(c_off) and not c_off.enabled?
-  assert verify_all(db) is Ok(rep) and rep.ok?
-end
-
-test "Modb Store physically isolates OAuth secrets from audit, replay, views, and export"
-  files = Files.in_memory({})
-  t0 = Time.parse("2026-11-22T00:00:00Z") or stop "time"
-  clock = Clock.fixed(t0)
-  db = open(files, clock)
-  assert seed_defaults(db, t0.to_text) is Ok(Unit)
-
-  pkce = "super-secret-pkce-verifier-999"
-  tok = "secret-oauth-bearer-token-xyz"
-  assert save_oauth_pending(
-    db,
-    OAuthPending(
-      state: "st-1",
-      connector_name: "t3code",
-      client_id: "cid-1",
-      redirect_uri: "http://localhost:8787/oauth/callback",
-      code_verifier: pkce,
-      token_endpoint: "https://auth.example.com/token",
-      resource: "mcp",
-      created_at: t0.to_text
-    )
-  ) is
-    Ok(Unit)
-  assert save_connector_token(db, "t3code", tok, "read write", "2026-11-23T00:00:00Z", t0.to_text) is
-    Ok(Unit)
-  assert get_connector_token(db, "t3code") == Ok(Some(tok))
-  assert get_connector_token_meta(db, "t3code") == Ok(Some(("read write", "2026-11-23T00:00:00Z")))
-  assert take_oauth_pending(db, "st-1") is Ok(Some(pending)) and pending.code_verifier == pkce
-  assert take_oauth_pending(db, "st-1") == Ok(None)
-
-  # Secrets MUST NEVER appear in portable export, audit ledger, replay log, or views!
-  assert export_snapshot(db, t0) is Ok(snap)
-  snap_json = Json.encode(snap)
-  assert not snap_json.contains?(tok) and not snap_json.contains?(pkce)
-  assert audit_tail(db, 100) is Ok(aud)
-  aud_json = Json.encode(aud)
-  assert not aud_json.contains?(tok) and not aud_json.contains?(pkce)
-  assert describe_for_caller(db, "operator", None, t0) is Ok(manifest)
-  assert manifest.allowed_views.size == 4
+  # Verify integrity across main + secrets DBs
   assert verify_all(db) is Ok(vrep) and vrep.ok? and vrep.secrets_ok?
 end
 
 test "Modb Store enforces invariants, supports lossless selective-undo Replay, Grants, and Claims"
   files = Files.in_memory({})
-  t0 = Time.parse("2026-11-22T00:00:00Z") or stop "time"
+  t0 = Time.parse("2026-11-25T00:00:00Z") or stop "time"
   clock = Clock.fixed(t0)
   db = open(files, clock)
   assert seed_defaults(db, t0.to_text) is Ok(Unit)
@@ -2769,33 +5465,35 @@ test "Modb Store enforces invariants, supports lossless selective-undo Replay, G
   assert record_spend_ledger(db, "chief", "s1", 10, 5, -1.0, t0.to_text) is
     Error(BadInput(message: _))
 
-  # 2. Lossless selective-undo Replay removes bot:watcher memories while keeping user memories & seed bots
+  # 2. Lossless selective-undo Replay removes bot:researcher memories while keeping user memories & seed bots
   assert save_memory(db, "shared", "fact", "Keep user preference", "user", t0.to_text) is Ok(_)
-  assert save_memory(db, "watcher", "work_log", "Bad noisy log", "bot:watcher", t0.to_text) is Ok(_)
+  assert save_memory(db, "researcher", "work_log", "Bad noisy log", "bot:researcher", t0.to_text) is
+    Ok(_)
   assert simulate_replay(
     db,
-    "undo-watcher",
-    "Remove bot:watcher writes",
-    Replay.ExcludePrincipal(principal: "bot:watcher"),
+    "undo-researcher",
+    "Remove bot:researcher writes",
+    Replay.ExcludePrincipal(principal: "bot:researcher"),
     "operator",
     t0
   ) is
     Ok(prop)
   assert prop.summary.excluded == 1
-  assert accept_replay_proposal(db, "undo-watcher", "operator", "clean noisy watcher", t0) is Ok(_)
+  assert accept_replay_proposal(db, "undo-researcher", "operator", "clean noisy researcher", t0) is
+    Ok(_)
   assert list_memories(db, None, 20) is Ok(mems) and mems.size == 1
   assert (mems.first or stop "m").content == "Keep user preference"
-  assert list_bots(db) is Ok(bots) and bots.size == 3
+  assert list_bots(db) is Ok(bots) and bots.size == 7
 
   # 3. Attenuated Grants + cascading revocation
-  assert delegate_bot_grant(db, "chief", "bot:chief", "del:chief-builder", "builder", true, 3, t0) is
+  assert delegate_bot_grant(db, "chief", "bot:chief", "del:chief-finance", "finance", true, 3, t0) is
     Ok(cg)
   assert cg.allowed_actions == ["read"]
-  assert authorize_grant_action(db, "del:chief-builder", "write_local", t0) is
+  assert authorize_grant_action(db, "del:chief-finance", "write_local", t0) is
     Error(PolicyDenied(message: _))
-  assert authorize_grant_action(db, "del:chief-builder", "read", t0) is Ok(_)
+  assert authorize_grant_action(db, "del:chief-finance", "read", t0) is Ok(_)
   assert revoke_grant(db, "bot:chief", "operator", "rotate chief", t0) is Ok(_)
-  assert authorize_grant_action(db, "del:chief-builder", "read", t0) is
+  assert authorize_grant_action(db, "del:chief-finance", "read", t0) is
     Error(PolicyDenied(message: _))
 
   # 4. Claims mutual exclusion for routine execution
@@ -2803,5 +5501,7 @@ test "Modb Store enforces invariants, supports lossless selective-undo Replay, G
   assert try_claim_routine(db, 1, "worker-2", t0, 300) == Ok(false)
   assert release_routine_claim(db, 1, "worker-1", t0) == Ok(Unit)
   assert try_claim_routine(db, 1, "worker-2", t0, 300) == Ok(true)
+  assert describe_for_caller(db, "operator", None, t0) is Ok(manifest) and
+    manifest.allowed_views.size == 4
   assert verify_all(db) is Ok(v) and v.ok?
 end
