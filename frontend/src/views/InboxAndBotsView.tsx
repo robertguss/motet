@@ -335,14 +335,14 @@ export const BotsView: React.FC<{
       },
       gemini_flash: {
         provider: 'gemini' as ProviderKind,
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3-flash-preview',
         model_tier: 'gemini_flash',
         endpoint: 'https://generativelanguage.googleapis.com/v1beta/models',
         api_key_env: 'GEMINI_API_KEY',
       },
       gemini_pro: {
         provider: 'gemini' as ProviderKind,
-        model: 'gemini-2.5-pro',
+        model: 'gemini-3.1-pro-preview',
         model_tier: 'gemini_pro',
         endpoint: 'https://generativelanguage.googleapis.com/v1beta/models',
         api_key_env: 'GEMINI_API_KEY',

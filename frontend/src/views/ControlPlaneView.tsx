@@ -290,9 +290,9 @@ export const ModelsView: React.FC<{
             calling and cached token accounting.
           </div>
           <div className="text-xs font-mono flex flex-col gap-1">
-            <div>gemini-2.5-pro · gemini_pro ($1.25 / $10.00)</div>
-            <div>gemini-2.5-flash · gemini_flash ($0.15 / $0.60)</div>
-            <div>gemini-2.5-flash-lite · gemini_lite ($0.075 / $0.30)</div>
+            <div>gemini-3.1-pro-preview · gemini_pro ($1.25 / $10.00)</div>
+            <div>gemini-3-flash-preview · gemini_flash ($0.15 / $0.60)</div>
+            <div>gemini-3.1-flash-lite · gemini_lite ($0.075 / $0.30)</div>
           </div>
         </Card>
       </div>

@@ -458,7 +458,7 @@ fn post_bot(_op: Operator, db: Sqlite.Database, clock: Clock, body: CreateBotReq
   default_model = case provider
     OpenAiCompat: "gpt-4.1"
     Anthropic: "claude-sonnet-5-5"
-    Gemini: "gemini-2.5-flash"
+    Gemini: "gemini-3-flash-preview"
   end
   default_tier = case provider
     Gemini: "gemini_flash"

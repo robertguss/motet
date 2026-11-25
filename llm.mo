@@ -510,8 +510,9 @@ fn chat_turn_with_key(
       end
     end
     if not resp.ok?
-      err_txt = resp.text or ""
-      return Error(UpstreamFailed(message: "LLM HTTP #{resp.status}: #{err_txt.lines.first or ""}"))
+      err_txt = (resp.text or "").replace("\n", " ").replace("\r", "").trim
+      err_short = Text.from_chars(err_txt.chars.take(240))
+      return Error(UpstreamFailed(message: "LLM HTTP #{resp.status}: #{err_short}"))
     end
     doc = try resp.json.map_error(
       fn(e) UpstreamFailed(message: "LLM response JSON parse error: #{e}") end
