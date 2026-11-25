@@ -141,7 +141,7 @@ fn parse_openai_response(doc: Json) : Result(LlmResponse, MotetError)
           Some(other): other.to_text
           None: "{}"
         end
-        Some(ToolCallReq(id: cid, name: fname, arguments_json: args_str))
+        Some(ToolCallReq(id: cid, name: fname, arguments_json: args_str, thought_signature: None))
       None: None
     end
   end)
@@ -285,7 +285,9 @@ fn parse_anthropic_response(doc: Json) : Result(LlmResponse, MotetError)
         Some(fname):
           cid = b.text_at("id") or "toolu_#{idx + 1}"
           inp = b.get("input") or Json.Object({})
-          calls = calls.append(ToolCallReq(id: cid, name: fname, arguments_json: inp.to_text))
+          calls = calls.append(
+            ToolCallReq(id: cid, name: fname, arguments_json: inp.to_text, thought_signature: None)
+          )
         None: Unit
       end
     end
@@ -368,12 +370,14 @@ fn build_gemini_payload(tiers: PromptTiers, messages: List(LlmMessage), tools: L
           parts = parts.append(Json.Object({"text": Json.String(c)}))
         end
         for tc in tcs
+          sig = tc.thought_signature or "skip_thought_signature_validator"
           parts = parts.append(
             Json.Object({
               "functionCall": Json.Object({
                 "name": Json.String(tc.name),
                 "args": parse_json_or_empty_obj(tc.arguments_json)
-              })
+              }),
+              "thoughtSignature": Json.String(sig)
             })
           )
         end
@@ -426,7 +430,15 @@ fn parse_gemini_response(doc: Json) : Result(LlmResponse, MotetError)
           Some(fname):
             cid = fc.text_at("id") or "gem_call_#{idx + 1}"
             fargs = fc.get("args") or Json.Object({})
-            calls = calls.append(ToolCallReq(id: cid, name: fname, arguments_json: fargs.to_text))
+            sig = p.text_at("thoughtSignature")
+            calls = calls.append(
+              ToolCallReq(
+                id: cid,
+                name: fname,
+                arguments_json: fargs.to_text,
+                thought_signature: sig
+              )
+            )
           None: Unit
         end
       None: Unit
@@ -608,8 +620,8 @@ test "OpenAI-compatible, Anthropic (with parallel tool_result merge), and native
     AssistantMsg(
       content: "",
       tool_calls: [
-        ToolCallReq(id: "t1", name: "memory_save", arguments_json: "{}"),
-        ToolCallReq(id: "t2", name: "memory_save", arguments_json: "{}")
+        ToolCallReq(id: "t1", name: "memory_save", arguments_json: "{}", thought_signature: None),
+        ToolCallReq(id: "t2", name: "memory_save", arguments_json: "{}", thought_signature: None)
       ]
     ),
     ToolResultMsg(tool_call_id: "t1", tool_name: "memory_save", content: "ok1"),

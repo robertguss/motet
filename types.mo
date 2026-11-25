@@ -326,6 +326,7 @@ struct ToolCallReq
   id: Text
   name: Text
   arguments_json: Text
+  thought_signature: Option(Text)
 end
 
 struct AskRequest

@@ -1127,7 +1127,14 @@ test "Brain pauses WriteExternal, supports edited approval + Always-Allow rule +
   m2 = m1.append(
     AssistantMsg(
       content: "Drafting email to Sarah.",
-      tool_calls: [ToolCallReq(id: "toolu_1", name: "connector_call", arguments_json: orig_args)]
+      tool_calls: [
+        ToolCallReq(
+          id: "toolu_1",
+          name: "connector_call",
+          arguments_json: orig_args,
+          thought_signature: None
+        )
+      ]
     )
   ).append(ToolResultMsg(tool_call_id: "toolu_1", tool_name: "connector_call", content: paused_obs))
   req2 = build_http_request(work_bot, "test-ant", tiers, m2, tool_defs)
@@ -1284,7 +1291,14 @@ test "Brain enforces strict specialist wall, delegates chief -> finance (Gemini)
     UserMsg(content: framed),
     AssistantMsg(
       content: "",
-      tool_calls: [ToolCallReq(id: "gem_call_1", name: "connector_call", arguments_json: bad_call)]
+      tool_calls: [
+        ToolCallReq(
+          id: "gem_call_1",
+          name: "connector_call",
+          arguments_json: bad_call,
+          thought_signature: None
+        )
+      ]
     ),
     ToolResultMsg(tool_call_id: "gem_call_1", tool_name: "connector_call", content: wall_obs)
   ]
@@ -1296,7 +1310,14 @@ test "Brain enforces strict specialist wall, delegates chief -> finance (Gemini)
     UserMsg(content: "Morning finance check"),
     AssistantMsg(
       content: "Asking finance.",
-      tool_calls: [ToolCallReq(id: "toolu_del", name: "bot_delegate", arguments_json: del_args)]
+      tool_calls: [
+        ToolCallReq(
+          id: "toolu_del",
+          name: "bot_delegate",
+          arguments_json: del_args,
+          thought_signature: None
+        )
+      ]
     ),
     ToolResultMsg(tool_call_id: "toolu_del", tool_name: "bot_delegate", content: del_obs)
   ]
