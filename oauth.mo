@@ -10,7 +10,10 @@ secure_random_token,
 discover,
 register_client,
 build_authorize_url,
-exchange_code
+exchange_code,
+google_authorize_url,
+exchange_google_code,
+refresh_google_token
 use Crypto
 use Http
 use Json
@@ -269,6 +272,94 @@ fn exchange_code(
   )
   scope = doc.text_at("scope") or ""
   exp = doc.int_at("expires_in") or 2592000
+  Ok(OAuthTokenResponse(access_token: tok, scope: scope, expires_in: exp))
+end
+
+## Builds Google OAuth 2.0 + PKCE authorize URL requesting offline refresh_token for Gmail, Calendar, and Docs.
+fn google_authorize_url(client_id: Text, redirect_uri: Text, code_challenge: Text, state: Text) : Text
+  scopes = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/documents"
+  ].join(" ")
+  qs = [
+    "response_type=code",
+    "client_id=#{percent_encode(client_id.trim)}",
+    "redirect_uri=#{percent_encode(redirect_uri.trim)}",
+    "scope=#{percent_encode(scopes)}",
+    "access_type=offline",
+    "prompt=consent",
+    "code_challenge=#{percent_encode(code_challenge)}",
+    "code_challenge_method=S256",
+    "state=#{percent_encode(state)}"
+  ].join("&")
+  "https://accounts.google.com/o/oauth2/v2/auth?#{qs}"
+end
+
+## Exchanges a Google OAuth 2.0 authorization code for `(access_token, optional refresh_token)`.
+fn exchange_google_code(
+  network: Network,
+  code: Text,
+  redirect_uri: Text,
+  client_id: Text,
+  client_secret: Text,
+  code_verifier: Text
+) : Result((OAuthTokenResponse, Option(Text)), MotetError)
+  endpoint = "https://oauth2.googleapis.com/token"
+  scoped = network.allow_hosts(["oauth2.googleapis.com:443"])
+  req = Http.post(endpoint).header("Accept", "application/json").form([
+    ("grant_type", "authorization_code"),
+    ("code", code),
+    ("redirect_uri", redirect_uri),
+    ("client_id", client_id.trim),
+    ("client_secret", client_secret.trim),
+    ("code_verifier", code_verifier)
+  ]).within(25.seconds)
+  resp = try req.send(scoped).map_error(
+    fn(e) UpstreamFailed(message: "Google OAuth token exchange: #{e}") end
+  )
+  if not resp.ok?
+    detail = (resp.text or "HTTP #{resp.status}").replace("\n", " ").trim
+    return Error(UpstreamFailed(message: "Google OAuth HTTP #{resp.status}: #{detail}"))
+  end
+  doc = try resp.json.map_error(fn(e) UpstreamFailed(message: "Google OAuth JSON: #{e}") end)
+  tok = try doc.text_at("access_token").or_fail(
+    UpstreamFailed(message: "Google OAuth response missing access_token")
+  )
+  scope = doc.text_at("scope") or "gmail calendar docs"
+  exp = doc.int_at("expires_in") or 3600
+  ref_tok = doc.text_at("refresh_token")
+  Ok((OAuthTokenResponse(access_token: tok, scope: scope, expires_in: exp), ref_tok))
+end
+
+## Exchanges a sealed Google refresh_token for a fresh short-lived access_token transparently.
+fn refresh_google_token(network: Network, client_id: Text, client_secret: Text, refresh_token: Text) : Result(
+  OAuthTokenResponse,
+  MotetError
+)
+  endpoint = "https://oauth2.googleapis.com/token"
+  scoped = network.allow_hosts(["oauth2.googleapis.com:443"])
+  req = Http.post(endpoint).header("Accept", "application/json").form([
+    ("grant_type", "refresh_token"),
+    ("client_id", client_id.trim),
+    ("client_secret", client_secret.trim),
+    ("refresh_token", refresh_token.trim)
+  ]).within(20.seconds)
+  resp = try req.send(scoped).map_error(
+    fn(e) UpstreamFailed(message: "Google OAuth refresh: #{e}") end
+  )
+  if not resp.ok?
+    detail = (resp.text or "HTTP #{resp.status}").replace("\n", " ").trim
+    return Error(UpstreamFailed(message: "Google OAuth refresh HTTP #{resp.status}: #{detail}"))
+  end
+  doc = try resp.json.map_error(
+    fn(e) UpstreamFailed(message: "Google OAuth refresh JSON: #{e}") end
+  )
+  tok = try doc.text_at("access_token").or_fail(
+    UpstreamFailed(message: "Google refresh response missing access_token")
+  )
+  scope = doc.text_at("scope") or "gmail calendar docs"
+  exp = doc.int_at("expires_in") or 3600
   Ok(OAuthTokenResponse(access_token: tok, scope: scope, expires_in: exp))
 end
 

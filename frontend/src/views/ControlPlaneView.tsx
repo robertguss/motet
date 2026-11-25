@@ -109,6 +109,36 @@ export const ConnectorsView: React.FC<{
       <SectionHeader
         title="Connectors & Sidecars"
         subtitle="Mount work, personal, finance, and local MCP sidecars (tobi/qmd, Notion, Google, Todoist, Hearth Arvo)."
+        actions={
+          <div className="flex gap-2 flex-wrap">
+            {(['work', 'personal'] as const).map((acct) => (
+              <Button
+                key={acct}
+                size="sm"
+                variant="ghost"
+                onClick={async () => {
+                  try {
+                    const r = await api<{ authorize_url: string }>(
+                      `/v1/connectors/google/${acct}/oauth/start`,
+                      {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          redirect_uri: `${window.location.origin}/oauth/callback`,
+                        }),
+                      }
+                    );
+                    window.location.href = r.authorize_url;
+                  } catch (e) {
+                    toast((e as Error).message);
+                  }
+                }}
+              >
+                <Link2 className="w-3.5 h-3.5" />
+                <span>Connect Google ({acct})</span>
+              </Button>
+            ))}
+          </div>
+        }
       />
 
       <Card>

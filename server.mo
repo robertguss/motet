@@ -99,9 +99,6 @@ api
   actor scheduler: SchedulerActor
   auth Operator via authenticate
 
-  job "motet.runs" job_drain_runs every 1.second
-  job "motet.routines" job_run_routines every 1.minute
-  job "motet.telegram" job_poll_telegram every 3.seconds
   job "motet.dreaming" job_run_dreaming every 1.hour
 
   get "/" get_ui
@@ -181,6 +178,7 @@ api
   get "/v1/connectors/auth" get_connectors_auth
   post "/v1/connectors" post_connector
   post "/v1/connectors/gdocs/publish" post_gdocs_publish
+  post "/v1/connectors/google/:account/oauth/start" post_google_oauth_start
   post "/v1/connectors/:name/toggle" post_toggle_connector
   post "/v1/connectors/:name/oauth/start" post_connector_oauth_start
   post "/v1/connectors/:name/test" post_test_connector
@@ -1265,6 +1263,49 @@ fn get_connectors_auth(_op: Operator, db: Sqlite.Database, env: Env, clock: Cloc
   Ok(out)
 end
 
+## Starts Google OAuth 2.0 + PKCE sign-in for isolated Work or Personal Google connectors
+## (`gmail-*`, `gcal-*`, `gdocs-*`), requesting an offline refresh_token stored sealed in Vault.
+fn post_google_oauth_start(
+  _op: Operator,
+  db: Sqlite.Database,
+  env: Env,
+  clock: Clock,
+  srng: SecureRandom,
+  account: Text,
+  body: StartOAuthRequest
+) : Result(StartOAuthResponse, MotetError)
+  try ensure_ready(db, clock)
+  acct = if account.trim.ascii_lowercase == "work": "work" else: "personal"
+  redir = body.redirect_uri.trim
+  valid_redir = redir.starts_with?("https://") or
+    redir.starts_with?("http://localhost") or
+    redir.starts_with?("http://127.0.0.1")
+  if not valid_redir
+    return Error(BadInput(message: "redirect_uri must be https:// or loopback http://"))
+  end
+  cid = try (try Store.resolve_secret(db, env, "GOOGLE_OAUTH_CLIENT_ID")).or_fail(
+    BadInput(message: "Seal GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET in Vault first.")
+  )
+  verifier = Oauth.secure_random_token(srng, 48)
+  state = Oauth.secure_random_token(srng, 24)
+  challenge = Oauth.pkce_s256(verifier)
+  try Store.save_oauth_pending(
+    db,
+    Store.OAuthPending(
+      state: state,
+      connector_name: "google:#{acct}",
+      client_id: cid.trim,
+      redirect_uri: redir,
+      code_verifier: verifier,
+      token_endpoint: "https://oauth2.googleapis.com/token",
+      resource: "google:#{acct}",
+      created_at: clock.now.to_text
+    )
+  )
+  auth_url = Oauth.google_authorize_url(cid.trim, redir, challenge, state)
+  Ok(StartOAuthResponse(connector_name: "google:#{acct}", authorize_url: auth_url, state: state))
+end
+
 ## Starts standard MCP OAuth 2.0 + PKCE (RFC 9728 / 8414 / 7591 / 7636) sign-in using CSPRNG.
 fn post_connector_oauth_start(
   _op: Operator,
@@ -1401,6 +1442,70 @@ fn get_oauth_callback(
     )
     Error(e): return oauth_html_page(500, "Storage Error", "#{e}", None)
   end
+  now_time = clock.now
+  case pending.connector_name.drop_prefix("google:")
+    Some(acct):
+      csec = case Store.resolve_secret(db, env, "GOOGLE_OAUTH_CLIENT_SECRET")
+        Ok(Some(s)): s
+        Ok(None) | Error(_): return oauth_html_page(
+          500,
+          "Missing Google Client Secret",
+          "Seal GOOGLE_OAUTH_CLIENT_SECRET in Motet Vault first.",
+          None
+        )
+      end
+      (gtok, ref_opt) = case Oauth.exchange_google_code(
+        network,
+        auth_code,
+        pending.redirect_uri,
+        pending.client_id,
+        csec,
+        pending.code_verifier
+      )
+        Ok(pair): pair
+        Error(e): return oauth_html_page(502, "Google Token Exchange Failed", "#{e}", None)
+      end
+      ref_secret_name = if acct == "work"
+        "GOOGLE_WORK_REFRESH_TOKEN"
+      else
+        "GOOGLE_PERSONAL_REFRESH_TOKEN"
+      end
+      case ref_opt
+        Some(rtok) if not rtok.trim.empty?: _sr = Store.save_vault_secret(
+          db,
+          env,
+          srng,
+          ref_secret_name,
+          "oauth",
+          rtok.trim,
+          now_time.to_text
+        )
+        Some(_) | None: Unit
+      end
+      g_exp = (now_time + gtok.expires_in.seconds).to_text
+      for cname in ["gmail-#{acct}", "gcal-#{acct}", "gdocs-#{acct}"]
+        _sv = Store.save_connector_token_sealed(
+          db,
+          env,
+          srng,
+          cname,
+          gtok.access_token,
+          gtok.scope,
+          g_exp,
+          now_time.to_text
+        )
+        _en = Store.set_connector_enabled(db, cname, Some(true))
+      end
+      dest = "/?connected=google-#{Oauth.percent_encode(acct)}"
+      return oauth_html_page(
+        200,
+        "Connected Google (#{acct})",
+        "Enabled gmail-#{acct}, gcal-#{acct}, and gdocs-#{acct} with sealed offline auto-refresh token. Redirecting back to Motet…",
+        Some(dest)
+      )
+    None: Unit
+  end
+
   tok = case Oauth.exchange_code(
     network,
     pending.token_endpoint,
@@ -1413,7 +1518,6 @@ fn get_oauth_callback(
     Ok(t): t
     Error(e): return oauth_html_page(502, "Token Exchange Failed", "#{e}", None)
   end
-  now_time = clock.now
   expires_at = (now_time + tok.expires_in.seconds).to_text
   case Store.save_connector_token_sealed(
     db,
@@ -1458,17 +1562,33 @@ fn post_gdocs_publish(
   body: PublishGdocRequest
 ) : Result(PublishGdocResponse, MotetError)
   try ensure_ready(db, clock)
-  acct = if body.account.trim.ascii_lowercase == "work": "gdocs-work" else: "gdocs-personal"
+  is_work = body.account.trim.ascii_lowercase == "work"
+  acct = if is_work: "gdocs-work" else: "gdocs-personal"
   spec = try (try Store.get_connector(db, acct)).or_fail(
     ItemNotFound(message: "unknown Google Docs connector: #{acct}")
   )
-  stored_tok = if not spec.auth_env.trim.empty?
-    case try Store.get_vault_secret(db, env, spec.auth_env.trim)
-      Some(v): Some(v)
-      None: try Store.get_connector_token_opened(db, env, spec.name)
+  ref_key = if is_work: "GOOGLE_WORK_REFRESH_TOKEN" else: "GOOGLE_PERSONAL_REFRESH_TOKEN"
+  ref_opt = try Store.resolve_secret(db, env, ref_key)
+  cid_opt = try Store.resolve_secret(db, env, "GOOGLE_OAUTH_CLIENT_ID")
+  csec_opt = try Store.resolve_secret(db, env, "GOOGLE_OAUTH_CLIENT_SECRET")
+  var refreshed = None
+  if ref_opt is Some(rtok) and cid_opt is Some(cid) and csec_opt is Some(csec)
+    case Oauth.refresh_google_token(network, cid, csec, rtok)
+      Ok(fresh): refreshed = Some(fresh.access_token)
+      Error(_): Unit
     end
-  else
-    try Store.get_connector_token_opened(db, env, spec.name)
+  end
+  stored_tok = case refreshed
+    Some(t): Some(t)
+    None:
+      if not spec.auth_env.trim.empty?
+        case try Store.get_vault_secret(db, env, spec.auth_env.trim)
+          Some(v): Some(v)
+          None: try Store.get_connector_token_opened(db, env, spec.name)
+        end
+      else
+        try Store.get_connector_token_opened(db, env, spec.name)
+      end
   end
   token = try Mcp.resolve_connector_token(spec, env, stored_tok).or_fail(Unauthorized)
   url = try Connectors.gdocs_publish_page(network, token, body.title, body.content)

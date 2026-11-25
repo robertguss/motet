@@ -16,6 +16,7 @@ use Json
 use Llm{ToolDef}
 use Mcp
 use Memory
+use Oauth
 use Policy
 use Skills
 use Store
@@ -392,18 +393,52 @@ fn resolve_workspace_cmd(cmd: Command, bot: BotConfig) : Command
   scoped.allow_programs(bot.allowed_programs)
 end
 
+fn google_refresh_secret_name(spec: ConnectorSpec) : Option(Text)
+  k = spec.kind.trim.ascii_lowercase
+  if k == "google_gmail" or k == "google_gcal" or k == "google_gdocs"
+    if spec.name.ends_with?("-work")
+      Some("GOOGLE_WORK_REFRESH_TOKEN")
+    else if spec.name.ends_with?("-personal")
+      Some("GOOGLE_PERSONAL_REFRESH_TOKEN")
+    else
+      None
+    end
+  else
+    None
+  end
+end
+
 ## Resolves an encrypted OAuth token or Vault-stored connector secret before falling back to Env.
-fn resolve_stored_connector_token(db: Sqlite.Database, env: Env, spec: ConnectorSpec) : Result(
+## For Google connectors with a sealed refresh_token, automatically refreshes fresh access tokens!
+fn resolve_stored_connector_token(rt: ToolRuntime, db: Sqlite.Database, spec: ConnectorSpec) : Result(
   Option(Text),
   MotetError
 )
+  # 1. Google OAuth auto-refresh using isolated Work/Personal sealed refresh_token
+  case google_refresh_secret_name(spec)
+    Some(ref_key):
+      ref_opt = try Store.resolve_secret(db, rt.env, ref_key)
+      cid_opt = try Store.resolve_secret(db, rt.env, "GOOGLE_OAUTH_CLIENT_ID")
+      csec_opt = try Store.resolve_secret(db, rt.env, "GOOGLE_OAUTH_CLIENT_SECRET")
+      if ref_opt is Some(ref_tok) and cid_opt is Some(cid) and csec_opt is Some(csec)
+        case Oauth.refresh_google_token(rt.network, cid, csec, ref_tok)
+          Ok(fresh): return Ok(Some(fresh.access_token))
+          Error(_): Unit
+        end
+      end
+    None: Unit
+  end
+
+  # 2. Direct Vault secret matching auth_env
   if not spec.auth_env.trim.empty?
-    case try Store.get_vault_secret(db, env, spec.auth_env.trim)
+    case try Store.get_vault_secret(db, rt.env, spec.auth_env.trim)
       Some(v) if not v.trim.empty?: return Ok(Some(v.trim))
       Some(_) | None: Unit
     end
   end
-  Store.get_connector_token_opened(db, env, spec.name)
+
+  # 3. Sealed OAuth access token from connector_tokens
+  Store.get_connector_token_opened(db, rt.env, spec.name)
 end
 
 ## Executes an already-authorized tool call under default Owner direct context.
@@ -624,7 +659,7 @@ fn execute_tool_in_context(
           lines = tools.map(fn(t) "#{t.name} [#{t.effect_class}]: #{t.description}" end)
           Ok(if lines.empty?: "no tools exposed" else: lines.join("\n"))
         else
-          stored_tok = try resolve_stored_connector_token(db, rt.env, spec)
+          stored_tok = try resolve_stored_connector_token(rt, db, spec)
           case Mcp.list_tools(rt.network, rt.env, spec, stored_tok)
             Ok(tools):
               lines = tools.map(fn(t) "#{t.name} [#{t.effect_class}]: #{t.description}" end)
@@ -654,7 +689,7 @@ fn execute_tool_in_context(
           Ok("connector_error: connector '#{cname}' is disabled")
         else
           rargs = (args.get("arguments") or Json.Object({})).to_text
-          stored_tok = try resolve_stored_connector_token(db, rt.env, spec)
+          stored_tok = try resolve_stored_connector_token(rt, db, spec)
           resolved_tok = Mcp.resolve_connector_token(spec, rt.env, stored_tok)
           if Connectors.is_builtin_connector?(spec)
             case Connectors.dispatch_builtin_tool(rt.network, spec, resolved_tok, rtool, rargs)
