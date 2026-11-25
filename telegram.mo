@@ -271,7 +271,7 @@ fn parse_updates(doc: Json) : List(TelegramUpdate)
   end)
 end
 
-fn handle_callback(rt: ToolRuntime, db: Sqlite.Database, token: Text, upd: TelegramUpdate) : Result(
+fn handle_callback(rt: ToolRuntime, db: Store.DbHandle, token: Text, upd: TelegramUpdate) : Result(
   Unit,
   MotetError
 )
@@ -314,7 +314,7 @@ end
 
 fn handle_text_message(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   token: Text,
   default_bot: Text,
   public_url: Text,
@@ -380,7 +380,7 @@ end
 
 ## Polls Telegram `getUpdates` once, enforcing `allowed_telegram_user_id` fail-closed.
 ## Returns the number of authorized updates processed.
-fn poll_once(rt: ToolRuntime, db: Sqlite.Database) : Result(Int, MotetError)
+fn poll_once(rt: ToolRuntime, db: Store.DbHandle) : Result(Int, MotetError)
   settings = try Store.get_settings(db)
   return Ok(0) if not settings.telegram_enabled?
   allowed_uid = settings.telegram_allowed_user_id.trim
@@ -433,9 +433,10 @@ fn poll_once(rt: ToolRuntime, db: Sqlite.Database) : Result(Int, MotetError)
 end
 
 test "Telegram rejects unauthorized users, routes /work messages with live edit, and handles inline Approve callback"
-  sqlite = Sqlite.in_memory()
-  assert sqlite.open("motet.sqlite") is Ok(db)
+  files = Files.in_memory({})
   t0 = Time.parse("2026-11-25T16:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = Store.open(files, clock)
   assert Store.seed_defaults(db, t0.to_text) is Ok(Unit)
   assert Store.save_settings(
     db,
@@ -453,10 +454,8 @@ test "Telegram rejects unauthorized users, routes /work messages with live edit,
   ) is
     Ok(_)
 
-  files = Files.in_memory({})
   cmd = Command.fake({})
   env = Env.of({"TELEGRAM_BOT_TOKEN": "tg-tok-1", "ANTHROPIC_API_KEY": "sk-ant-tg"})
-  clock = Clock.fixed(t0)
 
   assert Store.get_bot(db, "work") is Ok(Some(work_bot))
   assert Brain.build_prompt_tiers(db, files.read_only, work_bot, Owner, t0.to_text) is Ok(tiers)

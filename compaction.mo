@@ -92,7 +92,7 @@ end
 fn compact_session_if_needed(
   network: Network,
   clock: Clock,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   bot: BotConfig,
   api_key: Text,
   session_id: Text,
@@ -170,10 +170,11 @@ fn compact_session_if_needed(
   Ok(compacted)
 end
 
-test "Warm-Request Compaction aligns on UserMsg boundary, flushes owner facts, and checkpoints SQLite"
-  sqlite = Sqlite.in_memory()
-  assert sqlite.open("motet.sqlite") is Ok(db)
+test "Warm-Request Compaction aligns on UserMsg boundary, flushes owner facts, and checkpoints MoDB"
+  files = Files.in_memory({})
   t0 = Time.parse("2026-11-25T10:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = Store.open(files, clock)
   assert Store.seed_defaults(db, t0.to_text) is Ok(Unit)
   assert Store.get_or_create_canonical_session(db, "chief", t0.to_text) is Ok(sess)
   assert Store.get_bot(db, "chief") is Ok(Some(chief))
@@ -227,7 +228,6 @@ test "Warm-Request Compaction aligns on UserMsg boundary, flushes owner facts, a
     })
   }).to_text
   net = Network.fake(Http.replies([(expected_req, Http.reply(200, reply_json))]))
-  clock = Clock.fixed(t0)
 
   assert compact_session_if_needed(
     net,

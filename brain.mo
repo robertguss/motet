@@ -48,6 +48,7 @@ use Types{
   ToolCallReq,
   TrustLevel,
   TurnReply,
+  effect_to_text,
   trust_to_text
 }
 
@@ -55,7 +56,7 @@ use Types{
 ## Stable + Context receive Anthropic cache_control breakpoints; Volatile holds
 ## the frozen memory snapshot so mid-session memory saves never bust prefix caches.
 fn build_prompt_tiers(
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   read_files: ReadFiles,
   bot: BotConfig,
   trust: TrustLevel,
@@ -134,7 +135,7 @@ end
 
 ## Reconstructs prior conversation messages starting from the latest compaction checkpoint,
 ## faithfully preserving `assistant_tools` tool_calls and preventing orphaned tool_results.
-fn load_prior_messages(db: Sqlite.Database, session_id: Text) : Result(List(LlmMessage), MotetError)
+fn load_prior_messages(db: Store.DbHandle, session_id: Text) : Result(List(LlmMessage), MotetError)
   sess_opt = try Store.get_session(db, session_id)
   start_after = case sess_opt
     Some(s) if s.compaction_seq > 0: s.compaction_seq - 1
@@ -195,11 +196,13 @@ end
 
 fn execute_delegation(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   caller_bot: BotConfig,
   parent_session_id: Text,
   trust: TrustLevel,
   parent_read_only?: Bool,
+  parent_grant_id_opt: Option(Text),
+  tool_call_id: Text,
   arguments_json: Text,
   depth: Int
 ) : Result((Text, List(ApprovalItem)), MotetError)
@@ -213,16 +216,35 @@ fn execute_delegation(
   if target == caller_bot.name
     return Ok(("delegation_error: bot #{caller_bot.name} cannot delegate to itself", []))
   end
-  case try Store.get_bot(db, target)
+  tb = case try Store.get_bot(db, target)
     None: return Ok(("delegation_error: unknown bot '#{target}'", []))
-    Some(tb):
-      if not tb.active?
+    Some(b):
+      if not b.active?
         return Ok(("delegation_error: target bot '#{target}' is inactive", []))
       end
+      b
   end
   child_ro = parent_read_only? or req_ro
   now_clean = rt.clock.now.to_text.replace(":", "").replace("-", "").replace(".", "")
   child_sid = "#{target}-del-#{now_clean}-d#{depth + 1}"
+  parent_gid = case parent_grant_id_opt
+    Some(pg): pg
+    None:
+      _rg = try Store.ensure_bot_root_grant(db, caller_bot.name, rt.clock.now)
+      Store.bot_root_grant_id(caller_bot.name)
+  end
+  child_gid = "del:#{child_sid}:#{tool_call_id}"
+  max_c = if tb.max_steps > 0 and tb.max_steps <= 32: tb.max_steps * 4 else: 32
+  _cg = try Store.delegate_bot_grant(
+    db,
+    caller_bot.name,
+    parent_gid,
+    child_gid,
+    target,
+    child_ro,
+    max_c,
+    rt.clock.now
+  )
   framed = "[Delegated from #{caller_bot.name} (session #{parent_session_id})] #{task}"
   case run_turn_internal(
     rt,
@@ -234,7 +256,8 @@ fn execute_delegation(
     child_ro,
     framed,
     None,
-    depth + 1
+    depth + 1,
+    Some(child_gid)
   )
     Ok(rep):
       var header = "Delegated to #{target} (session #{rep.session_id}, steps=#{rep.steps}, spent=$#{rep
@@ -256,7 +279,7 @@ end
 ## enforcing exact Decimal USD caps, strict specialist walls, and Needs-You approval gating.
 fn run_turn(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   bot_name: Text,
   session_id_opt: Option(Text),
   trust: TrustLevel,
@@ -273,14 +296,15 @@ fn run_turn(
     routine_read_only?,
     user_text,
     None,
-    0
+    0,
+    None
   )
 end
 
 ## Runs a turn targeting the bot's canonical forever-chat (`<bot>-main`) unless `session_id_opt` is given.
 fn run_turn_canonical(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   bot_name: Text,
   session_id_opt: Option(Text),
   trust: TrustLevel,
@@ -297,13 +321,14 @@ fn run_turn_canonical(
     routine_read_only?,
     user_text,
     None,
-    0
+    0,
+    None
   )
 end
 
 fn run_turn_internal(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   bot_name: Text,
   session_id_opt: Option(Text),
   use_canonical?: Bool,
@@ -311,7 +336,8 @@ fn run_turn_internal(
   routine_read_only?: Bool,
   user_text: Text,
   active_run_id: Option(Text),
-  depth: Int
+  depth: Int,
+  grant_id_opt: Option(Text)
 ) : Result(TurnReply, MotetError)
   bot = try (try Store.get_bot(db, bot_name)).or_fail(
     ItemNotFound(message: "unknown bot: #{bot_name}")
@@ -534,32 +560,47 @@ fn run_turn_internal(
 
       obs = case outcome.decision
         Allow:
-          if tc.name == "bot_delegate"
-            (del_obs, child_approvals) = try execute_delegation(
-              rt,
-              db,
-              bot,
-              session_id,
-              trust,
-              routine_read_only?,
-              tc.arguments_json,
-              depth
-            )
-            for ca in child_approvals
-              pending_approvals = pending_approvals.append(ca)
-            end
-            del_obs
-          else
-            try execute_tool_in_context(
-              rt,
-              db,
-              bot,
-              session_id,
-              trust,
-              routine_read_only?,
-              tc.name,
-              tc.arguments_json
-            )
+          exec_allowed = case grant_id_opt
+            Some(gid):
+              gact = if tc.name == "bot_delegate": "delegate" else: effect_to_text(effect)
+              case Store.authorize_grant_action(db, gid, gact, rt.clock.now)
+                Ok(_g): Ok(Unit)
+                Error(ge): Error(ge)
+              end
+            None: Ok(Unit)
+          end
+          case exec_allowed
+            Error(ge): "GRANT_DENIED: #{ge}"
+            Ok(Unit):
+              if tc.name == "bot_delegate"
+                (del_obs, child_approvals) = try execute_delegation(
+                  rt,
+                  db,
+                  bot,
+                  session_id,
+                  trust,
+                  routine_read_only?,
+                  grant_id_opt,
+                  tc.id,
+                  tc.arguments_json,
+                  depth
+                )
+                for ca in child_approvals
+                  pending_approvals = pending_approvals.append(ca)
+                end
+                del_obs
+              else
+                try execute_tool_in_context(
+                  rt,
+                  db,
+                  bot,
+                  session_id,
+                  trust,
+                  routine_read_only?,
+                  tc.name,
+                  tc.arguments_json
+                )
+              end
           end
         AskFirst:
           item = try Store.create_approval(
@@ -635,7 +676,7 @@ end
 ## - Automatic turn resume (defaults to true) so the bot finishes cleanly.
 fn resolve_approval_with_options(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   approval_id: Int,
   req: ResolveApprovalRequest
 ) : Result(ApprovalResolution, MotetError)
@@ -718,7 +759,18 @@ fn resolve_approval_with_options(
   end
 
   exec_res = if item.tool_name == "bot_delegate"
-    case execute_delegation(rt, db, bot, item.session_id, Owner, false, final_args, 0)
+    case execute_delegation(
+      rt,
+      db,
+      bot,
+      item.session_id,
+      Owner,
+      false,
+      None,
+      "approval-#{approval_id}",
+      final_args,
+      0
+    )
       Ok((del_txt, _child_p)): Ok(del_txt)
       Error(err): Error(err)
     end
@@ -782,7 +834,7 @@ fn resolve_approval_with_options(
 end
 
 ## Legacy wrapper: resolves approval without auto-resume (use `resolve_approval_with_options` for auto-resume).
-fn resolve_approval(rt: ToolRuntime, db: Sqlite.Database, approval_id: Int, approve?: Bool) : Result(
+fn resolve_approval(rt: ToolRuntime, db: Store.DbHandle, approval_id: Int, approve?: Bool) : Result(
   ApprovalItem,
   MotetError
 )
@@ -801,8 +853,8 @@ fn resolve_approval(rt: ToolRuntime, db: Sqlite.Database, approval_id: Int, appr
   Ok(res.approval)
 end
 
-## Executes a single claimed async BotRun, updating progress & status durably in SQLite.
-fn execute_run(rt: ToolRuntime, db: Sqlite.Database, run: BotRun) : Result(BotRun, MotetError)
+## Executes a single claimed async BotRun, updating progress & status durably in MoDB.
+fn execute_run(rt: ToolRuntime, db: Store.DbHandle, run: BotRun) : Result(BotRun, MotetError)
   case run_turn_internal(
     rt,
     db,
@@ -813,7 +865,8 @@ fn execute_run(rt: ToolRuntime, db: Sqlite.Database, run: BotRun) : Result(BotRu
     run.routine_read_only?,
     run.prompt,
     Some(run.id),
-    0
+    0,
+    None
   )
     Ok(rep):
       fin_status = case rep.stopped_reason
@@ -847,7 +900,7 @@ fn execute_run(rt: ToolRuntime, db: Sqlite.Database, run: BotRun) : Result(BotRu
 end
 
 ## Drains up to `max_runs` queued async BotRuns atomically (invoked by `mo serve` job & `motet watch`).
-fn drain_queued_runs(rt: ToolRuntime, db: Sqlite.Database, max_runs: Int) : Result(Int, MotetError)
+fn drain_queued_runs(rt: ToolRuntime, db: Store.DbHandle, max_runs: Int) : Result(Int, MotetError)
   cap = if max_runs > 0 and max_runs <= 20: max_runs else: 5
   var processed = 0
   while processed < cap
@@ -862,7 +915,7 @@ fn drain_queued_runs(rt: ToolRuntime, db: Sqlite.Database, max_runs: Int) : Resu
 end
 
 ## Zero-token routine precheck before invoking any LLM.
-fn routine_precheck_passes(db: Sqlite.Database, precheck_kind: Text, last_run_at: Option(Text)) : Result(
+fn routine_precheck_passes(db: Store.DbHandle, precheck_kind: Text, last_run_at: Option(Text)) : Result(
   Bool,
   MotetError
 )
@@ -874,24 +927,14 @@ fn routine_precheck_passes(db: Sqlite.Database, precheck_kind: Text, last_run_at
   end
   if pk == "unread_events"
     since = last_run_at or ""
-    rows = try db.query("SELECT COUNT(*) FROM events WHERE created_at > ?", [Sqlite.String(since)])
-      .map_error(fn(e) StorageFailed(message: "#{e}") end)
-    cnt = case rows.rows.first
-      Some(r):
-        case r.first
-          Some(Sqlite.Integer(n)): n
-          Some(_) | None: 0
-        end
-      None: 0
-    end
-    return Ok(cnt > 0)
+    return Store.has_events_since(db, since)
   end
   Ok(true)
 end
 
 ## Executes all enabled routines whose wall-clock slot or interval is due,
-## enforcing at-most-once occurrence slots, zero-token prechecks, and Routine trust.
-fn run_due_routines(rt: ToolRuntime, db: Sqlite.Database) : Result(TickSummary, MotetError)
+## enforcing at-most-once occurrence slots, Claims leases, zero-token prechecks, and Routine trust.
+fn run_due_routines(rt: ToolRuntime, db: Store.DbHandle) : Result(TickSummary, MotetError)
   now_time = rt.clock.now
   now_text = now_time.to_text
   candidates = try Store.list_due_routines(db, now_text)
@@ -912,9 +955,16 @@ fn run_due_routines(rt: ToolRuntime, db: Sqlite.Database) : Result(TickSummary, 
       Some(sk): sk
       None: continue
     end
+    holder = "routine-runner:#{r.bot_name}"
+    leased = try Store.try_claim_routine(db, r.id, holder, now_time, 300)
+    if not leased
+      results = results.append("#{r.bot_name}:#{r.name} skipped (active lease)")
+      continue
+    end
     # At-most-once occurrence ledger prevents duplicate fires across restarts
     claimed = try Store.claim_routine_slot(db, r.id, slot_key, now_text)
     if not claimed
+      _rel = Store.release_routine_claim(db, r.id, holder, rt.clock.now)
       continue
     end
     next_due = Scheduler.compute_next_due_text(now_time, r.schedule_kind, r.interval_seconds)
@@ -922,6 +972,7 @@ fn run_due_routines(rt: ToolRuntime, db: Sqlite.Database) : Result(TickSummary, 
     # Zero-token precheck hook: skip without calling any LLM when condition is quiet
     if not (try routine_precheck_passes(db, r.precheck_kind, r.last_run_at))
       try Store.mark_routine_skipped(db, r.id, next_due)
+      _rel = Store.release_routine_claim(db, r.id, holder, rt.clock.now)
       skipped += 1
       results = results.append(
         "#{r.bot_name}:#{r.name} -> skipped (zero-token precheck #{r.precheck_kind})"
@@ -952,6 +1003,7 @@ fn run_due_routines(rt: ToolRuntime, db: Sqlite.Database) : Result(TickSummary, 
         try Store.mark_routine_ran(db, r.id, now_text, next_due)
         results = results.append("#{r.bot_name}:#{r.name} error -> #{err}")
     end
+    _rel = Store.release_routine_claim(db, r.id, holder, rt.clock.now)
   end
 
   Ok(
@@ -966,9 +1018,10 @@ fn run_due_routines(rt: ToolRuntime, db: Sqlite.Database) : Result(TickSummary, 
 end
 
 test "Brain pauses WriteExternal, supports edited approval + Always-Allow rule + auto-resume + exact tool replay"
-  sqlite = Sqlite.in_memory()
-  assert sqlite.open("motet.sqlite") is Ok(db)
+  files = Files.in_memory({})
   t0 = Time.parse("2026-11-25T08:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = Store.open(files, clock)
   assert Store.seed_defaults(db, t0.to_text) is Ok(Unit)
   # Mount a work Gmail MCP connector for the test
   assert Store.upsert_connector(
@@ -985,10 +1038,8 @@ test "Brain pauses WriteExternal, supports edited approval + Always-Allow rule +
   ) is
     Ok(_)
 
-  files = Files.in_memory({})
   cmd = Command.fake({})
   env = Env.of({"ANTHROPIC_API_KEY": "test-ant", "GMAIL_WORK_TOKEN": "gw-tok"})
-  clock = Clock.fixed(t0)
 
   assert Store.get_bot(db, "work") is Ok(Some(work_bot))
   assert build_prompt_tiers(db, files.read_only, work_bot, Owner, t0.to_text) is Ok(tiers)
@@ -1118,15 +1169,14 @@ test "Brain pauses WriteExternal, supports edited approval + Always-Allow rule +
 end
 
 test "Brain enforces strict specialist wall, delegates chief -> finance (Gemini), and drains async steered runs"
-  sqlite = Sqlite.in_memory()
-  assert sqlite.open("motet.sqlite") is Ok(db)
+  files = Files.in_memory({})
   t0 = Time.parse("2026-11-25T12:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = Store.open(files, clock)
   assert Store.seed_defaults(db, t0.to_text) is Ok(Unit)
 
-  files = Files.in_memory({})
   cmd = Command.fake({})
   env = Env.of({"ANTHROPIC_API_KEY": "test-ant", "GEMINI_API_KEY": "test-gem"})
-  clock = Clock.fixed(t0)
 
   assert Store.get_bot(db, "chief") is Ok(Some(chief))
   assert Store.get_bot(db, "finance") is Ok(Some(finance))
@@ -1227,12 +1277,19 @@ test "Brain enforces strict specialist wall, delegates chief -> finance (Gemini)
     done_run.reply == "Finance reports $1,420 Safe-to-Spend."
   # Finance blocked from gmail-work -> 0 pending approvals created for wall violation!
   assert Store.list_approvals(db, true) is Ok(pends) and pends.empty?
+  # Attenuated child grant was persisted under `bot:chief` and revoking `bot:chief` cascades!
+  del_gid = "del:#{child_sid}:toolu_del"
+  assert Store.list_grants(db) is Ok(gs) and gs.any?(fn(g) g.id == del_gid end)
+  assert Store.authorize_grant_action(db, del_gid, "read", t0) is Ok(_)
+  assert Store.revoke_grant(db, "bot:chief", "operator", "revoke chief", t0) is Ok(_)
+  assert Store.authorize_grant_action(db, del_gid, "read", t0) is Error(PolicyDenied(message: _))
 end
 
 test "Brain trips 3-denial circuit breaker and cleanly cancels interrupted async runs"
-  sqlite = Sqlite.in_memory()
-  assert sqlite.open("motet.sqlite") is Ok(db)
+  files = Files.in_memory({})
   t0 = Time.parse("2026-11-25T14:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = Store.open(files, clock)
   assert Store.seed_defaults(db, t0.to_text) is Ok(Unit)
   assert Store.get_or_create_canonical_session(db, "personal", t0.to_text) is Ok(psess)
 
@@ -1270,10 +1327,8 @@ test "Brain trips 3-denial circuit breaker and cleanly cancels interrupted async
     Ok(_)
   assert Store.append_run_steer(db, "run-int-1", "interrupt", "", t0.to_text) is Ok(_)
 
-  files = Files.in_memory({})
   cmd = Command.fake({})
   env = Env.of({"ANTHROPIC_API_KEY": "test-ant"})
-  clock = Clock.fixed(t0)
   rt = ToolRuntime(files: files, command: cmd, network: Network.fake({}), env: env, clock: clock)
 
   assert drain_queued_runs(rt, db, 5) == Ok(1)

@@ -1,5 +1,5 @@
 ## Write-only AES-256-GCM Encrypted Vault and HMAC-SHA256 webhook verifier for Motet.
-## Secrets are encrypted at rest in SQLite using Mo 0.3.0's native Crypto primitives
+## Secrets are encrypted at rest in isolated MoDB using Mo 0.3.0's native Crypto primitives
 ## and are NEVER returned by APIs or injected into LLM prompts.
 module Vault
 expose seal_text,

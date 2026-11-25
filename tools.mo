@@ -393,6 +393,22 @@ fn resolve_workspace_cmd(cmd: Command, bot: BotConfig) : Command
   scoped.allow_programs(bot.allowed_programs)
 end
 
+fn is_protected_db_path?(path: Text) : Bool
+  segs = path.replace("\\", "/").split("/")
+  for raw_seg in segs
+    s = raw_seg.trim.ascii_lowercase
+    if s.ends_with?(".modb") or
+      s.ends_with?(".modb.lock") or
+      s.ends_with?(".modb.tmp") or
+      s.ends_with?(".sqlite") or
+      s.ends_with?(".sqlite-wal") or
+      s.ends_with?(".sqlite-shm")
+      return true
+    end
+  end
+  false
+end
+
 fn google_refresh_secret_name(spec: ConnectorSpec) : Option(Text)
   k = spec.kind.trim.ascii_lowercase
   if k == "google_gmail" or k == "google_gcal" or k == "google_gdocs"
@@ -410,7 +426,7 @@ end
 
 ## Resolves an encrypted OAuth token or Vault-stored connector secret before falling back to Env.
 ## For Google connectors with a sealed refresh_token, automatically refreshes fresh access tokens!
-fn resolve_stored_connector_token(rt: ToolRuntime, db: Sqlite.Database, spec: ConnectorSpec) : Result(
+fn resolve_stored_connector_token(rt: ToolRuntime, db: Store.DbHandle, spec: ConnectorSpec) : Result(
   Option(Text),
   MotetError
 )
@@ -444,7 +460,7 @@ end
 ## Executes an already-authorized tool call under default Owner direct context.
 fn execute_tool(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   bot: BotConfig,
   session_id: Text,
   tool_name: Text,
@@ -456,7 +472,7 @@ end
 ## Executes an already-authorized tool call with host-stamped TrustLevel provenance.
 fn execute_tool_in_context(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   bot: BotConfig,
   session_id: Text,
   trust: TrustLevel,
@@ -572,6 +588,9 @@ fn execute_tool_in_context(
 
   if tool_name == "file_read"
     path = args.text_at("path") or ""
+    if is_protected_db_path?(path)
+      return Ok("file_error: access to database file '#{path}' is denied")
+    end
     ws = resolve_workspace_files(rt.files, bot.workspace)
     return case ws.read_text(path)
       Ok(txt): Ok(txt)
@@ -583,13 +602,16 @@ fn execute_tool_in_context(
     folder = args.text_at("folder") or "."
     ws = resolve_workspace_files(rt.files, bot.workspace)
     return case ws.list(folder)
-      Ok(entries): Ok(entries.join("\n"))
+      Ok(entries): Ok(entries.filter(fn(e) not is_protected_db_path?(e) end).join("\n"))
       Error(err): Ok("file_error: #{err}")
     end
   end
 
   if tool_name == "file_write"
     path = args.text_at("path") or ""
+    if is_protected_db_path?(path)
+      return Ok("file_error: access to database file '#{path}' is denied")
+    end
     content = args.text_at("content") or ""
     ws = resolve_workspace_files(rt.files, bot.workspace)
     return case ws.write_text(path, content)
@@ -750,14 +772,22 @@ fn execute_tool_in_context(
   Ok("unknown tool: #{tool_name}")
 end
 
-test "local hand confines file escapes, disallowed commands, and strict connector walls"
-  sqlite = Sqlite.in_memory()
-  assert sqlite.open("t.sqlite") is Ok(db)
-  assert Store.init_schema(db) is Ok(Unit)
+test "local hand confines file escapes, database files, disallowed commands, and strict connector walls"
   files = Files.in_memory({"vault/notes.md": "# Notes\n", "secret.txt": "nope"})
   cmd = Command.fake({})
   net = Network.fake({})
   clock = Clock.fixed(Time.parse("2026-11-25T00:00:00Z") or stop "time")
+  db = Store.open(files, clock)
+  assert Store.init_schema(db) is Ok(Unit)
+  assert Store.save_connector_token(
+    db,
+    "t3code",
+    "top-secret-tok",
+    "all",
+    "",
+    "2026-11-25T00:00:00Z"
+  ) is
+    Ok(Unit)
   rt = ToolRuntime(files: files, command: cmd, network: net, env: Env.of({}), clock: clock)
   bot = BotConfig(
     name: "finance",
@@ -801,4 +831,40 @@ test "local hand confines file escapes, disallowed commands, and strict connecto
   ) is
     Ok(wall_err) and
     wall_err.contains?("read-only connector wall")
+
+  # Even a root-workspace bot cannot read, write, or list `.modb` database or secret files.
+  root_bot = BotConfig(
+    name: "chief",
+    role: "Chief",
+    persona: "Chief",
+    is_primary?: true,
+    model_tier: "smart",
+    provider: Anthropic,
+    endpoint: "https://api.anthropic.com/v1/messages",
+    api_key_env: "ANTHROPIC_API_KEY",
+    model: "claude-sonnet-5-5",
+    workspace: ".",
+    allowed_programs: ["git"],
+    allowed_hosts: [],
+    connectors: [],
+    read_only_connectors: [],
+    daily_budget_usd: 5.0,
+    max_steps: 5,
+    active?: true
+  )
+  assert execute_tool(rt, db, root_bot, "s2", "file_read", "{\"path\":\"motet-secrets.modb\"}") is
+    Ok(sec_err) and
+    sec_err.starts_with?("file_error:")
+  assert execute_tool(
+    rt,
+    db,
+    root_bot,
+    "s2",
+    "file_write",
+    "{\"path\":\"motet.modb\",\"content\":\"pwn\"}"
+  ) is
+    Ok(wr_err) and
+    wr_err.starts_with?("file_error:")
+  assert execute_tool(rt, db, root_bot, "s2", "file_list", "{\"folder\":\".\"}") is Ok(listing)
+  assert not listing.contains?("motet.modb") and not listing.contains?("motet-secrets.modb")
 end

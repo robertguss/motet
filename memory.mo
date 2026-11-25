@@ -21,22 +21,6 @@ use Skills
 use Store
 use Types{DreamingDigest, MemoryEntry, MotetError, TrustLevel, WeeklyAuditReport}
 
-fn db_err(e: SqliteError) : MotetError
-  StorageFailed(message: "#{e}")
-end
-
-fn cell_str(row: List(Sqlite.Value), idx: Int) : Text
-  if row.get(idx) is Some(Sqlite.String(s)): s else: ""
-end
-
-fn cell_int(row: List(Sqlite.Value), idx: Int) : Int
-  if row.get(idx) is Some(Sqlite.Integer(n)): n else: 0
-end
-
-fn cell_bool(row: List(Sqlite.Value), idx: Int) : Bool
-  cell_int(row, idx) != 0
-end
-
 ## Host-stamped non-model-writable provenance derived solely from the session's TrustLevel.
 fn derive_host_origin(trust: TrustLevel, routine_read_only?: Bool) : (Text, Text)
   examples
@@ -128,7 +112,7 @@ end
 
 ## Host-enforced memory save with recall-loop suppression and provenance taint gating.
 fn save_with_taint_gate(
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   scope: Text,
   kind: Text,
   content: Text,
@@ -166,41 +150,33 @@ fn save_with_taint_gate(
 end
 
 ## Patch semantics: replaces an existing memory entry cleanly without bloating hot memory.
-fn patch_memory(db: Sqlite.Database, id: Int, new_content: Text) : Result(MemoryEntry, MotetError)
+fn patch_memory(db: Store.DbHandle, id: Int, new_content: Text) : Result(MemoryEntry, MotetError)
   clean = new_content.trim
   return Error(BadInput(message: "memory patch content cannot be empty")) if clean.empty?
   return Error(BadInput(message: "memory entry exceeds 400 char cap")) if clean.char_count > 400
   Store.update_memory_content(db, id, clean)
 end
 
-fn row_to_digest(r: List(Sqlite.Value)) : DreamingDigest
-  DreamingDigest(
-    id: cell_int(r, 0),
-    run_at: cell_str(r, 1),
-    summary: cell_str(r, 2),
-    promoted_count: cell_int(r, 3),
-    pruned_count: cell_int(r, 4),
-    rolled_back?: cell_bool(r, 5)
+## Lists recent Overnight Dreaming digests & rollback statuses.
+fn list_dreaming_history(db: Store.DbHandle, limit: Int) : Result(List(DreamingDigest), MotetError)
+  rows = try Store.list_dreaming_runs(db, limit)
+  Ok(
+    rows.map(fn(r)
+      DreamingDigest(
+        id: r.id,
+        run_at: r.run_at,
+        summary: r.summary,
+        promoted_count: r.promoted_count,
+        pruned_count: r.pruned_count,
+        rolled_back?: r.rolled_back?
+      )
+    end)
   )
 end
 
-## Lists recent Overnight Dreaming digests & rollback statuses.
-fn list_dreaming_history(db: Sqlite.Database, limit: Int) : Result(List(DreamingDigest), MotetError)
-  cap = if limit > 0 and limit <= 50: limit else: 15
-  rows = try db.query(
-    "SELECT id, run_at, summary, promoted_count, pruned_count, rolled_back FROM dreaming_runs ORDER BY id DESC LIMIT ?",
-    [Sqlite.Integer(cap)]
-  ).map_error(db_err)
-  Ok(rows.rows.map(fn(r) row_to_digest(r) end))
-end
-
 ## Checks whether Dreaming has already run for the given UTC/local day prefix (`YYYY-MM-DD`).
-fn has_dreamed_today(db: Sqlite.Database, day_prefix: Text) : Result(Bool, MotetError)
-  rows = try db.query(
-    "SELECT COUNT(*) FROM dreaming_runs WHERE run_at LIKE ? AND rolled_back = 0",
-    [Sqlite.String("#{day_prefix}%")]
-  ).map_error(db_err)
-  Ok(cell_int(rows.rows.first or [], 0) > 0)
+fn has_dreamed_today(db: Store.DbHandle, day_prefix: Text) : Result(Bool, MotetError)
+  Store.has_dreamed_today(db, day_prefix)
 end
 
 fn extract_owner_signal?(text: Text) : Bool
@@ -219,7 +195,7 @@ end
 ## - Light: deduplicates redundant memories and archives excess stale `work_log` entries.
 ## - REM: extracts crisp owner-trust preference signals from recent Owner sessions (NEVER External).
 ## - Deep: commits a transactional rollback snapshot (`archived_ids`, `created_ids`) and logs a Digest.
-fn run_dreaming(db: Sqlite.Database, now_text: Text) : Result(DreamingDigest, MotetError)
+fn run_dreaming(db: Store.DbHandle, now_text: Text) : Result(DreamingDigest, MotetError)
   all_active = try Store.list_memories(db, None, 200)
 
   # LIGHT PHASE: identify redundant duplicates (keep newest/highest id) & overflow work_log entries
@@ -247,20 +223,12 @@ fn run_dreaming(db: Sqlite.Database, now_text: Text) : Result(DreamingDigest, Mo
   end
 
   # REM PHASE: scan recent Owner-only direct user messages for explicit durable preference signals
-  ev_rows = try db.query(
-    [
-      "SELECT e.content, s.bot_name FROM events e ",
-      "JOIN sessions s ON s.id = e.session_id ",
-      "WHERE s.trust = 'owner' AND e.kind = 'message' AND e.role = 'user' ",
-      "ORDER BY e.id DESC LIMIT 40"
-    ].join(""),
-    []
-  ).map_error(db_err)
+  ev_msgs = try Store.list_recent_owner_user_messages(db, 40)
 
   var created_ids = []
   var active_now = kept_by_scope
-  for r in ev_rows.rows
-    msg = cell_str(r, 0).trim
+  for raw_msg in ev_msgs
+    msg = raw_msg.trim
     if extract_owner_signal?(msg) and not is_duplicate_memory?(active_now, msg)
       saved = try Store.save_memory_full(
         db,
@@ -287,42 +255,18 @@ fn run_dreaming(db: Sqlite.Database, now_text: Text) : Result(DreamingDigest, Mo
   summary = "Light pass pruned #{archived_ids.size} redundant/stale entries; REM pass promoted #{created_ids
     .size} verified owner signal(s) from recent direct sessions; Deep pass saved rollback snapshot."
 
-  try db.run(
-    "INSERT INTO dreaming_runs (run_at, summary, promoted_count, pruned_count, rollback_snapshot_json, rolled_back) VALUES (?, ?, ?, ?, ?, 0)",
-    [
-      Sqlite.String(now_text),
-      Sqlite.String(summary),
-      Sqlite.Integer(created_ids.size),
-      Sqlite.Integer(archived_ids.size),
-      Sqlite.String(snap_json)
-    ]
-  ).map_error(db_err)
-  id_rows = try db.query("SELECT last_insert_rowid()", []).map_error(db_err)
-  did = cell_int(id_rows.rows.first or [], 0)
-
-  Ok(
-    DreamingDigest(
-      id: did,
-      run_at: now_text,
-      summary: summary,
-      promoted_count: created_ids.size,
-      pruned_count: archived_ids.size,
-      rolled_back?: false
-    )
-  )
+  Store.record_dreaming_run(db, now_text, summary, created_ids.size, archived_ids.size, snap_json)
 end
 
 ## 1-click Dreaming Rollback: restores archived pre-image memories and deletes REM-created entries.
-fn rollback_dreaming(db: Sqlite.Database, dream_id: Int) : Result(DreamingDigest, MotetError)
-  rows = try db.query(
-    "SELECT id, run_at, summary, promoted_count, pruned_count, rolled_back, rollback_snapshot_json FROM dreaming_runs WHERE id = ?",
-    [Sqlite.Integer(dream_id)]
-  ).map_error(db_err)
-  row = try rows.rows.first.or_fail(ItemNotFound(message: "dreaming run ##{dream_id} not found"))
-  if cell_bool(row, 5)
+fn rollback_dreaming(db: Store.DbHandle, dream_id: Int) : Result(DreamingDigest, MotetError)
+  row = try (try Store.get_dreaming_run(db, dream_id)).or_fail(
+    ItemNotFound(message: "dreaming run ##{dream_id} not found")
+  )
+  if row.rolled_back?
     return Error(Conflict(message: "dreaming run ##{dream_id} was already rolled back"))
   end
-  snap_raw = cell_str(row, 6)
+  snap_raw = row.rollback_snapshot_json
   snap_doc = case Json.parse(snap_raw)
     Ok(d): d
     Error(_): Json.Object({})
@@ -352,16 +296,15 @@ fn rollback_dreaming(db: Sqlite.Database, dream_id: Int) : Result(DreamingDigest
     end
   end
 
-  try db.run("UPDATE dreaming_runs SET rolled_back = 1 WHERE id = ?", [Sqlite.Integer(dream_id)])
-    .map_error(db_err)
+  try Store.mark_dreaming_rolled_back(db, dream_id)
 
   Ok(
     DreamingDigest(
-      id: cell_int(row, 0),
-      run_at: cell_str(row, 1),
-      summary: cell_str(row, 2),
-      promoted_count: cell_int(row, 3),
-      pruned_count: cell_int(row, 4),
+      id: row.id,
+      run_at: row.run_at,
+      summary: row.summary,
+      promoted_count: row.promoted_count,
+      pruned_count: row.pruned_count,
       rolled_back?: true
     )
   )
@@ -369,7 +312,7 @@ end
 
 ## Weekly Self-Audit Anti-Job scorecard (inspired by Grok Bot's `dr eggbot`):
 ## surfaces noisy/zero-value routines, unused bot-proposed skills, and repeated approval tools.
-fn generate_weekly_audit(db: Sqlite.Database, files: ReadFiles, now_text: Text) : Result(
+fn generate_weekly_audit(db: Store.DbHandle, files: ReadFiles, now_text: Text) : Result(
   WeeklyAuditReport,
   MotetError
 )
@@ -395,15 +338,10 @@ fn generate_weekly_audit(db: Sqlite.Database, files: ReadFiles, now_text: Text) 
     end
   end
 
-  app_rows = try db.query(
-    "SELECT bot_name, tool_name, COUNT(*) as c FROM approvals WHERE status = 'executed' GROUP BY bot_name, tool_name HAVING c >= 2 ORDER BY c DESC LIMIT 10",
-    []
-  ).map_error(db_err)
+  app_rows = try Store.list_repeated_executed_approvals(db, 2, 10)
   var repeated = []
-  for r in app_rows.rows
-    repeated = repeated.append(
-      "#{cell_str(r, 0)} -> #{cell_str(r, 1)} (approved #{cell_int(r, 2)}x)"
-    )
+  for (bname, tname, cnt) in app_rows
+    repeated = repeated.append("#{bname} -> #{tname} (approved #{cnt}x)")
   end
 
   md_lines = [
@@ -429,9 +367,10 @@ fn generate_weekly_audit(db: Sqlite.Database, files: ReadFiles, now_text: Text) 
 end
 
 test "Memory Core 2.0 enforces taint gate, recall-loop dedup, Dreaming Light->REM->Deep, and 1-click Rollback"
-  sqlite = Sqlite.in_memory()
-  assert sqlite.open("mem.sqlite") is Ok(db)
-  t0 = "2026-11-25T03:00:00Z"
+  files = Files.in_memory({})
+  t0_time = Time.parse("2026-11-25T03:00:00Z") or stop "time"
+  t0 = t0_time.to_text
+  db = Store.open(files, Clock.fixed(t0_time))
   assert Store.seed_defaults(db, t0) is Ok(Unit)
 
   # 1. Host-stamped taint gate stages untrusted/webhook & routine writes
@@ -534,7 +473,6 @@ test "Memory Core 2.0 enforces taint gate, recall-loop dedup, Dreaming Light->RE
   assert patched.content == "Prefers morning brief under 5 bullets"
 
   # 6. Weekly Self-Audit Anti-Job scorecard
-  files = Files.in_memory({})
   assert Skills.save_skill(files, "stale-bot-skill", "Never used", "Do X", "bot_proposed:chief") is
     Ok(_)
   assert generate_weekly_audit(db, files.read_only, t0) is Ok(audit)
