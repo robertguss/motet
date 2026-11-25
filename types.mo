@@ -36,6 +36,9 @@ ConnectorAuthStatus(..),
 StartOAuthRequest(..),
 StartOAuthResponse(..),
 ConnectorTestResult(..),
+ModbVerifySummary(..),
+ReplaySimulateRequest(..),
+RevokeGrantRequest(..),
 MotetError(..),
 provider_to_text,
 provider_from_text,
@@ -336,6 +339,31 @@ struct ConnectorTestResult
   tool_count: Int
   tools: List(Text)
   error: Option(Text)
+end
+
+struct ModbVerifySummary
+  ok?: Bool
+  txid: Int
+  page_count: Int
+  bucket_count: Int
+  schema_version: Int
+  audit_entries: Int
+  last_audit_hash: Text
+  invariants_checked: Int
+  call_count: Int
+  secrets_ok?: Bool
+end
+
+struct ReplaySimulateRequest
+  id: Text
+  description: Text
+  exclude_principal: Option(Text)
+  exclude_seqs: Option(List(Int))
+  stop_before_seq: Option(Int)
+end
+
+struct RevokeGrantRequest
+  reason: Option(Text)
 end
 
 enum MotetError
