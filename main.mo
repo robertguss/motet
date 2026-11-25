@@ -651,7 +651,7 @@ test "motet CLI initializes specialist roster, seals Vault API key, and runs can
   ) ==
     0
   assert c1.printed.first ==
-    Some("Motet initialized: 5 active bots, 1 enabled connectors, 3 routines")
+    Some("Motet initialized: 5 active bots, 1 enabled connectors, 4 routines")
 
   # Seal ANTHROPIC_API_KEY right into the AES-256-GCM Vault (NOT in Env!)
   c_v = Console.fake()

@@ -20,11 +20,19 @@ use Compaction
 use Http
 use Json
 use Llm{LlmMessage, PromptTiers, build_http_request}
+use Memory
 use Policy{PolicyActor}
 use Scheduler{SchedulerActor}
 use Skills
 use Store
-use Tools{ToolRuntime, classify_tool_effect, core_tool_defs, execute_tool, extract_connector_name}
+use Tools{
+  ToolRuntime,
+  classify_tool_effect,
+  core_tool_defs,
+  execute_tool,
+  execute_tool_in_context,
+  extract_connector_name
+}
 use Types{
   ApprovalDecision,
   ApprovalItem,
@@ -97,18 +105,10 @@ fn build_prompt_tiers(
     "Trigger trust level: #{trust_to_text(trust)}"
   ].join("\n")
 
-  shared_mems = try Store.list_memories(db, Some("shared"), 15)
-  bot_mems = try Store.list_memories(db, Some(bot.name), 20)
-  shared_lines = if shared_mems.empty?
-    "- (none)"
-  else
-    shared_mems.map(fn(m) "- [#{m.kind}] #{m.content}" end).join("\n")
-  end
-  bot_lines = if bot_mems.empty?
-    "- (none)"
-  else
-    bot_mems.map(fn(m) "- [#{m.kind}] #{m.content}" end).join("\n")
-  end
+  shared_mems = try Store.list_memories(db, Some("shared"), 25)
+  bot_mems = try Store.list_memories(db, Some(bot.name), 30)
+  shared_lines = Memory.render_capped_memory_block(shared_mems, 1500)
+  bot_lines = Memory.render_capped_memory_block(bot_mems, 2400)
 
   volatile = [
     "Session snapshot time: #{now_text}",
@@ -585,7 +585,16 @@ fn run_turn_internal(
             end
             del_obs
           else
-            try execute_tool(rt, db, bot, session_id, tc.name, tc.arguments_json)
+            try execute_tool_in_context(
+              rt,
+              db,
+              bot,
+              session_id,
+              trust,
+              routine_read_only?,
+              tc.name,
+              tc.arguments_json
+            )
           end
         AskFirst:
           item = try Store.create_approval(

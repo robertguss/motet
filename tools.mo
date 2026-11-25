@@ -4,16 +4,22 @@
 ## - Defense-in-depth strict per-bot specialist connector wall checks
 ## - Built-in Memory, Progressive Skills, Session Search, Artifacts, Web, and Bot Delegation.
 module Tools
-expose ToolRuntime(..), core_tool_defs, classify_tool_effect, extract_connector_name, execute_tool
+expose ToolRuntime(..),
+core_tool_defs,
+classify_tool_effect,
+extract_connector_name,
+execute_tool,
+execute_tool_in_context
 use Command
 use Connectors
 use Json
 use Llm{ToolDef}
 use Mcp
+use Memory
 use Policy
 use Skills
 use Store
-use Types{BotConfig, ConnectorSpec, EffectClass, MotetError, ProviderKind}
+use Types{BotConfig, ConnectorSpec, EffectClass, MotetError, ProviderKind, TrustLevel}
 use VaultFs
 use Web
 
@@ -46,7 +52,7 @@ fn core_tool_defs() : List(ToolDef)
   [
     ToolDef(
       name: "memory_save",
-      description: "Save a durable memory fact, user preference, rule, or work-log item. Use scope 'shared' for global user facts or your bot name for role-specific memory.",
+      description: "Save a durable memory fact, user preference, rule, or work-log item. Use scope 'shared' for global user facts or your bot name for role-specific memory. Untrusted/routine writes are automatically staged.",
       schema: obj_schema(
         {
           "scope": str_prop("Memory scope: 'shared' or this bot's name"),
@@ -54,6 +60,17 @@ fn core_tool_defs() : List(ToolDef)
           "content": str_prop("Concise durable memory statement")
         },
         ["scope", "kind", "content"]
+      )
+    ),
+    ToolDef(
+      name: "memory_patch",
+      description: "Update an existing memory entry by id in place to keep hot memory compact and accurate.",
+      schema: obj_schema(
+        {
+          "id": int_prop("Memory id to update"),
+          "content": str_prop("Replacement concise memory statement (<= 400 chars)")
+        },
+        ["id", "content"]
       )
     ),
     ToolDef(
@@ -308,6 +325,7 @@ fn classify_tool_effect(tool_name: Text, arguments_json: Text, connectors: List(
   end
 
   if tool_name == "memory_save" or
+    tool_name == "memory_patch" or
     tool_name == "skill_propose" or
     tool_name == "artifact_save" or
     tool_name == "schedule_checkin" or
@@ -388,12 +406,26 @@ fn resolve_stored_connector_token(db: Sqlite.Database, env: Env, spec: Connector
   Store.get_connector_token_opened(db, env, spec.name)
 end
 
-## Executes an already-authorized tool call using confined capabilities.
+## Executes an already-authorized tool call under default Owner direct context.
 fn execute_tool(
   rt: ToolRuntime,
   db: Sqlite.Database,
   bot: BotConfig,
   session_id: Text,
+  tool_name: Text,
+  arguments_json: Text
+) : Result(Text, MotetError)
+  execute_tool_in_context(rt, db, bot, session_id, Owner, false, tool_name, arguments_json)
+end
+
+## Executes an already-authorized tool call with host-stamped TrustLevel provenance.
+fn execute_tool_in_context(
+  rt: ToolRuntime,
+  db: Sqlite.Database,
+  bot: BotConfig,
+  session_id: Text,
+  trust: TrustLevel,
+  routine_read_only?: Bool,
   tool_name: Text,
   arguments_json: Text
 ) : Result(Text, MotetError)
@@ -406,8 +438,40 @@ fn execute_tool(
     kind = args.text_at("kind") or "fact"
     content = args.text_at("content") or ""
     return Ok("memory_save ignored: empty content") if content.trim.empty?
-    entry = try Store.save_memory(db, scope, kind, content.trim, "bot:#{bot.name}", now_text)
-    return Ok("saved memory ##{entry.id} [#{entry.scope}/#{entry.kind}]")
+    (origin, session_kind) = Memory.derive_host_origin(trust, routine_read_only?)
+    (entry, status) = try Memory.save_with_taint_gate(
+      db,
+      scope,
+      kind,
+      content.trim,
+      "bot:#{bot.name}",
+      origin,
+      session_kind,
+      now_text
+    )
+    if status == "deduplicated"
+      return Ok("memory already present (##{entry.id} [#{entry.scope}/#{entry.kind}])")
+    else if status == "staged"
+      return Ok(
+        "staged memory candidate ##{entry.id} [#{entry.scope}/#{entry.kind}] for owner review (taint gate: #{origin}/#{session_kind})"
+      )
+    else
+      return Ok("saved memory ##{entry.id} [#{entry.scope}/#{entry.kind}]")
+    end
+  end
+
+  if tool_name == "memory_patch"
+    mid = args.int_at("id") or 0
+    content = args.text_at("content") or ""
+    return Ok("memory_patch error: valid id and content required") if mid <= 0 or
+      content.trim.empty?
+    if trust != Owner or routine_read_only?
+      return Ok("memory_patch blocked: only Owner direct turns may patch durable hot memory")
+    end
+    return case Memory.patch_memory(db, mid, content)
+      Ok(entry): Ok("patched memory ##{entry.id} [#{entry.scope}/#{entry.kind}]")
+      Error(err): Ok("memory_patch error: #{err}")
+    end
   end
 
   if tool_name == "memory_search"
@@ -433,7 +497,9 @@ fn execute_tool(
   if tool_name == "skill_read"
     sname = args.text_at("name") or ""
     return case Skills.read_skill(rt.files.read_only, sname)
-      Ok(doc): Ok("# Skill: #{doc.name} (#{doc.provenance})\n#{doc.description}\n\n#{doc.body}")
+      Ok(doc):
+        _u = Store.record_skill_usage(db, doc.name, now_text)
+        Ok("# Skill: #{doc.name} (#{doc.provenance})\n#{doc.description}\n\n#{doc.body}")
       Error(err): Ok("skill_read error: #{err}")
     end
   end

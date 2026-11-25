@@ -661,7 +661,10 @@ export const SkillsView: React.FC<{
                   <FileCode2 className="w-4 h-4 text-[var(--accent-hover)]" />
                   <strong className="text-sm">{s.name}</strong>
                 </div>
-                <Badge tone={s.provenance === 'user' ? 'ok' : 'accent'}>{s.provenance}</Badge>
+                <div className="flex items-center gap-1.5">
+                  <Badge tone={s.provenance === 'user' ? 'ok' : 'accent'}>{s.provenance}</Badge>
+                  <Badge tone="info">{s.usage_count ?? 0} reads</Badge>
+                </div>
               </div>
               <div className="text-xs text-[var(--fg-muted)]">{s.description}</div>
               <div>

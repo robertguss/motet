@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Activity,
   Bell,
@@ -15,6 +15,7 @@ import {
 import {
   AnalyticsSummary,
   api,
+  apiOptional,
   AppSettings,
   BotConfig,
   ConnectorAuthStatus,
@@ -32,7 +33,7 @@ import {
   VaultSecretMeta,
   WebhookConfig,
 } from '../lib/api';
-import { Badge, Button, Card, Field, inputCls, Modal, SectionHeader } from '../components/ui';
+import { Badge, Button, Card, Field, inputCls, MarkdownView, Modal, SectionHeader } from '../components/ui';
 
 const CONNECTOR_PRESETS = [
   { name: 'gmail-work', url: 'https://gmail.googleapis.com/gmail/v1', auth_env: 'GMAIL_WORK_TOKEN', default_effect: 'write_external' as EffectClass },
@@ -805,6 +806,16 @@ export const AnalyticsSystemView: React.FC<{
   const [rPat, setRPat] = useState('');
   const [rDec, setRDec] = useState<'allow' | 'ask_first' | 'deny'>('allow');
   const [rNote, setRNote] = useState('');
+  const [auditMd, setAuditMd] = useState('');
+
+  async function loadAudit() {
+    const rep = await apiOptional<{ summary_markdown: string } | null>('/v1/analytics/audit', null);
+    if (rep?.summary_markdown) setAuditMd(rep.summary_markdown);
+  }
+
+  useEffect(() => {
+    loadAudit();
+  }, []);
 
   async function saveGlobalSettings(e: React.FormEvent) {
     e.preventDefault();
@@ -886,6 +897,18 @@ export const AnalyticsSystemView: React.FC<{
           <strong className="text-xl font-mono">v{health?.version || '0.2.0'}</strong>
         </Card>
       </div>
+
+      {auditMd && (
+        <Card>
+          <div className="flex items-center justify-between gap-2">
+            <strong className="text-sm">Weekly Self-Audit Anti-Job Scorecard</strong>
+            <Button variant="ghost" size="sm" onClick={loadAudit}>
+              Refresh Audit
+            </Button>
+          </div>
+          <MarkdownView content={auditMd} />
+        </Card>
+      )}
 
       <Card>
         <div className="flex items-center gap-2 font-bold text-sm">

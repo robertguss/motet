@@ -47,9 +47,17 @@ list_events_after,
 search_events,
 count_session_tool_denials,
 save_memory,
+save_memory_full,
 list_memories,
+list_staged_memories,
+promote_staged_memory,
+update_memory_content,
+archive_memory,
+restore_memory,
 search_memories,
 delete_memory,
+record_skill_usage,
+get_skill_usage_map,
 upsert_routine,
 upsert_routine_full,
 list_routines,
@@ -317,7 +325,57 @@ fn init_schema(db: Sqlite.Database) : Result(Unit, MotetError)
       "  kind TEXT NOT NULL,",
       "  content TEXT NOT NULL,",
       "  provenance TEXT NOT NULL,",
+      "  origin TEXT NOT NULL DEFAULT 'owner',",
+      "  session_kind TEXT NOT NULL DEFAULT 'direct',",
+      "  staged INT NOT NULL DEFAULT 0,",
+      "  archived INT NOT NULL DEFAULT 0,",
       "  created_at TEXT NOT NULL",
+      ")"
+    ].join("")
+  )
+  try ensure_column(db, "memories", "origin", "TEXT NOT NULL DEFAULT 'owner'")
+  try ensure_column(db, "memories", "session_kind", "TEXT NOT NULL DEFAULT 'direct'")
+  try ensure_column(db, "memories", "staged", "INT NOT NULL DEFAULT 0")
+  try ensure_column(db, "memories", "archived", "INT NOT NULL DEFAULT 0")
+  try run_ddl(
+    db,
+    [
+      "CREATE TABLE IF NOT EXISTS dreaming_runs (",
+      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
+      "  run_at TEXT NOT NULL,",
+      "  summary TEXT NOT NULL,",
+      "  promoted_count INT NOT NULL,",
+      "  pruned_count INT NOT NULL,",
+      "  rollback_snapshot_json TEXT NOT NULL,",
+      "  rolled_back INT NOT NULL DEFAULT 0",
+      ")"
+    ].join("")
+  )
+  try run_ddl(
+    db,
+    [
+      "CREATE TABLE IF NOT EXISTS standing_intents (",
+      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
+      "  bot_name TEXT NOT NULL,",
+      "  name TEXT NOT NULL,",
+      "  watch_terms TEXT NOT NULL,",
+      "  instruction TEXT NOT NULL,",
+      "  cooldown_seconds INT NOT NULL,",
+      "  max_fires INT NOT NULL,",
+      "  fire_count INT NOT NULL DEFAULT 0,",
+      "  expires_at TEXT NOT NULL,",
+      "  active INT NOT NULL DEFAULT 1,",
+      "  last_fired_at TEXT NOT NULL DEFAULT ''",
+      ")"
+    ].join("")
+  )
+  try run_ddl(
+    db,
+    [
+      "CREATE TABLE IF NOT EXISTS skill_usage (",
+      "  skill_name TEXT PRIMARY KEY,",
+      "  read_count INT NOT NULL DEFAULT 0,",
+      "  last_used_at TEXT NOT NULL DEFAULT ''",
       ")"
     ].join("")
   )
@@ -858,6 +916,20 @@ fn seed_defaults(db: Sqlite.Database, now_text: Text) : Result(Unit, MotetError)
       true,
       true,
       "unread_events",
+      now_text
+    )
+    _r4 = try upsert_routine_full(
+      db,
+      "chief",
+      "weekly-self-audit",
+      "Run the weekly anti-job self-audit: review routine run/skip noise ratio, unused bot-proposed skills, and repeated approval tools that could become narrow Allow rules. Deliver one concise Sunday scorecard.",
+      604800,
+      "weekly",
+      "sun@19:00",
+      "America/Los_Angeles",
+      true,
+      true,
+      "",
       now_text
     )
   end
@@ -1703,21 +1775,43 @@ fn count_session_tool_denials(db: Sqlite.Database, session_id: Text, tool_name: 
   Ok(cell_int(rows.rows.first or [], 0))
 end
 
-fn save_memory(
+memory_select_cols = "id, scope, kind, content, provenance, origin, session_kind, staged, created_at"
+
+fn row_to_memory(r: List(Sqlite.Value)) : MemoryEntry
+  MemoryEntry(
+    id: cell_int(r, 0),
+    scope: cell_str(r, 1),
+    kind: cell_str(r, 2),
+    content: cell_str(r, 3),
+    provenance: cell_str(r, 4),
+    origin: cell_str(r, 5),
+    session_kind: cell_str(r, 6),
+    staged: cell_bool(r, 7),
+    created_at: cell_str(r, 8)
+  )
+end
+
+fn save_memory_full(
   db: Sqlite.Database,
   scope: Text,
   kind: Text,
   content: Text,
   provenance: Text,
+  origin: Text,
+  session_kind: Text,
+  staged?: Bool,
   now_text: Text
 ) : Result(MemoryEntry, MotetError)
   try db.run(
-    "INSERT INTO memories (scope, kind, content, provenance, created_at) VALUES (?, ?, ?, ?, ?)",
+    "INSERT INTO memories (scope, kind, content, provenance, origin, session_kind, staged, archived, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
     [
       Sqlite.String(scope),
       Sqlite.String(kind),
       Sqlite.String(content),
       Sqlite.String(provenance),
+      Sqlite.String(origin),
+      Sqlite.String(session_kind),
+      Sqlite.Integer(if staged?: 1 else: 0),
       Sqlite.String(now_text)
     ]
   ).map_error(db_err)
@@ -1735,20 +1829,23 @@ fn save_memory(
       kind: kind,
       content: content,
       provenance: provenance,
+      origin: origin,
+      session_kind: session_kind,
+      staged: staged?,
       created_at: now_text
     )
   )
 end
 
-fn row_to_memory(r: List(Sqlite.Value)) : MemoryEntry
-  MemoryEntry(
-    id: cell_int(r, 0),
-    scope: cell_str(r, 1),
-    kind: cell_str(r, 2),
-    content: cell_str(r, 3),
-    provenance: cell_str(r, 4),
-    created_at: cell_str(r, 5)
-  )
+fn save_memory(
+  db: Sqlite.Database,
+  scope: Text,
+  kind: Text,
+  content: Text,
+  provenance: Text,
+  now_text: Text
+) : Result(MemoryEntry, MotetError)
+  save_memory_full(db, scope, kind, content, provenance, "owner", "direct", false, now_text)
 end
 
 fn list_memories(db: Sqlite.Database, scope_opt: Option(Text), limit: Int) : Result(
@@ -1758,15 +1855,83 @@ fn list_memories(db: Sqlite.Database, scope_opt: Option(Text), limit: Int) : Res
   cap = if limit > 0 and limit <= 200: limit else: 50
   rows = case scope_opt
     Some(scope): try db.query(
-      "SELECT id, scope, kind, content, provenance, created_at FROM memories WHERE scope = ? ORDER BY id DESC LIMIT ?",
+      "SELECT #{memory_select_cols} FROM memories WHERE staged = 0 AND archived = 0 AND scope = ? ORDER BY id DESC LIMIT ?",
       [Sqlite.String(scope), Sqlite.Integer(cap)]
     ).map_error(db_err)
     None: try db.query(
-      "SELECT id, scope, kind, content, provenance, created_at FROM memories ORDER BY id DESC LIMIT ?",
+      "SELECT #{memory_select_cols} FROM memories WHERE staged = 0 AND archived = 0 ORDER BY id DESC LIMIT ?",
       [Sqlite.Integer(cap)]
     ).map_error(db_err)
   end
   Ok(rows.rows.map(fn(r) row_to_memory(r) end))
+end
+
+fn list_staged_memories(db: Sqlite.Database, limit: Int) : Result(List(MemoryEntry), MotetError)
+  cap = if limit > 0 and limit <= 200: limit else: 50
+  rows = try db.query(
+    "SELECT #{memory_select_cols} FROM memories WHERE staged = 1 AND archived = 0 ORDER BY id DESC LIMIT ?",
+    [Sqlite.Integer(cap)]
+  ).map_error(db_err)
+  Ok(rows.rows.map(fn(r) row_to_memory(r) end))
+end
+
+fn promote_staged_memory(db: Sqlite.Database, id: Int) : Result(MemoryEntry, MotetError)
+  try db.run(
+    "UPDATE memories SET staged = 0, origin = 'owner' WHERE id = ? AND archived = 0",
+    [Sqlite.Integer(id)]
+  ).map_error(db_err)
+  rows = try db.query(
+    "SELECT #{memory_select_cols} FROM memories WHERE id = ?",
+    [Sqlite.Integer(id)]
+  ).map_error(db_err)
+  row = try rows.rows.first.or_fail(ItemNotFound(message: "memory ##{id} not found"))
+  Ok(row_to_memory(row))
+end
+
+fn update_memory_content(db: Sqlite.Database, id: Int, new_content: Text) : Result(
+  MemoryEntry,
+  MotetError
+)
+  rows0 = try db.query(
+    "SELECT #{memory_select_cols} FROM memories WHERE id = ?",
+    [Sqlite.Integer(id)]
+  ).map_error(db_err)
+  r0 = try rows0.rows.first.or_fail(ItemNotFound(message: "memory ##{id} not found"))
+  cur = row_to_memory(r0)
+  try db.run(
+    "UPDATE memories SET content = ? WHERE id = ?",
+    [Sqlite.String(new_content.trim), Sqlite.Integer(id)]
+  ).map_error(db_err)
+  try db.run("DELETE FROM memory_tokens WHERE memory_id = ?", [Sqlite.Integer(id)]).map_error(
+    db_err
+  )
+  for tok in tokenize("#{cur.scope} #{cur.kind} #{new_content.trim}").take(64)
+    try db.run(
+      "INSERT INTO memory_tokens (token, memory_id) VALUES (?, ?) ON CONFLICT(token, memory_id) DO NOTHING",
+      [Sqlite.String(tok), Sqlite.Integer(id)]
+    ).map_error(db_err)
+  end
+  Ok(
+    MemoryEntry(
+      id: cur.id,
+      scope: cur.scope,
+      kind: cur.kind,
+      content: new_content.trim,
+      provenance: cur.provenance,
+      origin: cur.origin,
+      session_kind: cur.session_kind,
+      staged: cur.staged,
+      created_at: cur.created_at
+    )
+  )
+end
+
+fn archive_memory(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
+  db.run("UPDATE memories SET archived = 1 WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
+end
+
+fn restore_memory(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
+  db.run("UPDATE memories SET archived = 0 WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
 end
 
 fn search_memories(db: Sqlite.Database, scope_opt: Option(Text), query: Text) : Result(
@@ -1778,9 +1943,9 @@ fn search_memories(db: Sqlite.Database, scope_opt: Option(Text), query: Text) : 
   first_term = terms.first or ""
   rows = try db.query(
     [
-      "SELECT m.id, m.scope, m.kind, m.content, m.provenance, m.created_at ",
+      "SELECT m.id, m.scope, m.kind, m.content, m.provenance, m.origin, m.session_kind, m.staged, m.created_at ",
       "FROM memories m JOIN memory_tokens t ON m.id = t.memory_id ",
-      "WHERE t.token = ? ORDER BY m.id DESC LIMIT 80"
+      "WHERE t.token = ? AND m.staged = 0 AND m.archived = 0 ORDER BY m.id DESC LIMIT 80"
     ].join(""),
     [Sqlite.String(first_term)]
   ).map_error(db_err)
@@ -1801,6 +1966,25 @@ fn delete_memory(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
     db_err
   )
   db.run("DELETE FROM memories WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
+end
+
+fn record_skill_usage(db: Sqlite.Database, skill_name: Text, now_text: Text) : Result(
+  Unit,
+  MotetError
+)
+  db.run(
+    "INSERT INTO skill_usage (skill_name, read_count, last_used_at) VALUES (?, 1, ?) ON CONFLICT(skill_name) DO UPDATE SET read_count = read_count + 1, last_used_at = excluded.last_used_at",
+    [Sqlite.String(skill_name.trim), Sqlite.String(now_text)]
+  ).map_error(db_err)
+end
+
+fn get_skill_usage_map(db: Sqlite.Database) : Result(Map(Text, Int), MotetError)
+  rows = try db.query("SELECT skill_name, read_count FROM skill_usage", []).map_error(db_err)
+  var m = {}
+  for r in rows.rows
+    m = m.set(cell_str(r, 0), cell_int(r, 1))
+  end
+  Ok(m)
 end
 
 routine_select_cols = "id, bot_name, name, prompt, interval_seconds, schedule_kind, schedule_expr, timezone, read_only, skip_memory, precheck_kind, enabled, next_due_at, last_run_at, run_count, skip_count"

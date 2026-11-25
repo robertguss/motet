@@ -11,8 +11,10 @@ use Brain
 use Budget{BudgetActor}
 use Command
 use Connectors
+use Intents
 use Json
 use Mcp{parse_host_port, resolve_connector_url}
+use Memory
 use Oauth
 use Policy{PolicyActor}
 use Scheduler{SchedulerActor}
@@ -36,10 +38,14 @@ use Types{
   ConnectorSpec,
   ConnectorTestResult,
   CreateBotRequest,
+  CreateIntentRequest,
   CreateRoutineRequest,
   CreateRuleRequest,
   DeleteResult,
+  DreamingDigest,
   EnqueueRunRequest,
+  EvaluateIntentsRequest,
+  EvaluateIntentsResponse,
   HealthSummary,
   MemoryEntry,
   MotetError,
@@ -57,6 +63,7 @@ use Types{
   SessionSummary,
   SkillDoc,
   SkillSummary,
+  StandingIntent,
   StartOAuthRequest,
   StartOAuthResponse,
   SteerRunRequest,
@@ -71,7 +78,8 @@ use Types{
   VaultSearchResponse,
   VaultSecretMeta,
   WebhookConfig,
-  WebhookReceipt
+  WebhookReceipt,
+  WeeklyAuditReport
 }
 use Vault
 use VaultFs{VaultFileEntry, VaultGitStatus}
@@ -94,6 +102,7 @@ api
   job "motet.runs" job_drain_runs every 1.second
   job "motet.routines" job_run_routines every 1.minute
   job "motet.telegram" job_poll_telegram every 3.seconds
+  job "motet.dreaming" job_run_dreaming every 1.hour
 
   get "/" get_ui
   get "/manifest.json" get_manifest
@@ -104,6 +113,7 @@ api
   get "/v1/settings" get_settings
   post "/v1/settings" post_settings
   get "/v1/analytics" get_analytics
+  get "/v1/analytics/audit" get_weekly_audit
   get "/v1/channels/telegram" get_telegram_config
   post "/v1/channels/telegram/test" post_telegram_test
   get "/v1/push/subscriptions" get_push_subscriptions
@@ -145,7 +155,17 @@ api
 
   get "/v1/memory" get_memory
   post "/v1/memory" post_memory
+  get "/v1/memory/staged" get_staged_memory
+  post "/v1/memory/staged/:id/promote" post_promote_staged_memory
+  post "/v1/memory/dream" post_run_dreaming
+  get "/v1/memory/dream/history" get_dreaming_history
+  post "/v1/memory/dream/:id/rollback" post_rollback_dreaming
   delete "/v1/memory/:id" delete_memory_by_id
+
+  get "/v1/intents" get_intents
+  post "/v1/intents" post_intent
+  post "/v1/intents/evaluate" post_evaluate_intents
+  delete "/v1/intents/:id" delete_intent_by_id
 
   get "/v1/skills" get_skills
   get "/v1/skills/:name" get_skill_by_name
@@ -262,6 +282,22 @@ fn job_poll_telegram(
   try ensure_ready(db, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
   _n = Telegram.poll_once(rt, db, budget, policy, scheduler)
+  Ok(Unit)
+end
+
+## Background worker job: runs overnight Dreaming consolidation once per local day around 03:00.
+fn job_run_dreaming(_payload: Json, db: Sqlite.Database, clock: Clock) : Result(Unit, MotetError)
+  try ensure_ready(db, clock)
+  settings = try Store.get_settings(db)
+  now_t = clock.now
+  local = Scheduler.to_local_clock(now_t, settings.timezone)
+  if local.hour == 3
+    day_prefix = Store.utc_day_prefix(now_t.to_text)
+    already = try Memory.has_dreamed_today(db, day_prefix)
+    if not already
+      _d = try Memory.run_dreaming(db, now_t.to_text)
+    end
+  end
   Ok(Unit)
 end
 
@@ -903,9 +939,118 @@ fn delete_memory_by_id(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int
   Ok(DeleteResult(deleted?: true))
 end
 
-## Lists installed progressive-disclosure SKILL.md documents.
-fn get_skills(_op: Operator, files: ReadFiles) : List(SkillSummary)
-  Skills.index_skills(files)
+## Lists staged untrusted/routine memory candidates waiting for owner promotion.
+fn get_staged_memory(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+  List(MemoryEntry),
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Store.list_staged_memories(db, 50)
+end
+
+## Promotes a staged memory candidate into active owner-verified durable memory.
+fn post_promote_staged_memory(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+  MemoryEntry,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Store.promote_staged_memory(db, id)
+end
+
+## Runs Overnight Dreaming consolidation (Light -> REM -> Deep) with a pre-image rollback snapshot.
+fn post_run_dreaming(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+  DreamingDigest,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Memory.run_dreaming(db, clock.now.to_text)
+end
+
+## Lists recent Overnight Dreaming digests and rollback state.
+fn get_dreaming_history(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+  List(DreamingDigest),
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Memory.list_dreaming_history(db, 20)
+end
+
+## 1-click Rollback of an Overnight Dreaming run to its pre-image memory snapshot.
+fn post_rollback_dreaming(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+  DreamingDigest,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Memory.rollback_dreaming(db, id)
+end
+
+## Lists active Standing Intents (zero-LLM FTS prefiltered event watchdogs).
+fn get_intents(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+  List(StandingIntent),
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Intents.list_intents(db, true)
+end
+
+## Creates a bounded Standing Intent with cooldown, max_fires, and expiry.
+fn post_intent(_op: Operator, db: Sqlite.Database, clock: Clock, body: CreateIntentRequest) : Result(
+  StandingIntent,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Intents.create_intent(db, body, clock.now)
+end
+
+## Evaluates text against active Standing Intents (zero LLM cost when unmatched).
+fn post_evaluate_intents(
+  _op: Operator,
+  db: Sqlite.Database,
+  clock: Clock,
+  srng: SecureRandom,
+  body: EvaluateIntentsRequest
+) : Result(EvaluateIntentsResponse, MotetError)
+  try ensure_ready(db, clock)
+  Intents.evaluate_text(db, body.source, body.text, clock.now, srng)
+end
+
+## Explicit-only owner cancellation of a Standing Intent.
+fn delete_intent_by_id(_op: Operator, db: Sqlite.Database, clock: Clock, id: Int) : Result(
+  DeleteResult,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  try Intents.cancel_intent(db, id)
+  Ok(DeleteResult(deleted?: true))
+end
+
+## Weekly Self-Audit Anti-Job scorecard (routine noise, unused bot skills, approval friction).
+fn get_weekly_audit(_op: Operator, db: Sqlite.Database, files: ReadFiles, clock: Clock) : Result(
+  WeeklyAuditReport,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Memory.generate_weekly_audit(db, files, clock.now.to_text)
+end
+
+## Lists installed progressive-disclosure SKILL.md documents enriched with Skill Curator usage counts.
+fn get_skills(_op: Operator, db: Sqlite.Database, files: ReadFiles, clock: Clock) : Result(
+  List(SkillSummary),
+  MotetError
+)
+  try ensure_ready(db, clock)
+  usage = try Store.get_skill_usage_map(db)
+  Ok(
+    Skills.index_skills(files).map(fn(s)
+      SkillSummary(
+        name: s.name,
+        description: s.description,
+        provenance: s.provenance,
+        path: s.path,
+        usage_count: usage.get(s.name) or 0
+      )
+    end)
+  )
 end
 
 ## Reads a single SKILL.md document in full by slug.
@@ -1539,6 +1684,9 @@ fn post_webhook(
     now_text
   )
 
+  # Evaluate active Standing Intents against the incoming webhook text (zero-LLM when unmatched).
+  _int_eval = Intents.evaluate_text(db, "webhook:#{source}", body_text, clock.now, srng)
+
   # Wake the routed bot via an External-trust async run if the bot exists and is active.
   run_id_opt = case try Store.get_bot(db, target_bot)
     Some(b) if b.active?:
@@ -2026,4 +2174,84 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   assert ha_test.status == 200 and
     ha_test.text.contains?("hearth_get_snapshot") and
     ha_test.text.contains?("hearth_undo_event")
+
+  # 9. Phase 4: Dreaming + 1-click Rollback, Standing Intents, and Weekly Self-Audit Anti-Job
+  dream_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/memory/dream").with_bearer("secret-op"),
+    sqlite,
+    env,
+    clock,
+    srng,
+    budget,
+    policy,
+    sched
+  )
+  assert dream_resp.status == 200 and Json.decode[DreamingDigest](dream_resp.text) is Ok(dd)
+  rb_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/memory/dream/#{dd.id}/rollback").with_bearer("secret-op"),
+    sqlite,
+    env,
+    clock,
+    srng,
+    budget,
+    policy,
+    sched
+  )
+  assert rb_resp.status == 200 and rb_resp.text.contains?("\"rolled_back?\":true")
+
+  int_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/intents").with_bearer("secret-op").with_json(
+      CreateIntentRequest(
+        bot_name: "personal",
+        name: "watch-permit",
+        watch_terms: "permit contractor",
+        instruction: "Notify immediately",
+        cooldown_seconds: Some(3600),
+        max_fires: Some(5),
+        expires_days: Some(14)
+      )
+    ),
+    sqlite,
+    env,
+    clock,
+    srng,
+    budget,
+    policy,
+    sched
+  )
+  assert int_resp.status == 200 and int_resp.text.contains?("watch-permit")
+
+  eval_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/intents/evaluate").with_bearer("secret-op").with_json(
+      EvaluateIntentsRequest(source: "gmail", text: "Contractor sent permit approval")
+    ),
+    sqlite,
+    env,
+    clock,
+    srng,
+    budget,
+    policy,
+    sched
+  )
+  assert eval_resp.status == 200 and
+    Json.decode[EvaluateIntentsResponse](eval_resp.text) is Ok(evr) and
+    evr.matched == 1
+
+  audit_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/analytics/audit").with_bearer("secret-op"),
+    sqlite,
+    vfiles,
+    env,
+    clock,
+    srng,
+    budget,
+    policy,
+    sched
+  )
+  assert audit_resp.status == 200 and audit_resp.text.contains?("Motet Weekly Self-Audit")
 end

@@ -58,6 +58,12 @@ VaultFileWriteRequest(..),
 VaultSearchResponse(..),
 PublishGdocRequest(..),
 PublishGdocResponse(..),
+StandingIntent(..),
+CreateIntentRequest(..),
+EvaluateIntentsRequest(..),
+EvaluateIntentsResponse(..),
+DreamingDigest(..),
+WeeklyAuditReport(..),
 provider_to_text,
 provider_from_text,
 effect_to_text,
@@ -192,6 +198,9 @@ struct MemoryEntry
   kind: Text
   content: Text
   provenance: Text
+  origin: Text
+  session_kind: Text
+  staged: Bool
   created_at: Text
 end
 
@@ -207,6 +216,7 @@ struct SkillSummary
   description: Text
   provenance: Text
   path: Text
+  usage_count: Int
 end
 
 struct SkillDoc
@@ -540,6 +550,58 @@ end
 struct PublishGdocResponse
   account: Text
   url: Text
+end
+
+struct StandingIntent
+  id: Int
+  bot_name: Text
+  name: Text
+  watch_terms: Text
+  instruction: Text
+  cooldown_seconds: Int
+  max_fires: Int
+  fire_count: Int
+  expires_at: Text
+  active?: Bool
+  last_fired_at: Option(Text)
+end
+
+struct CreateIntentRequest
+  bot_name: Text
+  name: Text
+  watch_terms: Text
+  instruction: Text
+  cooldown_seconds: Option(Int)
+  max_fires: Option(Int)
+  expires_days: Option(Int)
+end
+
+struct EvaluateIntentsRequest
+  source: Text
+  text: Text
+end
+
+struct EvaluateIntentsResponse
+  matched: Int
+  triggered_runs: List(Text)
+end
+
+struct DreamingDigest
+  id: Int
+  run_at: Text
+  summary: Text
+  promoted_count: Int
+  pruned_count: Int
+  rolled_back?: Bool
+end
+
+struct WeeklyAuditReport
+  generated_at: Text
+  total_routines: Int
+  zero_value_routines: List(Text)
+  unused_bot_skills: List(Text)
+  repeated_approval_tools: List(Text)
+  summary_markdown: Text
 end
 
 fn provider_to_text(p: ProviderKind) : Text

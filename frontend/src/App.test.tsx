@@ -102,6 +102,16 @@ function mockFetch() {
         { name: 'ANTHROPIC_API_KEY', scope: 'llm', updated_at: '2026-11-25', source: 'vault' },
       ]);
     }
+    if (url.includes('/v1/analytics/audit')) {
+      return json({
+        generated_at: '2026-11-25T19:00:00Z',
+        total_routines: 4,
+        zero_value_routines: [],
+        unused_bot_skills: ['stale-bot-skill (bot_proposed:chief)'],
+        repeated_approval_tools: [],
+        summary_markdown: '# Motet Weekly Self-Audit\n\n- **Total routines:** 4',
+      });
+    }
     if (url.includes('/v1/analytics')) {
       return json({
         day: '2026-11-25',
@@ -116,6 +126,47 @@ function mockFetch() {
         active_bots: 5,
         by_bot: [],
       });
+    }
+    if (url.includes('/v1/vault/files')) {
+      return json([{ path: 'notes/trip.md', folder: 'notes', size_bytes: 42 }]);
+    }
+    if (url.includes('/v1/vault/git/status')) {
+      return json({
+        'initialized?': true,
+        branch: 'main',
+        dirty_count: 0,
+        last_commit: 'abc123 Add trip note',
+        remote: 'origin',
+      });
+    }
+    if (url.includes('/v1/intents')) {
+      return json([
+        {
+          id: 1,
+          bot_name: 'personal',
+          name: 'watch-permit',
+          watch_terms: 'permit contractor',
+          instruction: 'Alert immediately',
+          cooldown_seconds: 3600,
+          max_fires: 5,
+          fire_count: 1,
+          expires_at: '2026-12-09T00:00:00Z',
+          'active?': true,
+          last_fired_at: null,
+        },
+      ]);
+    }
+    if (url.includes('/v1/memory/dream/history')) {
+      return json([
+        {
+          id: 1,
+          run_at: '2026-11-25T03:00:00Z',
+          summary: 'Light pass pruned 1 duplicate; REM pass promoted 1 owner preference.',
+          promoted_count: 1,
+          pruned_count: 1,
+          'rolled_back?': false,
+        },
+      ]);
     }
     return json([]);
   });
@@ -156,10 +207,32 @@ describe('Motet Control Plane Dashboard', () => {
       expect(screen.getByText('Approve & Run')).toBeInTheDocument();
     });
 
-    // Switch to Analytics & System and verify cache hit rate renders
+    // Switch to Analytics & System and verify cache hit rate + weekly audit scorecard render
     fireEvent.click(screen.getByText('Analytics & System'));
     await waitFor(() => {
       expect(screen.getByText('82%')).toBeInTheDocument();
+      expect(screen.getByText('Weekly Self-Audit Anti-Job Scorecard')).toBeInTheDocument();
+    });
+
+    // Switch to Personal Vault & Pages and verify Git+qmd vault renders
+    fireEvent.click(screen.getByText('Vault & Pages'));
+    await waitFor(() => {
+      expect(screen.getByText('notes/trip.md')).toBeInTheDocument();
+      expect(screen.getByText('main · 0 pending')).toBeInTheDocument();
+    });
+
+    // Switch to Routines & Intents and verify Standing Intent renders
+    fireEvent.click(screen.getByText('Routines & Intents'));
+    await waitFor(() => {
+      expect(screen.getByText('Standing Intents (Zero-LLM FTS Watchdogs)')).toBeInTheDocument();
+      expect(screen.getByText('personal:watch-permit')).toBeInTheDocument();
+    });
+
+    // Switch to Memory & Dreaming and verify Dreaming Rollback renders
+    fireEvent.click(screen.getByText('Memory & Dreaming'));
+    await waitFor(() => {
+      expect(screen.getByText('Dreaming History & Rollback')).toBeInTheDocument();
+      expect(screen.getByText('Rollback')).toBeInTheDocument();
     });
   });
 });
