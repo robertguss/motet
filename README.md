@@ -4,7 +4,7 @@
 
 It combines:
 - **Grok Bot simplicity:** a small roster of named persistent teammates (`chief`, `watcher`, `builder`), tiered memory (shared "About you" + per-bot rules & work log), standing routines, and a single **Needs You** approval inbox.
-- **Hermes power without Python bloat:** dual-protocol LLM client (OpenAI-compatible + Anthropic Messages API with explicit prompt-cache breakpoints), progressive-disclosure `SKILL.md` skills (`agentskills.io`), append-only WAL SQLite session logs with full-text token search, and confined local workspace tools.
+- **Hermes power without Python bloat:** dual-protocol LLM client (OpenAI-compatible + Anthropic Messages API with explicit prompt-cache breakpoints), progressive-disclosure `SKILL.md` skills (`agentskills.io`), crash-safe pure-Mo **MoDB** storage (`motet.modb` + physically isolated `motet-secrets.modb` for OAuth secrets) with inverted token search, tamper-evident SHA-256 hash-chained audit ledger, attenuated delegation Grants, advisory Claims leases, selective-undo Replay, and confined local workspace tools.
 - **Devin Bot supervision + T3 Code orchestration:** standing engineering responsibilities backed by a unified Streamable-HTTP MCP connector engine — with **T3 Code** mounted as Connector #1 so bots can monitor projects/threads/PRs and coordinate isolated worktree threads, while future connectors (Slack, Notion, Linear, GitHub, Gmail) plug into the exact same contract.
 
 ## Quickstart
@@ -19,9 +19,10 @@ mo test server.mo
 ### 2. Install the `motet` CLI
 
 ```sh
-mo install main.mo --name motet --state-dir ~/.local/share/motet
+mo install main.mo --name motet --root ~/.local/share/motet
 motet init
 motet bots
+motet verify
 ```
 
 ### 3. Set a provider key and talk to your roster
