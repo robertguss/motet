@@ -157,37 +157,26 @@ export default function App() {
     try {
       const h = await api<HealthSummary>('/v1/health');
       setHealth(h);
-      const [
-        b,
-        s,
-        ib,
-        bd,
-        c,
-        ca,
-        rt,
-        sk,
-        mm,
-        rl,
-        ar,
-        sc,
-        wh,
-        st,
-        tg,
-        ps,
-        an,
-      ] = await Promise.all([
+      // Batch dashboard requests so initial mount and background polling do not burst-saturate mo serve.
+      const [b, s, ib, bd] = await Promise.all([
         apiOptional<BotConfig[]>('/v1/bots', []),
         apiOptional<SessionSummary[]>('/v1/sessions', []),
         apiOptional<ApprovalItem[]>('/v1/inbox?pending=false', []),
         apiOptional<BudgetSnapshot[]>('/v1/budget', []),
+      ]);
+      const [c, ca, rt, sk] = await Promise.all([
         apiOptional<ConnectorSpec[]>('/v1/connectors', []),
         apiOptional<ConnectorAuthStatus[]>('/v1/connectors/auth', []),
         apiOptional<RoutineSpec[]>('/v1/routines', []),
         apiOptional<SkillSummary[]>('/v1/skills', []),
+      ]);
+      const [mm, rl, ar, sc] = await Promise.all([
         apiOptional<MemoryEntry[]>('/v1/memory', []),
         apiOptional<PolicyRule[]>('/v1/rules', []),
         apiOptional<ArtifactItem[]>('/v1/artifacts', []),
         apiOptional<VaultSecretMeta[]>('/v1/vault/secrets', []),
+      ]);
+      const [wh, st, tg, ps, an] = await Promise.all([
         apiOptional<WebhookConfig[]>('/v1/webhooks', []),
         apiOptional<AppSettings | null>('/v1/settings', null),
         apiOptional<TelegramConfig | null>('/v1/channels/telegram', null),
@@ -229,7 +218,10 @@ export default function App() {
       toast(`Connected ${connected} via OAuth!`);
       window.history.replaceState({}, '', '/');
     }
-    const id = window.setInterval(refreshAll, 15000);
+    const id = window.setInterval(() => {
+      if (document.hidden) return;
+      refreshAll();
+    }, 30000);
     return () => window.clearInterval(id);
   }, [refreshAll, toast]);
 

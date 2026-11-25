@@ -692,7 +692,14 @@ fn execute_tool_in_context(
           stored_tok = try resolve_stored_connector_token(rt, db, spec)
           resolved_tok = Mcp.resolve_connector_token(spec, rt.env, stored_tok)
           if Connectors.is_builtin_connector?(spec)
-            case Connectors.dispatch_builtin_tool(rt.network, spec, resolved_tok, rtool, rargs)
+            case Connectors.dispatch_builtin_tool_at(
+              rt.network,
+              now_text,
+              spec,
+              resolved_tok,
+              rtool,
+              rargs
+            )
               Ok(out): Ok(out)
               Error(err): Ok("connector_error: #{err}")
             end

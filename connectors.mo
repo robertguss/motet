@@ -8,6 +8,7 @@ module Connectors
 expose builtin_connector_tools,
 is_builtin_connector?,
 dispatch_builtin_tool,
+dispatch_builtin_tool_at,
 gdocs_publish_page,
 hearth_get_snapshot,
 todoist_list_tasks,
@@ -15,6 +16,7 @@ todoist_add_task
 use Http
 use Json
 use Mcp{McpToolInfo, parse_host_port}
+use Oauth{percent_encode}
 use Types{ConnectorSpec, EffectClass, MotetError}
 
 fn is_builtin_connector?(spec: ConnectorSpec) : Bool
@@ -33,7 +35,12 @@ fn builtin_connector_tools(spec: ConnectorSpec) : List(McpToolInfo)
     return [
       McpToolInfo(
         name: "gmail_list_messages",
-        description: "Search and list recent emails (args: query, max_results)",
+        description: "Search and list recent emails with sender, subject, date, and snippet (args: query, max_results)",
+        effect_class: Read
+      ),
+      McpToolInfo(
+        name: "gmail_get_message",
+        description: "Fetch full Gmail message headers and plain-text body (args: id)",
         effect_class: Read
       ),
       McpToolInfo(
@@ -52,7 +59,7 @@ fn builtin_connector_tools(spec: ConnectorSpec) : List(McpToolInfo)
     return [
       McpToolInfo(
         name: "gcal_list_events",
-        description: "List upcoming Google Calendar events (args: time_min, max_results)",
+        description: "List upcoming Google Calendar events (args: time_min optional defaulting to now, max_results)",
         effect_class: Read
       ),
       McpToolInfo(
@@ -184,12 +191,54 @@ end
 # ==============================================================================
 # Google Workspace (Gmail, Calendar, Google Docs) — Multi-Account Isolated
 # ==============================================================================
+fn gmail_header(headers: List(Json), want: Text) : Text
+  target = want.trim.ascii_lowercase
+  vals = headers.filter_map(fn(h)
+    if (h.text_at("name") or "").trim.ascii_lowercase == target
+      h.text_at("value")
+    else
+      None
+    end
+  end)
+  vals.first or ""
+end
+
+fn decode_base64url_utf8(encoded: Text) : Text
+  clean = encoded.trim
+  if clean.empty?
+    return ""
+  end
+  case Bytes.from_base64url(clean)
+    Some(raw): raw.decode_utf8 or ""
+    None: ""
+  end
+end
+
+fn gmail_extract_plain_body(part: Json) : Text
+  mime = (part.text_at("mimeType") or "").trim.ascii_lowercase
+  data = part.text_at("body.data") or ""
+  if not data.trim.empty? and (mime == "text/plain" or mime.empty?)
+    decoded = decode_base64url_utf8(data)
+    return decoded if not decoded.trim.empty?
+  end
+  subparts = part.list_at("parts") or []
+  found = subparts.filter_map(fn(p)
+    txt = gmail_extract_plain_body(p)
+    if txt.trim.empty?: None else: Some(txt)
+  end)
+  return found.first or "" if not found.empty?
+  if not data.trim.empty?
+    return decode_base64url_utf8(data)
+  end
+  ""
+end
+
 fn gmail_list_messages(network: Network, token: Text, query: Text, max_results: Int) : Result(
   Text,
   MotetError
 )
   cap = if max_results > 0 and max_results <= 25: max_results else: 10
-  q_param = if query.trim.empty?: "" else: "&q=#{query.trim.replace(" ", "+")}"
+  q_param = if query.trim.empty?: "" else: "&q=#{percent_encode(query.trim)}"
   url = "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=#{cap}#{q_param}"
   doc = try get_json_authed(network, url, token)
   msgs = doc.list_at("messages") or []
@@ -197,7 +246,53 @@ fn gmail_list_messages(network: Network, token: Text, query: Text, max_results: 
     return Ok("No matching Gmail messages.")
   end
   ids = msgs.filter_map(fn(m) m.text_at("id") end)
-  Ok("Found #{ids.size} Gmail message(s): #{ids.join(", ")}")
+  hydrated_ids = ids.take(10)
+  var lines = []
+  for id in hydrated_ids
+    meta_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/#{percent_encode(id)}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date"
+    line = case get_json_authed(network, meta_url, token)
+      Ok(m):
+        hdrs = m.list_at("payload.headers") or []
+        subj_raw = gmail_header(hdrs, "Subject")
+        from_raw = gmail_header(hdrs, "From")
+        date_raw = gmail_header(hdrs, "Date")
+        subj = if subj_raw.trim.empty?: "(no subject)" else: subj_raw.trim
+        from = if from_raw.trim.empty?: "(unknown sender)" else: from_raw.trim
+        snip = (m.text_at("snippet") or "").trim
+        snip_line = if snip.empty?: "" else: "\n  Snippet: #{snip}"
+        "- [#{id}] #{subj} | From: #{from} | Date: #{date_raw.trim}#{snip_line}"
+      Error(_): "- [#{id}] (metadata unavailable)"
+    end
+    lines = lines.append(line)
+  end
+  extra = if ids.size > 10
+    rem = ids.drop(10)
+    "\n... plus #{rem.size} more message ID(s): #{rem.join(", ")}"
+  else
+    ""
+  end
+  Ok("Found #{ids.size} Gmail message(s):\n#{lines.join("\n")}#{extra}")
+end
+
+fn gmail_get_message(network: Network, token: Text, message_id: Text) : Result(Text, MotetError)
+  clean_id = message_id.trim
+  if clean_id.empty?
+    return Error(BadInput(message: "gmail_get_message requires id"))
+  end
+  url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/#{percent_encode(clean_id)}?format=full"
+  doc = try get_json_authed(network, url, token)
+  hdrs = doc.list_at("payload.headers") or []
+  from = gmail_header(hdrs, "From")
+  to = gmail_header(hdrs, "To")
+  subj = gmail_header(hdrs, "Subject")
+  date = gmail_header(hdrs, "Date")
+  snip = (doc.text_at("snippet") or "").trim
+  body = case doc.get("payload")
+    Some(p): gmail_extract_plain_body(p)
+    None: ""
+  end
+  body_out = if body.trim.empty?: snip else: body.trim
+  Ok("ID: #{clean_id}\nFrom: #{from}\nTo: #{to}\nDate: #{date}\nSubject: #{subj}\n\n#{body_out}")
 end
 
 fn gmail_create_draft(network: Network, token: Text, to: Text, subject: Text, body: Text) : Result(
@@ -232,12 +327,16 @@ fn gmail_send_message(network: Network, token: Text, to: Text, subject: Text, bo
   Ok("Sent Gmail message #{mid} to #{to} (subject: #{subject})")
 end
 
-fn gcal_list_events(network: Network, token: Text, time_min: Text, max_results: Int) : Result(
-  Text,
-  MotetError
-)
+fn gcal_list_events(
+  network: Network,
+  token: Text,
+  time_min: Text,
+  max_results: Int,
+  default_now_iso: Text
+) : Result(Text, MotetError)
   cap = if max_results > 0 and max_results <= 25: max_results else: 10
-  tm = if time_min.trim.empty?: "" else: "&timeMin=#{time_min.trim}"
+  eff_min = if time_min.trim.empty?: default_now_iso.trim else: time_min.trim
+  tm = if eff_min.empty?: "" else: "&timeMin=#{percent_encode(eff_min)}"
   url = "https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&maxResults=#{cap}#{tm}"
   doc = try get_json_authed(network, url, token)
   items = doc.list_at("items") or []
@@ -247,7 +346,12 @@ fn gcal_list_events(network: Network, token: Text, time_min: Text, max_results: 
   lines = items.map(fn(ev)
     sum = ev.text_at("summary") or "(untitled)"
     st = ev.text_at("start.dateTime") or (ev.text_at("start.date") or "")
-    "- #{st}: #{sum}"
+    loc = (ev.text_at("location") or "").trim
+    if loc.empty?
+      "- #{st}: #{sum}"
+    else
+      "- #{st}: #{sum} (#{loc})"
+    end
   end)
   Ok(lines.join("\n"))
 end
@@ -429,9 +533,10 @@ fn hearth_undo_event(network: Network, base_url: Text, token: Text, event_id: Te
   Ok("Hearth Arvo Undo completed for event #{event_id.trim}: #{doc.to_text}")
 end
 
-## Unified dispatcher for built-in everyday connectors (called from `Tools.execute_tool`).
-fn dispatch_builtin_tool(
+## Unified dispatcher for built-in everyday connectors with caller timestamp context.
+fn dispatch_builtin_tool_at(
   network: Network,
+  now_iso: Text,
   spec: ConnectorSpec,
   token_opt: Option(Text),
   tool_name: Text,
@@ -452,6 +557,9 @@ fn dispatch_builtin_tool(
         args.text_at("query") or "",
         args.int_at("max_results") or 10
       )
+    end
+    if tool_name == "gmail_get_message"
+      return gmail_get_message(network, token, args.text_at("id") or "")
     end
     if tool_name == "gmail_create_draft"
       return gmail_create_draft(
@@ -479,7 +587,8 @@ fn dispatch_builtin_tool(
         network,
         token,
         args.text_at("time_min") or "",
-        args.int_at("max_results") or 10
+        args.int_at("max_results") or 10,
+        now_iso
       )
     end
     if tool_name == "gcal_create_event"
@@ -552,6 +661,17 @@ fn dispatch_builtin_tool(
   end
 
   Error(BadInput(message: "unknown tool '#{tool_name}' for connector #{spec.name} (#{spec.kind})"))
+end
+
+## Unified dispatcher for built-in everyday connectors (called from `Tools.execute_tool` or tests).
+fn dispatch_builtin_tool(
+  network: Network,
+  spec: ConnectorSpec,
+  token_opt: Option(Text),
+  tool_name: Text,
+  arguments_json: Text
+) : Result(Text, MotetError)
+  dispatch_builtin_tool_at(network, "", spec, token_opt, tool_name, arguments_json)
 end
 
 test "Connectors dispatch Todoist, Hearth Arvo Safe-to-Spend, and Google Docs Page publish over fake Network"
@@ -635,4 +755,99 @@ test "Connectors dispatch Todoist, Hearth Arvo Safe-to-Spend, and Google Docs Pa
 
   assert gdocs_publish_page(net, "gd-tok", "Q4 Brief", "Summary text") ==
     Ok("https://docs.google.com/document/d/doc_77/edit")
+
+  # 4. Gmail metadata hydration + full fetch + Calendar default timeMin=now
+  gm_list = Http.get(
+    "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=2&q=from%3Aalice%20test"
+  ).header("Authorization", "Bearer gm-tok").header("Accept", "application/json").within(25.seconds)
+  gm_meta = Http.get(
+    "https://gmail.googleapis.com/gmail/v1/users/me/messages/msg_1?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date"
+  ).header("Authorization", "Bearer gm-tok").header("Accept", "application/json").within(25.seconds)
+  gm_full = Http.get("https://gmail.googleapis.com/gmail/v1/users/me/messages/msg_1?format=full")
+    .header("Authorization", "Bearer gm-tok").header("Accept", "application/json").within(
+      25.seconds
+    )
+  gc_list = Http.get(
+    "https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&maxResults=3&timeMin=2026-11-25T16%3A30%3A00Z"
+  ).header("Authorization", "Bearer gc-tok").header("Accept", "application/json").within(25.seconds)
+
+  g_net = Network.fake(
+    Http.replies([
+      (gm_list, Http.reply(200, "{\"messages\":[{\"id\":\"msg_1\"}]}")),
+      (
+        gm_meta,
+        Http.reply(
+          200,
+          "{\"id\":\"msg_1\",\"snippet\":\"Quick check-in\",\"payload\":{\"headers\":[{\"name\":\"From\",\"value\":\"alice@example.com\"},{\"name\":\"Subject\",\"value\":\"Status update\"},{\"name\":\"Date\",\"value\":\"Wed, 25 Nov 2026 10:00:00 -0800\"}]}}"
+        )
+      ),
+      (
+        gm_full,
+        Http.reply(
+          200,
+          "{\"id\":\"msg_1\",\"snippet\":\"Quick check-in\",\"payload\":{\"mimeType\":\"text/plain\",\"headers\":[{\"name\":\"From\",\"value\":\"alice@example.com\"},{\"name\":\"To\",\"value\":\"me@example.com\"},{\"name\":\"Subject\",\"value\":\"Status update\"},{\"name\":\"Date\",\"value\":\"Wed, 25 Nov 2026 10:00:00 -0800\"}],\"body\":{\"data\":\"SGVsbG8h\"}}}"
+        )
+      ),
+      (
+        gc_list,
+        Http.reply(
+          200,
+          "{\"items\":[{\"summary\":\"Design sync\",\"start\":{\"dateTime\":\"2026-11-25T18:00:00Z\"},\"location\":\"Room 4B\"}]}"
+        )
+      )
+    ])
+  )
+
+  gm_spec = ConnectorSpec(
+    name: "gmail-work",
+    kind: "google_gmail",
+    url: "https://gmail.googleapis.com",
+    auth_env: "GOOGLE_WORK_REFRESH_TOKEN",
+    allowed_host: "gmail.googleapis.com:443",
+    default_effect: WriteExternal,
+    enabled?: true
+  )
+  gc_spec = ConnectorSpec(
+    name: "gcal-work",
+    kind: "google_gcal",
+    url: "https://www.googleapis.com/calendar/v3",
+    auth_env: "GOOGLE_WORK_REFRESH_TOKEN",
+    allowed_host: "www.googleapis.com:443",
+    default_effect: WriteExternal,
+    enabled?: true
+  )
+
+  gm_out = dispatch_builtin_tool_at(
+    g_net,
+    "2026-11-25T16:30:00Z",
+    gm_spec,
+    Some("gm-tok"),
+    "gmail_list_messages",
+    "{\"query\":\"from:alice test\",\"max_results\":2}"
+  )
+  assert gm_out is Ok(list_txt) and
+    list_txt.contains?("Status update") and
+    list_txt.contains?("alice@example.com") and
+    list_txt.contains?("Quick check-in")
+
+  assert dispatch_builtin_tool_at(
+    g_net,
+    "2026-11-25T16:30:00Z",
+    gm_spec,
+    Some("gm-tok"),
+    "gmail_get_message",
+    "{\"id\":\"msg_1\"}"
+  ) is
+    Ok(msg_txt) and
+    msg_txt.contains?("Hello!")
+
+  assert dispatch_builtin_tool_at(
+    g_net,
+    "2026-11-25T16:30:00Z",
+    gc_spec,
+    Some("gc-tok"),
+    "gcal_list_events",
+    "{\"max_results\":3}"
+  ) ==
+    Ok("- 2026-11-25T18:00:00Z: Design sync (Room 4B)")
 end
