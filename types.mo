@@ -1,12 +1,14 @@
 ## Core domain types for Motet v1: bots, strict specialist walls, async runs,
-## write-only vault metadata, sessions, memory, skills, routines, connectors,
-## policy decisions, editable approvals, artifacts, webhooks, and errors.
+## write-only vault metadata, sessions, memory, skills, wall-clock routines,
+## connectors, policy decisions, editable approvals, artifacts, channels, push,
+## settings, analytics, webhooks, and errors.
 module Types
 expose ProviderKind(..),
 EffectClass(..),
 TrustLevel(..),
 ApprovalDecision(..),
 ApprovalStatus(..),
+MotetError(..),
 BotConfig(..),
 CreateBotRequest(..),
 CloneBotRequest(..),
@@ -46,7 +48,11 @@ ConnectorAuthStatus(..),
 StartOAuthRequest(..),
 StartOAuthResponse(..),
 ConnectorTestResult(..),
-MotetError(..),
+AppSettings(..),
+TelegramConfig(..),
+TelegramTestResult(..),
+PushSubscription(..),
+AnalyticsSummary(..),
 provider_to_text,
 provider_from_text,
 effect_to_text,
@@ -218,18 +224,30 @@ struct RoutineSpec
   name: Text
   prompt: Text
   interval_seconds: Int
+  schedule_kind: Text
+  schedule_expr: Text
+  timezone: Text
   read_only?: Bool
+  skip_memory?: Bool
+  precheck_kind: Text
   enabled?: Bool
   next_due_at: Text
   last_run_at: Option(Text)
+  run_count: Int
+  skip_count: Int
 end
 
 struct CreateRoutineRequest
   bot_name: Text
   name: Text
   prompt: Text
-  interval_seconds: Int
+  interval_seconds: Option(Int)
+  schedule_kind: Option(Text)
+  schedule_expr: Option(Text)
+  timezone: Option(Text)
   read_only: Option(Bool)
+  skip_memory: Option(Bool)
+  precheck_kind: Option(Text)
 end
 
 struct ApprovalItem
@@ -387,6 +405,7 @@ end
 struct TickSummary
   checked_at: Text
   routines_ran: Int
+  routines_skipped: Int
   approvals_created: Int
   results: List(Text)
 end
@@ -401,6 +420,8 @@ struct HealthSummary
   queued_runs: Int
   vault_secrets: Int
   master_key_set?: Bool
+  telegram_enabled?: Bool
+  push_subscriptions: Int
 end
 
 struct ToggleRequest
@@ -439,6 +460,54 @@ struct ConnectorTestResult
   tool_count: Int
   tools: List(Text)
   error: Option(Text)
+end
+
+struct AppSettings
+  timezone: Text
+  quiet_hours_start: Text
+  quiet_hours_end: Text
+  public_url: Text
+  vault_path: Text
+  vault_git_remote: Text
+  telegram_enabled?: Bool
+  telegram_allowed_user_id: Text
+  telegram_default_bot: Text
+end
+
+struct TelegramConfig
+  enabled?: Bool
+  allowed_user_id: Text
+  default_bot: Text
+  token_configured?: Bool
+  last_update_id: Int
+end
+
+struct TelegramTestResult
+  ok?: Bool
+  bot_username: Text
+  error: Option(Text)
+end
+
+struct PushSubscription
+  endpoint: Text
+  p256dh: Text
+  auth: Text
+  user_agent: Text
+  created_at: Text
+end
+
+struct AnalyticsSummary
+  day: Text
+  total_spent_usd: Decimal
+  total_input_tokens: Int
+  total_output_tokens: Int
+  total_cached_tokens: Int
+  cache_hit_pct: Int
+  routines_total_runs: Int
+  routines_total_skips: Int
+  pending_approvals: Int
+  active_bots: Int
+  by_bot: List(BudgetSnapshot)
 end
 
 fn provider_to_text(p: ProviderKind) : Text

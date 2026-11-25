@@ -950,7 +950,36 @@ fn drain_queued_runs(
   Ok(processed)
 end
 
-## Executes all enabled routines whose `next_due_at <= now`, defaulting to Routine trust.
+## Zero-token routine precheck before invoking any LLM.
+fn routine_precheck_passes(db: Sqlite.Database, precheck_kind: Text, last_run_at: Option(Text)) : Result(
+  Bool,
+  MotetError
+)
+  pk = precheck_kind.trim.ascii_lowercase
+  return Ok(true) if pk.empty? or pk == "always" or pk == "none"
+  if pk == "pending_approvals"
+    pend = try Store.list_approvals(db, true)
+    return Ok(not pend.empty?)
+  end
+  if pk == "unread_events"
+    since = last_run_at or ""
+    rows = try db.query("SELECT COUNT(*) FROM events WHERE created_at > ?", [Sqlite.String(since)])
+      .map_error(fn(e) StorageFailed(message: "#{e}") end)
+    cnt = case rows.rows.first
+      Some(r):
+        case r.first
+          Some(Sqlite.Integer(n)): n
+          Some(_) | None: 0
+        end
+      None: 0
+    end
+    return Ok(cnt > 0)
+  end
+  Ok(true)
+end
+
+## Executes all enabled routines whose wall-clock slot or interval is due,
+## enforcing at-most-once occurrence slots, zero-token prechecks, and Routine trust.
 fn run_due_routines(
   rt: ToolRuntime,
   db: Sqlite.Database,
@@ -960,14 +989,47 @@ fn run_due_routines(
 ) : Result(TickSummary, MotetError)
   now_time = rt.clock.now
   now_text = now_time.to_text
-  due = try Store.list_due_routines(db, now_text)
+  candidates = try Store.list_due_routines(db, now_text)
   var ran = 0
+  var skipped = 0
   var approvals = 0
   var results = []
 
-  for r in due
+  for r in candidates
+    slot_opt = Scheduler.evaluate_wall_clock_slot(
+      now_time,
+      r.schedule_kind,
+      r.schedule_expr,
+      r.timezone,
+      r.next_due_at
+    )
+    slot_key = case slot_opt
+      Some(sk): sk
+      None: continue
+    end
+    # At-most-once occurrence ledger prevents duplicate fires across restarts
+    claimed = try Store.claim_routine_slot(db, r.id, slot_key, now_text)
+    if not claimed
+      continue
+    end
+    next_due = Scheduler.compute_next_due_text(now_time, r.schedule_kind, r.interval_seconds)
+
+    # Zero-token precheck hook: skip without calling any LLM when condition is quiet
+    if not (try routine_precheck_passes(db, r.precheck_kind, r.last_run_at))
+      try Store.mark_routine_skipped(db, r.id, next_due)
+      skipped += 1
+      results = results.append(
+        "#{r.bot_name}:#{r.name} -> skipped (zero-token precheck #{r.precheck_kind})"
+      )
+      continue
+    end
+
     _reg = scheduler.register_routine(r.bot_name, r.name)
-    next_due = (now_time + r.interval_seconds.seconds).to_text
+    mem_hint = if r.skip_memory?
+      " (Unattended routine: do NOT call memory_save unless explicitly asked by owner.)"
+    else
+      ""
+    end
     case run_turn(
       rt,
       db,
@@ -978,7 +1040,7 @@ fn run_due_routines(
       None,
       Routine,
       r.read_only?,
-      "[Routine #{r.name}] #{r.prompt}"
+      "[Routine #{r.name} slot=#{slot_key}] #{r.prompt}#{mem_hint}"
     )
       Ok(reply):
         try Store.mark_routine_ran(db, r.id, now_text, next_due)
@@ -996,6 +1058,7 @@ fn run_due_routines(
     TickSummary(
       checked_at: now_text,
       routines_ran: ran,
+      routines_skipped: skipped,
       approvals_created: approvals,
       results: results
     )

@@ -17,8 +17,11 @@ use Policy{PolicyActor}
 use Scheduler{SchedulerActor}
 use Skills
 use Store
+use Telegram
 use Tools{ToolRuntime}
 use Types{
+  AnalyticsSummary,
+  AppSettings,
   ApprovalItem,
   ApprovalResolution,
   ArtifactItem,
@@ -41,6 +44,7 @@ use Types{
   MotetError,
   PolicyRule,
   ProviderKind,
+  PushSubscription,
   ResolveApprovalRequest,
   RoutineSpec,
   SaveMemoryRequest,
@@ -53,6 +57,8 @@ use Types{
   StartOAuthRequest,
   StartOAuthResponse,
   SteerRunRequest,
+  TelegramConfig,
+  TelegramTestResult,
   TickSummary,
   ToggleRequest,
   TrustLevel,
@@ -72,6 +78,7 @@ api
   port 8787
   cors "*"
   sqlite db from "motet.sqlite"
+  static "/assets" from "public/assets"
   actor budget: BudgetActor
   actor policy: PolicyActor
   actor scheduler: SchedulerActor
@@ -79,12 +86,22 @@ api
 
   job "motet.runs" job_drain_runs every 1.second
   job "motet.routines" job_run_routines every 1.minute
+  job "motet.telegram" job_poll_telegram every 3.seconds
 
   get "/" get_ui
   get "/manifest.json" get_manifest
+  get "/sw.js" get_service_worker
   get "/icon.svg" get_icon
   get "/oauth/callback" get_oauth_callback
   get "/v1/health" get_health
+  get "/v1/settings" get_settings
+  post "/v1/settings" post_settings
+  get "/v1/analytics" get_analytics
+  get "/v1/channels/telegram" get_telegram_config
+  post "/v1/channels/telegram/test" post_telegram_test
+  get "/v1/push/subscriptions" get_push_subscriptions
+  post "/v1/push/subscribe" post_push_subscribe
+  delete "/v1/push/subscribe" delete_push_subscribe
 
   get "/v1/bots" get_bots
   post "/v1/bots" post_bot
@@ -216,9 +233,51 @@ fn job_run_routines(
   Ok(Unit)
 end
 
-## Serves the mobile-first responsive PWA web interface.
-fn get_ui() : Api.Response
-  Api.html_response(200, WebUi.app_html())
+## Background worker job: polls Telegram Bot API every 3 seconds when enabled.
+fn job_poll_telegram(
+  _payload: Json,
+  db: Sqlite.Database,
+  budget: BudgetActor,
+  policy: PolicyActor,
+  scheduler: SchedulerActor,
+  files: Files,
+  command: Command,
+  network: Network,
+  env: Env,
+  clock: Clock
+) : Result(Unit, MotetError)
+  try ensure_ready(db, clock)
+  rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
+  _n = Telegram.poll_once(rt, db, budget, policy, scheduler)
+  Ok(Unit)
+end
+
+## Serves the built React + Tailwind Dashboard SPA (`public/index.html`) when present,
+## falling back cleanly to the zero-build inline PWA UI (`WebUi.app_html()`).
+fn get_ui(files: ReadFiles) : Api.Response
+  case files.read_text("public/index.html")
+    Ok(html) if not html.trim.empty?: Api.html_response(200, html)
+    Ok(_) | Error(_): Api.html_response(200, WebUi.app_html())
+  end
+end
+
+## Serves the PWA Service Worker for Home Screen installation & Web Push notifications.
+fn get_service_worker() : Api.Response
+  js = [
+    "self.addEventListener('install', () => self.skipWaiting());",
+    "self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));",
+    "self.addEventListener('push', (e) => {",
+    "  let data = { title: 'Motet', body: 'New update ready', url: '/' };",
+    "  try { if (e.data) data = Object.assign(data, e.data.json()); } catch (_) {}",
+    "  e.waitUntil(self.registration.showNotification(data.title, { body: data.body, icon: '/icon.svg', data: { url: data.url || '/' } }));",
+    "});",
+    "self.addEventListener('notificationclick', (e) => {",
+    "  e.notification.close();",
+    "  const url = (e.notification.data && e.notification.data.url) || '/';",
+    "  e.waitUntil(self.clients.openWindow(url));",
+    "});"
+  ].join("\n")
+  Api.response(200, [("Content-Type", "application/javascript; charset=utf-8")], js.bytes)
 end
 
 ## Serves the PWA web manifest for Home Screen installation on iOS/macOS.
@@ -235,6 +294,91 @@ end
 fn get_health(db: Sqlite.Database, env: Env, clock: Clock) : Result(HealthSummary, MotetError)
   try ensure_ready(db, clock)
   Store.health_summary(db, env)
+end
+
+## Reads global Motet settings (timezone, quiet hours, public URL, vault path, Telegram config).
+fn get_settings(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(AppSettings, MotetError)
+  try ensure_ready(db, clock)
+  Store.get_settings(db)
+end
+
+## Updates global Motet settings (timezone, quiet hours, public URL, vault path, Telegram config).
+fn post_settings(_op: Operator, db: Sqlite.Database, clock: Clock, body: AppSettings) : Result(
+  AppSettings,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Store.save_settings(db, body)
+end
+
+## Returns live spend, prompt-cache hit %, routine run vs zero-token skip telemetry, and roster metrics.
+fn get_analytics(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+  AnalyticsSummary,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Store.analytics_summary(db, Store.utc_day_prefix(clock.now.to_text))
+end
+
+## Reads Telegram channel configuration and token status without exposing the bot token.
+fn get_telegram_config(_op: Operator, db: Sqlite.Database, env: Env, clock: Clock) : Result(
+  TelegramConfig,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  s = try Store.get_settings(db)
+  tok_ok = case try Store.resolve_secret(db, env, "TELEGRAM_BOT_TOKEN")
+    Some(t) if not t.trim.empty?: true
+    Some(_) | None: false
+  end
+  offset = try Store.get_telegram_offset(db)
+  Ok(
+    TelegramConfig(
+      enabled?: s.telegram_enabled?,
+      allowed_user_id: s.telegram_allowed_user_id,
+      default_bot: s.telegram_default_bot,
+      token_configured?: tok_ok,
+      last_update_id: offset
+    )
+  )
+end
+
+## Tests Telegram Bot API connectivity using the Vault/Env TELEGRAM_BOT_TOKEN.
+fn post_telegram_test(_op: Operator, db: Sqlite.Database, network: Network, env: Env, clock: Clock) : Result(
+  TelegramTestResult,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  tok = (try Store.resolve_secret(db, env, "TELEGRAM_BOT_TOKEN")) or ""
+  Ok(Telegram.test_bot_token(network, tok))
+end
+
+## Lists registered PWA Web Push subscriptions.
+fn get_push_subscriptions(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
+  List(PushSubscription),
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Store.list_push_subscriptions(db)
+end
+
+## Registers or updates a PWA Web Push subscription for approval & briefing alerts.
+fn post_push_subscribe(_op: Operator, db: Sqlite.Database, clock: Clock, body: PushSubscription) : Result(
+  PushSubscription,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  Store.save_push_subscription(db, body, clock.now.to_text)
+end
+
+## Removes a registered PWA Web Push subscription by endpoint URL.
+fn delete_push_subscribe(_op: Operator, db: Sqlite.Database, clock: Clock, endpoint: Text) : Result(
+  DeleteResult,
+  MotetError
+)
+  try ensure_ready(db, clock)
+  try Store.delete_push_subscription(db, endpoint)
+  Ok(DeleteResult(deleted?: true))
 end
 
 ## Lists all configured bots in the Motet roster (active specialists first).
@@ -716,13 +860,19 @@ fn post_routine(
     ItemNotFound(message: "unknown bot: #{body.bot_name}")
   )
   _reg = scheduler.register_routine(body.bot_name, body.name.trim)
-  Store.upsert_routine(
+  settings = try Store.get_settings(db)
+  Store.upsert_routine_full(
     db,
     body.bot_name,
     body.name.trim,
     body.prompt.trim,
-    body.interval_seconds,
+    body.interval_seconds or 3600,
+    body.schedule_kind or "interval",
+    body.schedule_expr or "",
+    body.timezone or settings.timezone,
     body.read_only or true,
+    body.skip_memory or true,
+    body.precheck_kind or "",
     clock.now.to_text
   )
 end

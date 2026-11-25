@@ -1,5 +1,7 @@
-.motet/*.sqlite
-.motet/*.sqlite-*
+.motet/
 *.sqlite
-*.sqlite-*
+*.sqlite-shm
+*.sqlite-wal
 *.bc
+frontend/node_modules/
+public/

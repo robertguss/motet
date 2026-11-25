@@ -51,9 +51,12 @@ list_memories,
 search_memories,
 delete_memory,
 upsert_routine,
+upsert_routine_full,
 list_routines,
 list_due_routines,
+claim_routine_slot,
 mark_routine_ran,
+mark_routine_skipped,
 set_routine_enabled,
 delete_routine,
 create_approval,
@@ -82,9 +85,19 @@ upsert_webhook_config,
 get_webhook_config,
 list_webhook_configs,
 delete_webhook_config,
+get_settings,
+save_settings,
+get_telegram_offset,
+set_telegram_offset,
+save_push_subscription,
+list_push_subscriptions,
+delete_push_subscription,
+analytics_summary,
 health_summary
 use Json
 use Types{
+  AnalyticsSummary,
+  AppSettings,
   ApprovalDecision,
   ApprovalItem,
   ApprovalStatus,
@@ -99,6 +112,7 @@ use Types{
   MotetError,
   PolicyRule,
   ProviderKind,
+  PushSubscription,
   RoutineSpec,
   SessionEvent,
   SessionSummary,
@@ -326,11 +340,60 @@ fn init_schema(db: Sqlite.Database) : Result(Unit, MotetError)
       "  name TEXT NOT NULL,",
       "  prompt TEXT NOT NULL,",
       "  interval_seconds INT NOT NULL,",
+      "  schedule_kind TEXT NOT NULL DEFAULT 'interval',",
+      "  schedule_expr TEXT NOT NULL DEFAULT '',",
+      "  timezone TEXT NOT NULL DEFAULT 'America/Los_Angeles',",
       "  read_only INT NOT NULL,",
+      "  skip_memory INT NOT NULL DEFAULT 1,",
+      "  precheck_kind TEXT NOT NULL DEFAULT '',",
       "  enabled INT NOT NULL,",
       "  next_due_at TEXT NOT NULL,",
       "  last_run_at TEXT NOT NULL,",
+      "  run_count INT NOT NULL DEFAULT 0,",
+      "  skip_count INT NOT NULL DEFAULT 0,",
       "  UNIQUE (bot_name, name)",
+      ")"
+    ].join("")
+  )
+  try ensure_column(db, "routines", "schedule_kind", "TEXT NOT NULL DEFAULT 'interval'")
+  try ensure_column(db, "routines", "schedule_expr", "TEXT NOT NULL DEFAULT ''")
+  try ensure_column(db, "routines", "timezone", "TEXT NOT NULL DEFAULT 'America/Los_Angeles'")
+  try ensure_column(db, "routines", "skip_memory", "INT NOT NULL DEFAULT 1")
+  try ensure_column(db, "routines", "precheck_kind", "TEXT NOT NULL DEFAULT ''")
+  try ensure_column(db, "routines", "run_count", "INT NOT NULL DEFAULT 0")
+  try ensure_column(db, "routines", "skip_count", "INT NOT NULL DEFAULT 0")
+  try run_ddl(
+    db,
+    [
+      "CREATE TABLE IF NOT EXISTS routine_runs (",
+      "  id INTEGER PRIMARY KEY AUTOINCREMENT,",
+      "  routine_id INT NOT NULL,",
+      "  slot_key TEXT NOT NULL,",
+      "  status TEXT NOT NULL,",
+      "  detail TEXT NOT NULL,",
+      "  created_at TEXT NOT NULL,",
+      "  UNIQUE (routine_id, slot_key)",
+      ")"
+    ].join("")
+  )
+  try run_ddl(
+    db,
+    [
+      "CREATE TABLE IF NOT EXISTS app_settings (",
+      "  key TEXT PRIMARY KEY,",
+      "  value TEXT NOT NULL",
+      ")"
+    ].join("")
+  )
+  try run_ddl(
+    db,
+    [
+      "CREATE TABLE IF NOT EXISTS push_subscriptions (",
+      "  endpoint TEXT PRIMARY KEY,",
+      "  p256dh TEXT NOT NULL,",
+      "  auth TEXT NOT NULL,",
+      "  user_agent TEXT NOT NULL,",
+      "  created_at TEXT NOT NULL",
       ")"
     ].join("")
   )
@@ -1599,6 +1662,8 @@ fn delete_memory(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
   db.run("DELETE FROM memories WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
 end
 
+routine_select_cols = "id, bot_name, name, prompt, interval_seconds, schedule_kind, schedule_expr, timezone, read_only, skip_memory, precheck_kind, enabled, next_due_at, last_run_at, run_count, skip_count"
+
 fn row_to_routine(r: List(Sqlite.Value)) : RoutineSpec
   RoutineSpec(
     id: cell_int(r, 0),
@@ -1606,11 +1671,67 @@ fn row_to_routine(r: List(Sqlite.Value)) : RoutineSpec
     name: cell_str(r, 2),
     prompt: cell_str(r, 3),
     interval_seconds: cell_int(r, 4),
-    read_only?: cell_bool(r, 5),
-    enabled?: cell_bool(r, 6),
-    next_due_at: cell_str(r, 7),
-    last_run_at: cell_opt_str(r, 8)
+    schedule_kind: cell_str(r, 5),
+    schedule_expr: cell_str(r, 6),
+    timezone: cell_str(r, 7),
+    read_only?: cell_bool(r, 8),
+    skip_memory?: cell_bool(r, 9),
+    precheck_kind: cell_str(r, 10),
+    enabled?: cell_bool(r, 11),
+    next_due_at: cell_str(r, 12),
+    last_run_at: cell_opt_str(r, 13),
+    run_count: cell_int(r, 14),
+    skip_count: cell_int(r, 15)
   )
+end
+
+fn upsert_routine_full(
+  db: Sqlite.Database,
+  bot_name: Text,
+  name: Text,
+  prompt: Text,
+  interval_seconds: Int,
+  schedule_kind: Text,
+  schedule_expr: Text,
+  timezone: Text,
+  read_only?: Bool,
+  skip_memory?: Bool,
+  precheck_kind: Text,
+  next_due_at: Text
+) : Result(RoutineSpec, MotetError)
+  secs = if interval_seconds >= 10: interval_seconds else: 60
+  sk = if schedule_kind.trim.empty?: "interval" else: schedule_kind.trim.ascii_lowercase
+  tz = if timezone.trim.empty?: "America/Los_Angeles" else: timezone.trim
+  try db.run(
+    [
+      "INSERT INTO routines (bot_name, name, prompt, interval_seconds, schedule_kind, schedule_expr, timezone, read_only, skip_memory, precheck_kind, enabled, next_due_at, last_run_at, run_count, skip_count) ",
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, '', 0, 0) ",
+      "ON CONFLICT(bot_name, name) DO UPDATE SET prompt = excluded.prompt, ",
+      "interval_seconds = excluded.interval_seconds, schedule_kind = excluded.schedule_kind, ",
+      "schedule_expr = excluded.schedule_expr, timezone = excluded.timezone, ",
+      "read_only = excluded.read_only, skip_memory = excluded.skip_memory, ",
+      "precheck_kind = excluded.precheck_kind, enabled = 1, next_due_at = excluded.next_due_at"
+    ].join(""),
+    [
+      Sqlite.String(bot_name),
+      Sqlite.String(name),
+      Sqlite.String(prompt),
+      Sqlite.Integer(secs),
+      Sqlite.String(sk),
+      Sqlite.String(schedule_expr.trim),
+      Sqlite.String(tz),
+      Sqlite.Integer(if read_only?: 1 else: 0),
+      Sqlite.Integer(if skip_memory?: 1 else: 0),
+      Sqlite.String(precheck_kind.trim),
+      Sqlite.String(next_due_at)
+    ]
+  ).map_error(db_err)
+  rows = try db.query(
+    "SELECT #{routine_select_cols} FROM routines WHERE bot_name = ? AND name = ?",
+    [Sqlite.String(bot_name), Sqlite.String(name)]
+  ).map_error(db_err)
+  row = try rows.rows.first.or_fail(StorageFailed(message: "routine upsert did not return row"))
+  Ok(row_to_routine(row))
 end
 
 fn upsert_routine(
@@ -1622,46 +1743,54 @@ fn upsert_routine(
   read_only?: Bool,
   next_due_at: Text
 ) : Result(RoutineSpec, MotetError)
-  secs = if interval_seconds >= 10: interval_seconds else: 60
-  try db.run(
-    [
-      "INSERT INTO routines (bot_name, name, prompt, interval_seconds, read_only, enabled, next_due_at, last_run_at) ",
-      "VALUES (?, ?, ?, ?, ?, 1, ?, '') ",
-      "ON CONFLICT(bot_name, name) DO UPDATE SET prompt = excluded.prompt, ",
-      "interval_seconds = excluded.interval_seconds, read_only = excluded.read_only, ",
-      "enabled = 1, next_due_at = excluded.next_due_at"
-    ].join(""),
-    [
-      Sqlite.String(bot_name),
-      Sqlite.String(name),
-      Sqlite.String(prompt),
-      Sqlite.Integer(secs),
-      Sqlite.Integer(if read_only?: 1 else: 0),
-      Sqlite.String(next_due_at)
-    ]
-  ).map_error(db_err)
-  rows = try db.query(
-    "SELECT id, bot_name, name, prompt, interval_seconds, read_only, enabled, next_due_at, last_run_at FROM routines WHERE bot_name = ? AND name = ?",
-    [Sqlite.String(bot_name), Sqlite.String(name)]
-  ).map_error(db_err)
-  row = try rows.rows.first.or_fail(StorageFailed(message: "routine upsert did not return row"))
-  Ok(row_to_routine(row))
+  upsert_routine_full(
+    db,
+    bot_name,
+    name,
+    prompt,
+    interval_seconds,
+    "interval",
+    "",
+    "America/Los_Angeles",
+    read_only?,
+    true,
+    "",
+    next_due_at
+  )
 end
 
 fn list_routines(db: Sqlite.Database) : Result(List(RoutineSpec), MotetError)
-  rows = try db.query(
-    "SELECT id, bot_name, name, prompt, interval_seconds, read_only, enabled, next_due_at, last_run_at FROM routines ORDER BY id ASC",
-    []
-  ).map_error(db_err)
+  rows = try db.query("SELECT #{routine_select_cols} FROM routines ORDER BY id ASC", []).map_error(
+    db_err
+  )
   Ok(rows.rows.map(fn(r) row_to_routine(r) end))
 end
 
 fn list_due_routines(db: Sqlite.Database, now_text: Text) : Result(List(RoutineSpec), MotetError)
   rows = try db.query(
-    "SELECT id, bot_name, name, prompt, interval_seconds, read_only, enabled, next_due_at, last_run_at FROM routines WHERE enabled = 1 AND next_due_at <= ? ORDER BY id ASC",
+    "SELECT #{routine_select_cols} FROM routines WHERE enabled = 1 AND (schedule_kind != 'interval' OR next_due_at <= ?) ORDER BY id ASC",
     [Sqlite.String(now_text)]
   ).map_error(db_err)
   Ok(rows.rows.map(fn(r) row_to_routine(r) end))
+end
+
+## At-most-once occurrence ledger: returns `true` only the first time `(routine_id, slot_key)` is claimed.
+fn claim_routine_slot(db: Sqlite.Database, routine_id: Int, slot_key: Text, now_text: Text) : Result(
+  Bool,
+  MotetError
+)
+  existing = try db.query(
+    "SELECT id FROM routine_runs WHERE routine_id = ? AND slot_key = ?",
+    [Sqlite.Integer(routine_id), Sqlite.String(slot_key)]
+  ).map_error(db_err)
+  if existing.rows.first is Some(_)
+    return Ok(false)
+  end
+  try db.run(
+    "INSERT OR IGNORE INTO routine_runs (routine_id, slot_key, status, detail, created_at) VALUES (?, ?, 'claimed', '', ?)",
+    [Sqlite.Integer(routine_id), Sqlite.String(slot_key), Sqlite.String(now_text)]
+  ).map_error(db_err)
+  Ok(true)
 end
 
 fn mark_routine_ran(db: Sqlite.Database, id: Int, now_text: Text, next_due_at: Text) : Result(
@@ -1669,8 +1798,15 @@ fn mark_routine_ran(db: Sqlite.Database, id: Int, now_text: Text, next_due_at: T
   MotetError
 )
   db.run(
-    "UPDATE routines SET last_run_at = ?, next_due_at = ? WHERE id = ?",
+    "UPDATE routines SET last_run_at = ?, next_due_at = ?, run_count = run_count + 1 WHERE id = ?",
     [Sqlite.String(now_text), Sqlite.String(next_due_at), Sqlite.Integer(id)]
+  ).map_error(db_err)
+end
+
+fn mark_routine_skipped(db: Sqlite.Database, id: Int, next_due_at: Text) : Result(Unit, MotetError)
+  db.run(
+    "UPDATE routines SET next_due_at = ?, skip_count = skip_count + 1 WHERE id = ?",
+    [Sqlite.String(next_due_at), Sqlite.Integer(id)]
   ).map_error(db_err)
 end
 
@@ -1679,7 +1815,7 @@ fn set_routine_enabled(db: Sqlite.Database, id: Int, enabled_opt: Option(Bool)) 
   MotetError
 )
   rows = try db.query(
-    "SELECT id, bot_name, name, prompt, interval_seconds, read_only, enabled, next_due_at, last_run_at FROM routines WHERE id = ?",
+    "SELECT #{routine_select_cols} FROM routines WHERE id = ?",
     [Sqlite.Integer(id)]
   ).map_error(db_err)
   row = try rows.rows.first.or_fail(ItemNotFound(message: "routine ##{id} not found"))
@@ -1699,15 +1835,25 @@ fn set_routine_enabled(db: Sqlite.Database, id: Int, enabled_opt: Option(Bool)) 
       name: cur.name,
       prompt: cur.prompt,
       interval_seconds: cur.interval_seconds,
+      schedule_kind: cur.schedule_kind,
+      schedule_expr: cur.schedule_expr,
+      timezone: cur.timezone,
       read_only?: cur.read_only?,
+      skip_memory?: cur.skip_memory?,
+      precheck_kind: cur.precheck_kind,
       enabled?: next_en,
       next_due_at: cur.next_due_at,
-      last_run_at: cur.last_run_at
+      last_run_at: cur.last_run_at,
+      run_count: cur.run_count,
+      skip_count: cur.skip_count
     )
   )
 end
 
 fn delete_routine(db: Sqlite.Database, id: Int) : Result(Unit, MotetError)
+  try db.run("DELETE FROM routine_runs WHERE routine_id = ?", [Sqlite.Integer(id)]).map_error(
+    db_err
+  )
   db.run("DELETE FROM routines WHERE id = ?", [Sqlite.Integer(id)]).map_error(db_err)
 end
 
@@ -2300,6 +2446,168 @@ fn delete_webhook_config(db: Sqlite.Database, source: Text) : Result(Unit, Motet
   db.run("DELETE FROM webhook_configs WHERE source = ?", [Sqlite.String(source)]).map_error(db_err)
 end
 
+# ==============================================================================
+# App Settings, Telegram Offset, Web Push Subscriptions & Analytics
+# ==============================================================================
+fn get_setting_val(db: Sqlite.Database, key: Text, fallback: Text) : Result(Text, MotetError)
+  rows = try db.query("SELECT value FROM app_settings WHERE key = ?", [Sqlite.String(key)])
+    .map_error(db_err)
+  Ok(
+    case rows.rows.first
+      Some(r):
+        v = cell_str(r, 0)
+        if v.empty?: fallback else: v
+      None: fallback
+    end
+  )
+end
+
+fn set_setting_val(db: Sqlite.Database, key: Text, value: Text) : Result(Unit, MotetError)
+  db.run(
+    "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    [Sqlite.String(key), Sqlite.String(value)]
+  ).map_error(db_err)
+end
+
+fn get_settings(db: Sqlite.Database) : Result(AppSettings, MotetError)
+  tz = try get_setting_val(db, "timezone", "America/Los_Angeles")
+  qs = try get_setting_val(db, "quiet_hours_start", "22:00")
+  qe = try get_setting_val(db, "quiet_hours_end", "07:00")
+  pub = try get_setting_val(db, "public_url", "")
+  vp = try get_setting_val(db, "vault_path", "vault")
+  vgr = try get_setting_val(db, "vault_git_remote", "")
+  tg_en = (try get_setting_val(db, "telegram_enabled", "0")) == "1"
+  tg_uid = try get_setting_val(db, "telegram_allowed_user_id", "")
+  tg_bot = try get_setting_val(db, "telegram_default_bot", "chief")
+  Ok(
+    AppSettings(
+      timezone: tz,
+      quiet_hours_start: qs,
+      quiet_hours_end: qe,
+      public_url: pub,
+      vault_path: vp,
+      vault_git_remote: vgr,
+      telegram_enabled?: tg_en,
+      telegram_allowed_user_id: tg_uid,
+      telegram_default_bot: tg_bot
+    )
+  )
+end
+
+fn save_settings(db: Sqlite.Database, s: AppSettings) : Result(AppSettings, MotetError)
+  try set_setting_val(db, "timezone", s.timezone.trim)
+  try set_setting_val(db, "quiet_hours_start", s.quiet_hours_start.trim)
+  try set_setting_val(db, "quiet_hours_end", s.quiet_hours_end.trim)
+  try set_setting_val(db, "public_url", s.public_url.trim)
+  try set_setting_val(db, "vault_path", s.vault_path.trim)
+  try set_setting_val(db, "vault_git_remote", s.vault_git_remote.trim)
+  try set_setting_val(db, "telegram_enabled", if s.telegram_enabled?: "1" else: "0")
+  try set_setting_val(db, "telegram_allowed_user_id", s.telegram_allowed_user_id.trim)
+  try set_setting_val(db, "telegram_default_bot", s.telegram_default_bot.trim)
+  get_settings(db)
+end
+
+fn get_telegram_offset(db: Sqlite.Database) : Result(Int, MotetError)
+  raw = try get_setting_val(db, "telegram_last_update_id", "0")
+  Ok(raw.to_int or 0)
+end
+
+fn set_telegram_offset(db: Sqlite.Database, offset: Int) : Result(Unit, MotetError)
+  set_setting_val(db, "telegram_last_update_id", "#{offset}")
+end
+
+fn save_push_subscription(db: Sqlite.Database, sub: PushSubscription, now_text: Text) : Result(
+  PushSubscription,
+  MotetError
+)
+  ep = sub.endpoint.trim
+  return Error(BadInput(message: "push endpoint required")) if ep.empty?
+  try db.run(
+    [
+      "INSERT INTO push_subscriptions (endpoint, p256dh, auth, user_agent, created_at) VALUES (?, ?, ?, ?, ?) ",
+      "ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, user_agent = excluded.user_agent"
+    ].join(""),
+    [
+      Sqlite.String(ep),
+      Sqlite.String(sub.p256dh.trim),
+      Sqlite.String(sub.auth.trim),
+      Sqlite.String(sub.user_agent.trim),
+      Sqlite.String(now_text)
+    ]
+  ).map_error(db_err)
+  Ok(
+    PushSubscription(
+      endpoint: ep,
+      p256dh: sub.p256dh.trim,
+      auth: sub.auth.trim,
+      user_agent: sub.user_agent.trim,
+      created_at: now_text
+    )
+  )
+end
+
+fn list_push_subscriptions(db: Sqlite.Database) : Result(List(PushSubscription), MotetError)
+  rows = try db.query(
+    "SELECT endpoint, p256dh, auth, user_agent, created_at FROM push_subscriptions ORDER BY created_at DESC",
+    []
+  ).map_error(db_err)
+  Ok(
+    rows.rows.map(fn(r)
+      PushSubscription(
+        endpoint: cell_str(r, 0),
+        p256dh: cell_str(r, 1),
+        auth: cell_str(r, 2),
+        user_agent: cell_str(r, 3),
+        created_at: cell_str(r, 4)
+      )
+    end)
+  )
+end
+
+fn delete_push_subscription(db: Sqlite.Database, endpoint: Text) : Result(Unit, MotetError)
+  db.run("DELETE FROM push_subscriptions WHERE endpoint = ?", [Sqlite.String(endpoint.trim)])
+    .map_error(db_err)
+end
+
+fn analytics_summary(db: Sqlite.Database, day_prefix: Text) : Result(AnalyticsSummary, MotetError)
+  by_bot = try daily_budget_snapshots(db, day_prefix)
+  var tot_usd = 0.0
+  var tot_in = 0
+  var tot_out = 0
+  var tot_cached = 0
+  for b in by_bot
+    tot_usd = (tot_usd + b.spent_usd).round(6)
+    tot_in = tot_in.saturating_add(b.input_tokens)
+    tot_out = tot_out.saturating_add(b.output_tokens)
+    tot_cached = tot_cached.saturating_add(b.cached_input_tokens)
+  end
+  cache_pct = if tot_in > 0: (tot_cached * 100) / tot_in else: 0
+  routines = try list_routines(db)
+  var r_runs = 0
+  var r_skips = 0
+  for r in routines
+    r_runs = r_runs.saturating_add(r.run_count)
+    r_skips = r_skips.saturating_add(r.skip_count)
+  end
+  pending = try count_table(db, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'")
+  active_bots = try count_table(db, "SELECT COUNT(*) FROM bots WHERE active = 1")
+  Ok(
+    AnalyticsSummary(
+      day: day_prefix,
+      total_spent_usd: tot_usd,
+      total_input_tokens: tot_in,
+      total_output_tokens: tot_out,
+      total_cached_tokens: tot_cached,
+      cache_hit_pct: cache_pct,
+      routines_total_runs: r_runs,
+      routines_total_skips: r_skips,
+      pending_approvals: pending,
+      active_bots: active_bots,
+      by_bot: by_bot
+    )
+  )
+end
+
 fn count_table(db: Sqlite.Database, sql: Text) : Result(Int, MotetError)
   rows = try db.query(sql, []).map_error(db_err)
   Ok(cell_int(rows.rows.first or [], 0))
@@ -2312,6 +2620,8 @@ fn health_summary(db: Sqlite.Database, env: Env) : Result(HealthSummary, MotetEr
   routines = try count_table(db, "SELECT COUNT(*) FROM routines WHERE enabled = 1")
   qruns = try count_table(db, "SELECT COUNT(*) FROM bot_runs WHERE status IN ('queued', 'running')")
   vsecs = try count_table(db, "SELECT COUNT(*) FROM vault_secrets")
+  psubs = try count_table(db, "SELECT COUNT(*) FROM push_subscriptions")
+  settings = try get_settings(db)
   Ok(
     HealthSummary(
       status: "ok",
@@ -2322,7 +2632,9 @@ fn health_summary(db: Sqlite.Database, env: Env) : Result(HealthSummary, MotetEr
       routines: routines,
       queued_runs: qruns,
       vault_secrets: vsecs,
-      master_key_set?: Vault.master_key_configured?(env)
+      master_key_set?: Vault.master_key_configured?(env),
+      telegram_enabled?: settings.telegram_enabled?,
+      push_subscriptions: psubs
     )
   )
 end

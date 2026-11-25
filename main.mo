@@ -11,6 +11,7 @@ use Policy{PolicyActor}
 use Scheduler{SchedulerActor}
 use Skills
 use Store
+use Telegram
 use Tools{ToolRuntime, core_tool_defs}
 use Types{
   BotConfig,
@@ -511,16 +512,20 @@ fn cmd_watch(
     None: 5
   end
   console.print(
-    "motet watch started (polling async runs & routines every #{secs}s; Ctrl+C to stop)"
+    "motet watch started (polling async runs, Telegram & routines every #{secs}s; Ctrl+C to stop)"
   )
   while true
     case Brain.drain_queued_runs(rt, db, budget, policy, scheduler, 5)
       Ok(n) if n > 0: console.print("runs: processed #{n} queued run(s)")
       Ok(_) | Error(_): Unit
     end
+    case Telegram.poll_once(rt, db, budget, policy, scheduler)
+      Ok(t) if t > 0: console.print("telegram: processed #{t} update(s)")
+      Ok(_) | Error(_): Unit
+    end
     case Brain.run_due_routines(rt, db, budget, policy, scheduler)
-      Ok(sum) if sum.routines_ran > 0: console.print(
-        "tick @ #{sum.checked_at}: ran #{sum.routines_ran}"
+      Ok(sum) if sum.routines_ran > 0 or sum.routines_skipped > 0: console.print(
+        "tick @ #{sum.checked_at}: ran #{sum.routines_ran}, skipped #{sum.routines_skipped}"
       )
       Ok(_) | Error(_): Unit
     end
@@ -579,7 +584,8 @@ fn main(
     return case Brain.run_due_routines(rt, db, budget, policy, scheduler)
       Ok(sum):
         console.print(
-          "tick @ #{sum.checked_at}: ran #{sum.routines_ran} routines, #{sum.approvals_created} new approvals"
+          "tick @ #{sum.checked_at}: ran #{sum.routines_ran} routines, skipped #{sum
+            .routines_skipped}, #{sum.approvals_created} new approvals"
         )
         for line in sum.results
           console.print("  #{line}")
