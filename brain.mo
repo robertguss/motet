@@ -955,6 +955,10 @@ fn run_due_routines(rt: ToolRuntime, db: Store.DbHandle) : Result(TickSummary, M
       Some(sk): sk
       None: continue
     end
+    # Check slot occurrence read-only BEFORE taking a write-audited Claims lease
+    if try Store.routine_slot_claimed(db, r.id, slot_key)
+      continue
+    end
     holder = "routine-runner:#{r.bot_name}"
     leased = try Store.try_claim_routine(db, r.id, holder, now_time, 300)
     if not leased
@@ -1334,4 +1338,40 @@ test "Brain trips 3-denial circuit breaker and cleanly cancels interrupted async
   assert drain_queued_runs(rt, db, 5) == Ok(1)
   assert Store.get_run(db, "run-int-1") is Ok(Some(canceled))
   assert canceled.status == "cancelled" and canceled.steps == 0
+end
+
+test "Brain run_due_routines commits zero transactions when wall-clock slot is already claimed"
+  files = Files.in_memory({})
+  # 2026-11-25 is Wednesday; 15:35Z == 07:35 PST, inside morning-brief (weekdays 07:30) window
+  t0 = Time.parse("2026-11-25T15:35:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = Store.open(files, clock)
+  assert Store.seed_defaults(db, t0.to_text) is Ok(Unit)
+
+  # Pre-claim today's slot for every due routine on wednesday morning
+  assert Store.list_due_routines(db, t0.to_text) is Ok(due)
+  for r in due
+    if Scheduler.evaluate_wall_clock_slot(
+      t0,
+      r.schedule_kind,
+      r.schedule_expr,
+      r.timezone,
+      r.next_due_at
+    ) is Some(sk)
+      assert Store.claim_routine_slot(db, r.id, sk, t0.to_text) == Ok(true)
+    end
+  end
+
+  assert Store.verify_all(db) is Ok(before_v)
+  rt = ToolRuntime(
+    files: files,
+    command: Command.fake({}),
+    network: Network.fake({}),
+    env: Env.of({}),
+    clock: clock
+  )
+  assert run_due_routines(rt, db) is Ok(sum)
+  assert sum.routines_ran == 0 and sum.routines_skipped == 0
+  assert Store.verify_all(db) is Ok(after_v)
+  assert after_v.txid == before_v.txid and after_v.audit_entries == before_v.audit_entries
 end

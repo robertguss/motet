@@ -241,7 +241,9 @@ end
 
 fn ensure_ready(files: Files, clock: Clock) : Result(Store.DbHandle, MotetError)
   db = Store.open(files, clock)
-  try Store.ensure_seeded(db, clock.now.to_text)
+  if not files.read_only.exists?(db.path)
+    try Store.ensure_seeded(db, clock.now.to_text)
+  end
   Ok(db)
 end
 
@@ -1161,62 +1163,7 @@ fn get_connectors_auth(_op: Operator, files: Files, env: Env, clock: Clock) : Re
   MotetError
 )
   db = try ensure_ready(files, clock)
-  conns = try Store.list_connectors(db)
-  var out = []
-  for c in conns
-    vault_tok = if not c.auth_env.trim.empty?
-      try Store.get_vault_secret(db, env, c.auth_env.trim)
-    else
-      None
-    end
-    case vault_tok
-      Some(_): out = out.append(
-        ConnectorAuthStatus(
-          connector_name: c.name,
-          connected?: true,
-          source: "vault",
-          scope: "vault:#{c.auth_env}",
-          expires_at: None
-        )
-      )
-      None:
-        env_tok = Mcp.resolve_connector_token(c, env, None)
-        case env_tok
-          Some(_): out = out.append(
-            ConnectorAuthStatus(
-              connector_name: c.name,
-              connected?: true,
-              source: "env",
-              scope: "env:#{c.auth_env}",
-              expires_at: None
-            )
-          )
-          None:
-            meta = try Store.get_connector_token_meta(db, c.name)
-            case meta
-              Some((sc, exp)): out = out.append(
-                ConnectorAuthStatus(
-                  connector_name: c.name,
-                  connected?: true,
-                  source: "oauth",
-                  scope: sc,
-                  expires_at: if exp.empty?: None else: Some(exp)
-                )
-              )
-              None: out = out.append(
-                ConnectorAuthStatus(
-                  connector_name: c.name,
-                  connected?: false,
-                  source: "none",
-                  scope: "",
-                  expires_at: None
-                )
-              )
-            end
-        end
-    end
-  end
-  Ok(out)
+  Store.list_connector_auth_statuses(db, env)
 end
 
 ## Starts Google OAuth 2.0 + PKCE sign-in for isolated Work or Personal Google connectors
@@ -1705,12 +1652,16 @@ fn get_events_stream(_op: Operator, files: Files, env: Env, clock: Clock) : Resu
 end
 
 ## Layer 3/4 MoDB verification, audit, export, views, grants, claims, and selective-undo replay endpoints.
-fn get_modb_verify(_op: Operator, files: Files, clock: Clock) : Result(
+fn get_modb_verify(_op: Operator, files: Files, clock: Clock, full: Option(Bool)) : Result(
   ModbVerifySummary,
   MotetError
 )
   db = try ensure_ready(files, clock)
-  Store.verify_all(db)
+  if full == Some(true)
+    Store.verify_all(db)
+  else
+    Store.verify_fast(db)
+  end
 end
 
 fn get_modb_audit(_op: Operator, files: Files, clock: Clock, limit: Option(Int)) : Result(
@@ -2049,7 +2000,7 @@ fn post_mcp(
       return Ok(mcp_ok(id, mcp_text_result(Json.encode(saved), saved.to_json)))
     end
     if tname == "motet_verify"
-      rep = try Store.verify_all(db)
+      rep = try Store.verify_fast(db)
       return Ok(mcp_ok(id, mcp_text_result(Json.encode(rep), rep.to_json)))
     end
     if tname == "motet_audit"
@@ -2366,7 +2317,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   )
   assert audit_resp.status == 200 and audit_resp.text.contains?("Motet Weekly Self-Audit")
 
-  # 10. Layer 3/4 MoDB verification, audit, export, views manifest, grants, claims, and MCP verify
+  # 10. Layer 3/4 MoDB verification (fast + full), audit, export, views manifest, grants, claims, and MCP verify
   v_resp = ApiTest.send(
     Server,
     Api.get("/v1/modb/verify").with_bearer("secret-op"),
@@ -2379,6 +2330,19 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     Json.decode[ModbVerifySummary](v_resp.text) is Ok(vr) and
     vr.ok? and
     vr.secrets_ok?
+
+  vf_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/verify").with_bearer("secret-op").with_query("full", "true"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert vf_resp.status == 200 and
+    Json.decode[ModbVerifySummary](vf_resp.text) is Ok(vfr) and
+    vfr.ok? and
+    vfr.secrets_ok?
 
   a_resp = ApiTest.send(
     Server,

@@ -52,7 +52,8 @@ fn print_usage(console: Console)
       "  motet log <session_id>                           Print a session's append-only event log",
       "  motet search <query...>                          Full-text search across all session logs",
       "  motet budget                                     Show exact Decimal USD spend per bot",
-      "  motet verify                                     Verify MoDB storage, SHA-256 audit chain, invariants & secrets",
+      "  motet verify                                     Full MoDB verify + refresh verification checkpoint",
+      "  motet compact                                    Rebuild motet.modb cleanly without internal log bloat",
       "  motet audit [limit]                              Print recent SHA-256 hash-chained audit entries",
       "  motet export                                     Export SHA-256 verified portable JSON snapshot (no secrets)",
       "  motet grants                                     List attenuated bot grants",
@@ -489,12 +490,25 @@ fn cmd_watch(rt: ToolRuntime, db: Store.DbHandle, console: Console, rest: List(T
 end
 
 fn cmd_verify(db: Store.DbHandle, console: Console) : Int
-  case Store.verify_all(db)
+  case Store.verify_and_checkpoint(db)
     Ok(rep):
       console.print(
         "MoDB verify ok=#{rep.ok?} txid=#{rep.txid} schema=v#{rep.schema_version} pages=#{rep
           .page_count} audit=#{rep.audit_entries} calls=#{rep.call_count} secrets_ok=#{rep
           .secrets_ok?} tail=#{rep.last_audit_hash}"
+      )
+      if rep.ok?: 0 else: 1
+    Error(err): print_err(console, err)
+  end
+end
+
+fn cmd_compact(db: Store.DbHandle, console: Console) : Int
+  case Store.compact(db)
+    Ok(rep):
+      console.print(
+        "MoDB compact ok=#{rep.ok?} txid=#{rep.txid} schema=v#{rep.schema_version} pages=#{rep
+          .page_count} audit=#{rep.audit_entries} calls=#{rep.call_count} secrets_ok=#{rep
+          .secrets_ok?}"
       )
       if rep.ok?: 0 else: 1
     Error(err): print_err(console, err)
@@ -597,6 +611,7 @@ fn main(
   return cmd_budget(db, console) if head == "budget"
   return cmd_watch(rt, db, console, rest) if head == "watch"
   return cmd_verify(db, console) if head == "verify"
+  return cmd_compact(db, console) if head == "compact"
   return cmd_audit(db, console, rest) if head == "audit"
   return cmd_export(db, clock, console) if head == "export"
   return cmd_grants(db, console) if head == "grants"
@@ -729,4 +744,9 @@ test "motet CLI initializes specialist roster, seals Vault API key, runs canonic
   assert main(Args.of(["verify"]), env, c5, files, cmd, Network.fake({}), clock, srng) == 0
   assert (c5.printed.first or "").contains?("MoDB verify ok=true") and
     (c5.printed.first or "").contains?("secrets_ok=true")
+
+  c6 = Console.fake()
+  assert main(Args.of(["compact"]), env, c6, files, cmd, Network.fake({}), clock, srng) == 0
+  assert (c6.printed.first or "").contains?("MoDB compact ok=true") and
+    (c6.printed.first or "").contains?("secrets_ok=true")
 end

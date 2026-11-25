@@ -40,6 +40,7 @@ get_connector,
 list_connectors,
 set_connector_enabled,
 delete_connector,
+list_connector_auth_statuses,
 OAuthPending(..),
 save_oauth_pending,
 take_oauth_pending,
@@ -95,6 +96,7 @@ upsert_routine,
 upsert_routine_full,
 list_routines,
 list_due_routines,
+routine_slot_claimed,
 claim_routine_slot,
 mark_routine_ran,
 mark_routine_skipped,
@@ -150,6 +152,9 @@ list_active_claims,
 describe_for_caller,
 run_read_program,
 verify_all,
+verify_fast,
+verify_and_checkpoint,
+compact,
 audit_tail,
 export_snapshot,
 simulate_replay,
@@ -184,6 +189,7 @@ use Types{
   BotConfig,
   BotRun,
   BudgetSnapshot,
+  ConnectorAuthStatus,
   ConnectorSpec,
   DreamingDigest,
   EffectClass,
@@ -4250,6 +4256,23 @@ fn list_due_routines(db: DbHandle, now_text: Text) : Result(List(RoutineSpec), M
   )
 end
 
+## Read-only check whether `(routine_id, slot_key)` has already been claimed in `routine_runs`.
+fn routine_slot_claimed(db: DbHandle, routine_id: Int, slot_key: Text) : Result(Bool, MotetError)
+  if not db.files.read_only.exists?(db.path)
+    return Ok(false)
+  end
+  comp = "#{routine_id}\u{1f}#{slot_key}"
+  with_db_read(
+    db,
+    fn(ldb)
+      Ok(
+        (try Table.get(Ledger.store(ldb), routine_runs_table(), comp).map_error(table_err)) is
+          Some(_)
+      )
+    end
+  )
+end
+
 fn claim_routine_slot(db: DbHandle, routine_id: Int, slot_key: Text, now_text: Text) : Result(
   Bool,
   MotetError
@@ -5025,42 +5048,183 @@ fn delete_push_subscription(db: DbHandle, endpoint: Text) : Result(Unit, MotetEr
   Ok(Unit)
 end
 
-fn analytics_summary(db: DbHandle, day_prefix: Text) : Result(AnalyticsSummary, MotetError)
-  by_bot = try daily_budget_snapshots(db, day_prefix)
-  var tot_usd = 0.0
-  var tot_in = 0
-  var tot_out = 0
-  var tot_cached = 0
-  for b in by_bot
-    tot_usd = (tot_usd + b.spent_usd).round(6)
-    tot_in = tot_in.saturating_add(b.input_tokens)
-    tot_out = tot_out.saturating_add(b.output_tokens)
-    tot_cached = tot_cached.saturating_add(b.cached_input_tokens)
+fn resolve_env_connector_token(spec: ConnectorSpec, env: Env) : Option(Text)
+  primary = if spec.auth_env.trim.empty?: None else: env.get(spec.auth_env.trim)
+  case primary
+    Some(tok) if not tok.trim.empty?: Some(tok.trim)
+    Some(_) | None:
+      if spec.name == "t3code"
+        case env.get("T3_ACP_MCP_AUTHORIZATION")
+          Some(t2) if not t2.trim.empty?: Some(t2.trim)
+          Some(_) | None: None
+        end
+      else
+        None
+      end
   end
-  cache_pct = if tot_in > 0: (tot_cached * 100) / tot_in else: 0
-  routines = try list_routines(db)
-  var r_runs = 0
-  var r_skips = 0
-  for r in routines
-    r_runs = r_runs.saturating_add(r.run_count)
-    r_skips = r_skips.saturating_add(r.skip_count)
-  end
-  pending = (try list_approvals(db, true)).size
-  active_bots = (try list_bots(db)).filter(fn(b) b.active? end).size
-  Ok(
-    AnalyticsSummary(
-      day: day_prefix,
-      total_spent_usd: tot_usd,
-      total_input_tokens: tot_in,
-      total_output_tokens: tot_out,
-      total_cached_tokens: tot_cached,
-      cache_hit_pct: cache_pct,
-      routines_total_runs: r_runs,
-      routines_total_skips: r_skips,
-      pending_approvals: pending,
-      active_bots: active_bots,
-      by_bot: by_bot
+end
+
+## Reports safe auth status for every connector in 1 main read + 1 secrets metadata read
+## without decrypting Vault ciphertexts.
+fn list_connector_auth_statuses(db: DbHandle, env: Env) : Result(
+  List(ConnectorAuthStatus),
+  MotetError
+)
+  conns = try list_connectors(db)
+  (vault_names, oauth_meta) = if not db.files.read_only.exists?(db.secrets_path)
+    (Set.empty, {})
+  else
+    try Modb.with_shared_lock(
+      db.files.read_only,
+      db.secrets_path,
+      modb_err,
+      fn(st)
+        vrows = try Table.all(st, vault_secrets_table()).map_error(table_err)
+        var vset = Set.empty
+        for (vname, _vrow) in vrows
+          vset = vset.add(vname)
+        end
+        trows = try Table.all(st, connector_tokens_table()).map_error(table_err)
+        var tmap = {}
+        for (cname, trow) in trows
+          tmap = tmap.set(cname, (trow.scope, trow.expires_at))
+        end
+        Ok((vset, tmap))
+      end
     )
+  end
+  var out = []
+  for c in conns
+    key = c.auth_env.trim
+    if not key.empty? and vault_names.has?(key)
+      out = out.append(
+        ConnectorAuthStatus(
+          connector_name: c.name,
+          connected?: true,
+          source: "vault",
+          scope: "vault:#{c.auth_env}",
+          expires_at: None
+        )
+      )
+    else if resolve_env_connector_token(c, env) is Some(_)
+      out = out.append(
+        ConnectorAuthStatus(
+          connector_name: c.name,
+          connected?: true,
+          source: "env",
+          scope: "env:#{c.auth_env}",
+          expires_at: None
+        )
+      )
+    else
+      case oauth_meta.get(c.name)
+        Some((sc, exp)): out = out.append(
+          ConnectorAuthStatus(
+            connector_name: c.name,
+            connected?: true,
+            source: "oauth",
+            scope: sc,
+            expires_at: if exp.empty?: None else: Some(exp)
+          )
+        )
+        None: out = out.append(
+          ConnectorAuthStatus(
+            connector_name: c.name,
+            connected?: false,
+            source: "none",
+            scope: "",
+            expires_at: None
+          )
+        )
+      end
+    end
+  end
+  Ok(out)
+end
+
+fn analytics_summary(db: DbHandle, day_prefix: Text) : Result(AnalyticsSummary, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      bot_rows = try Table.all(st, bots_table()).map_error(table_err)
+      bots = bot_rows.map(fn(p) p.1 end).sort_by(fn(b)
+        act = if b.active?: "0" else: "1"
+        pri = if b.is_primary?: "0" else: "1"
+        "#{act}:#{pri}:#{b.name}"
+      end)
+      var by_bot = []
+      var tot_usd = 0.0
+      var tot_in = 0
+      var tot_out = 0
+      var tot_cached = 0
+      var active_bots = 0
+      for b in bots
+        if b.active?
+          active_bots += 1
+        end
+        rows = try Table.lookup(
+          st,
+          budget_ledger_table(),
+          budget_by_bot_day_index(),
+          "#{b.name}:#{day_prefix}"
+        ).map_error(table_err)
+        var spent = 0.0
+        var in_toks = 0
+        var out_toks = 0
+        var cached_toks = 0
+        var turns = 0
+        for (_id, r) in rows
+          in_toks = in_toks.saturating_add(r.input_tokens)
+          out_toks = out_toks.saturating_add(r.output_tokens)
+          cached_toks = cached_toks.saturating_add(r.cached_input_tokens)
+          spent = (spent + r.cost_usd).round(6)
+          turns += 1
+        end
+        rem = if b.daily_budget_usd > spent: (b.daily_budget_usd - spent).round(6) else: 0.0
+        by_bot = by_bot.append(
+          BudgetSnapshot(
+            bot_name: b.name,
+            limit_usd: b.daily_budget_usd,
+            spent_usd: spent,
+            remaining_usd: rem,
+            turns: turns,
+            input_tokens: in_toks,
+            output_tokens: out_toks,
+            cached_input_tokens: cached_toks
+          )
+        )
+        tot_usd = (tot_usd + spent).round(6)
+        tot_in = tot_in.saturating_add(in_toks)
+        tot_out = tot_out.saturating_add(out_toks)
+        tot_cached = tot_cached.saturating_add(cached_toks)
+      end
+      cache_pct = if tot_in > 0: (tot_cached * 100) / tot_in else: 0
+      rt_rows = try Table.all(st, routines_table()).map_error(table_err)
+      var r_runs = 0
+      var r_skips = 0
+      for (_id, r) in rt_rows
+        r_runs = r_runs.saturating_add(r.run_count)
+        r_skips = r_skips.saturating_add(r.skip_count)
+      end
+      pend_rows = try Table.lookup(st, approvals_table(), approvals_by_status_index(), "pending")
+        .map_error(table_err)
+      Ok(
+        AnalyticsSummary(
+          day: day_prefix,
+          total_spent_usd: tot_usd,
+          total_input_tokens: tot_in,
+          total_output_tokens: tot_out,
+          total_cached_tokens: tot_cached,
+          cache_hit_pct: cache_pct,
+          routines_total_runs: r_runs,
+          routines_total_skips: r_skips,
+          pending_approvals: pend_rows.size,
+          active_bots: active_bots,
+          by_bot: by_bot
+        )
+      )
+    end
   )
 end
 
@@ -5270,7 +5434,45 @@ fn run_read_program(
   ).map_error(views_err)
 end
 
-## Layer 3/4 Verification, Audit Tail, Export, and Replay APIs.
+## Layer 3/4 Verification, Audit Tail, Export, Compaction, and Replay APIs.
+fn check_secrets_verify(db: DbHandle) : Bool
+  if not db.files.read_only.exists?(db.secrets_path)
+    true
+  else
+    case Modb.with_shared_lock(
+      db.files.read_only,
+      db.secrets_path,
+      modb_err,
+      fn(st) Modb.verify(st).map_error(modb_err) end
+    )
+      Ok(_srep): true
+      Error(_): false
+    end
+  end
+end
+
+fn summary_from_report(
+  rep: Ledger.FullReport,
+  txid_val: Int,
+  sc_ver: Int,
+  last_hash: Text,
+  calls: Int,
+  secrets_ok: Bool
+) : ModbVerifySummary
+  ModbVerifySummary(
+    ok?: secrets_ok,
+    txid: txid_val,
+    page_count: rep.storage.page_count,
+    bucket_count: rep.storage.bucket_count,
+    schema_version: sc_ver,
+    audit_entries: rep.audit.entry_count,
+    last_audit_hash: last_hash,
+    invariants_checked: rep.invariants_checked,
+    call_count: calls,
+    secrets_ok?: secrets_ok
+  )
+end
+
 fn verify_all(db: DbHandle) : Result(ModbVerifySummary, MotetError)
   main_res = try with_db_read(
     db,
@@ -5281,35 +5483,69 @@ fn verify_all(db: DbHandle) : Result(ModbVerifySummary, MotetError)
     end
   )
   (rep, txid_val, sc_ver, last_hash, calls) = main_res
-  secrets_ok = if not db.files.read_only.exists?(db.secrets_path)
-    true
-  else
-    case Modb.with_shared_lock(
-      db.files.read_only,
-      db.secrets_path,
-      modb_err,
-      fn(st)
-        Modb.verify(st).map_error(modb_err)
-      end
-    )
-      Ok(_srep): true
-      Error(_): false
+  secrets_ok = check_secrets_verify(db)
+  Ok(summary_from_report(rep, txid_val, sc_ver, last_hash, calls, secrets_ok))
+end
+
+## Fast bounded integrity check for HTTP endpoints: O(buckets) root verification,
+## checkpoint-anchored/windowed audit hash verification (last 128 entries), and commit invariants.
+fn verify_fast(db: DbHandle) : Result(ModbVerifySummary, MotetError)
+  main_res = try with_db_read(
+    db,
+    fn(ldb)
+      rep = try Ledger.verify_fast(ldb, 128).map_error(ledger_err)
+      calls = try Replay.call_count(Ledger.store(ldb)).map_error(replay_err)
+      Ok((rep, Ledger.txid(ldb), Ledger.schema_version(ldb), ldb.state.last_audit_hash, calls))
     end
-  end
-  Ok(
-    ModbVerifySummary(
-      ok?: secrets_ok,
-      txid: txid_val,
-      page_count: rep.storage.page_count,
-      bucket_count: rep.storage.bucket_count,
-      schema_version: sc_ver,
-      audit_entries: rep.audit.entry_count,
-      last_audit_hash: last_hash,
-      invariants_checked: rep.invariants_checked,
-      call_count: calls,
-      secrets_ok?: secrets_ok
-    )
   )
+  (rep, txid_val, sc_ver, last_hash, calls) = main_res
+  secrets_ok = check_secrets_verify(db)
+  Ok(summary_from_report(rep, txid_val, sc_ver, last_hash, calls, secrets_ok))
+end
+
+## Runs full genesis-to-tip verification and records a verified checkpoint for `verify_fast`.
+fn verify_and_checkpoint(db: DbHandle) : Result(ModbVerifySummary, MotetError)
+  now = db.clock.now
+  main_res = try Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (ldb_cp, _cp) = try Ledger.record_verify_checkpoint(ldb, now).map_error(ledger_err)
+      calls = try Replay.call_count(Ledger.store(ldb_cp)).map_error(replay_err)
+      rep = try Ledger.verify_fast(ldb_cp, 128).map_error(ledger_err)
+      Ok((rep, Ledger.txid(ldb_cp), Ledger.schema_version(ldb_cp), ldb_cp.state.last_audit_hash, calls))
+    end
+  )
+  (rep, txid_val, sc_ver, last_hash, calls) = main_res
+  secrets_ok = check_secrets_verify(db)
+  Ok(summary_from_report(rep, txid_val, sc_ver, last_hash, calls, secrets_ok))
+end
+
+## Rebuilds `motet.modb` cleanly from a portable SHA-256 snapshot of all application tables,
+## removing accumulated internal audit/freelist bloat while preserving every record and FTS index.
+## Caller must ensure no concurrent writers (`motet-server` / `motet-watch`) are active.
+fn compact(db: DbHandle) : Result(ModbVerifySummary, MotetError)
+  now = db.clock.now
+  snap = try Export.export_locked(db.files.read_only, db.path, motet_schema(), false, now).map_error(
+    export_err
+  )
+  tmp_path = "#{db.path}.compact.tmp"
+  _rm = db.files.remove(tmp_path)
+  ldb0 = try Export.import_db(db.files, tmp_path, motet_schema(), snap, now).map_error(export_err)
+  bots = try Table.all(Ledger.store(ldb0), bots_table()).map_error(table_err)
+  var cur_ldb = ldb0
+  for (_k, b) in bots
+    (next_ldb, _g) = try ensure_bot_root_grant_on(cur_ldb, b.name, now)
+    cur_ldb = next_ldb
+  end
+  (_cp_ldb, _cp) = try Ledger.record_verify_checkpoint(cur_ldb, now).map_error(ledger_err)
+  try db.files.rename(tmp_path, db.path).map_error(fn(e)
+    StorageFailed(message: "compact swap failed: #{e}")
+  end)
+  verify_all(db)
 end
 
 fn audit_tail(db: DbHandle, limit: Int) : Result(List(AuditEntry), MotetError)
@@ -5504,4 +5740,35 @@ test "Modb Store enforces invariants, supports lossless selective-undo Replay, G
   assert describe_for_caller(db, "operator", None, t0) is Ok(manifest) and
     manifest.allowed_views.size == 4
   assert verify_all(db) is Ok(v) and v.ok?
+
+  # 5. Fast verify, verify_and_checkpoint, and compact preserve all tables & FTS indexes cleanly
+  assert get_or_create_canonical_session(db, "chief", t0.to_text) is Ok(c_sess)
+  assert append_event(
+    db,
+    c_sess.id,
+    "message",
+    "user",
+    "Compactable milestone test",
+    None,
+    None,
+    0.0,
+    t0.to_text
+  ) is
+    Ok(_)
+  assert claim_routine_slot(db, 1, "2026-11-25", t0.to_text) == Ok(true)
+  assert routine_slot_claimed(db, 1, "2026-11-25") == Ok(true)
+  assert routine_slot_claimed(db, 1, "2026-11-26") == Ok(false)
+
+  assert verify_and_checkpoint(db) is Ok(vc) and vc.ok? and vc.secrets_ok?
+  assert verify_fast(db) is Ok(vf) and vf.ok? and vf.audit_entries == vc.audit_entries
+
+  assert list_bots(db) is Ok(b_before)
+  assert list_routines(db) is Ok(r_before)
+  assert compact(db) is Ok(cm) and cm.ok? and cm.secrets_ok?
+  assert cm.audit_entries < vc.audit_entries
+  assert list_bots(db) is Ok(b_after) and b_after.size == b_before.size
+  assert list_routines(db) is Ok(r_after) and r_after.size == r_before.size
+  assert routine_slot_claimed(db, 1, "2026-11-25") == Ok(true)
+  assert search_events(db, "Compactable milestone", 5) is Ok(comp_hits) and comp_hits.size == 1
+  assert verify_fast(db) is Ok(vf2) and vf2.ok?
 end
