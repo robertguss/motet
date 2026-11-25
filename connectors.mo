@@ -134,12 +134,30 @@ fn require_tok(_spec: ConnectorSpec, token_opt: Option(Text)) : Result(Text, Mot
   end
 end
 
+fn apply_auth_headers(req: Http.Request, token: Text) : Http.Request
+  # Supports dual-gated private exe.dev VMs using "<exedev_vm_token>|<app_bearer_token>"
+  parts = token.trim.split("|")
+  if parts.size == 2
+    proxy_tok = (parts.first or "").trim
+    app_tok = (parts.last or "").trim
+    var r = req
+    if not proxy_tok.empty?
+      r = r.header("X-Exedev-Authorization", bearer_hdr(proxy_tok))
+    end
+    if not app_tok.empty?
+      r = r.header("Authorization", bearer_hdr(app_tok))
+    end
+    r
+  else
+    req.header("Authorization", bearer_hdr(token))
+  end
+end
+
 fn get_json_authed(network: Network, url: Text, token: Text) : Result(Json, MotetError)
   pinned = network.allow_hosts([parse_host_port(url)])
-  req = Http.get(url).header("Authorization", bearer_hdr(token)).header(
-    "Accept",
-    "application/json"
-  ).within(25.seconds)
+  req = apply_auth_headers(Http.get(url), token).header("Accept", "application/json").within(
+    25.seconds
+  )
   resp = try req.send(pinned).map_error(fn(e) UpstreamFailed(message: "GET #{url}: #{e}") end)
   return Error(UpstreamFailed(message: "GET #{url} returned HTTP #{resp.status}")) if not resp.ok?
   resp.json.map_error(fn(e) UpstreamFailed(message: "JSON parse #{url}: #{e}") end)
@@ -147,10 +165,8 @@ end
 
 fn post_json_authed(network: Network, url: Text, token: Text, body: Json) : Result(Json, MotetError)
   pinned = network.allow_hosts([parse_host_port(url)])
-  req = Http.post(url).header("Authorization", bearer_hdr(token)).header(
-    "Accept",
-    "application/json"
-  ).json(body).within(25.seconds)
+  req = apply_auth_headers(Http.post(url), token).header("Accept", "application/json").json(body)
+    .within(25.seconds)
   resp = try req.send(pinned).map_error(fn(e) UpstreamFailed(message: "POST #{url}: #{e}") end)
   return Error(UpstreamFailed(message: "POST #{url} returned HTTP #{resp.status}")) if not resp.ok?
   txt = resp.text or ""
