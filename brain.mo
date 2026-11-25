@@ -1,8 +1,8 @@
 ## Stateless Managed-Agents-style Brain for Motet:
 ## - 3-tier cache-stable prompt assembly (Stable -> Context -> Volatile)
-## - Append-only SQLite session log
+## - Append-only MoDB session log & audit ledger
 ## - BudgetActor USD enforcement + PolicyActor Needs-You approval gating
-## - Approval execution & resume + standing routine runner.
+## - Attenuated MoDB Grants on bot delegation + Claims leases on standing routines.
 module Brain
 expose build_prompt_tiers, run_turn, resolve_approval, run_due_routines
 use Budget{BudgetActor}
@@ -25,6 +25,7 @@ use Types{
   ToolCallReq,
   TrustLevel,
   TurnReply,
+  effect_to_text,
   trust_to_text
 }
 
@@ -32,7 +33,7 @@ use Types{
 ## Stable + Context receive Anthropic cache_control breakpoints; Volatile holds
 ## the frozen memory snapshot so mid-session memory saves never bust prefix caches.
 fn build_prompt_tiers(
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   read_files: ReadFiles,
   bot: BotConfig,
   trust: TrustLevel,
@@ -102,7 +103,7 @@ fn build_prompt_tiers(
   Ok(PromptTiers(stable: stable, context: context, volatile: volatile))
 end
 
-fn load_prior_messages(db: Sqlite.Database, session_id: Text) : Result(List(LlmMessage), MotetError)
+fn load_prior_messages(db: Store.DbHandle, session_id: Text) : Result(List(LlmMessage), MotetError)
   events = try Store.list_events(db, session_id, 60)
   var out = []
   for ev in events
@@ -139,7 +140,7 @@ end
 
 fn execute_delegation(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   budget: BudgetActor,
   policy: PolicyActor,
   scheduler: SchedulerActor,
@@ -147,13 +148,13 @@ fn execute_delegation(
   parent_session_id: Text,
   trust: TrustLevel,
   parent_read_only?: Bool,
+  parent_grant_id_opt: Option(Text),
+  tool_call_id: Text,
   arguments_json: Text,
   depth: Int
 ) : Result((Text, List(ApprovalItem)), MotetError)
   if depth >= max_delegation_depth
-    return Ok(
-      ("delegation_error: max delegation depth (#{max_delegation_depth}) reached", [])
-    )
+    return Ok(("delegation_error: max delegation depth (#{max_delegation_depth}) reached", []))
   end
   (target, task, req_ro) = parse_delegate_args(arguments_json)
   if target.empty? or task.empty?
@@ -162,16 +163,35 @@ fn execute_delegation(
   if target == caller_bot.name
     return Ok(("delegation_error: bot #{caller_bot.name} cannot delegate to itself", []))
   end
-  case try Store.get_bot(db, target)
+  tb = case try Store.get_bot(db, target)
     None: return Ok(("delegation_error: unknown bot '#{target}'", []))
-    Some(tb):
-      if not tb.active?
+    Some(b):
+      if not b.active?
         return Ok(("delegation_error: target bot '#{target}' is inactive", []))
       end
+      b
   end
   child_ro = parent_read_only? or req_ro
   now_clean = rt.clock.now.to_text.replace(":", "").replace("-", "").replace(".", "")
   child_sid = "#{target}-del-#{now_clean}-d#{depth + 1}"
+  parent_gid = case parent_grant_id_opt
+    Some(pg): pg
+    None:
+      _rg = try Store.ensure_bot_root_grant(db, caller_bot.name, rt.clock.now)
+      Store.bot_root_grant_id(caller_bot.name)
+  end
+  child_gid = "del:#{child_sid}:#{tool_call_id}"
+  max_c = if tb.max_steps > 0 and tb.max_steps <= 32: tb.max_steps * 4 else: 32
+  _cg = try Store.delegate_bot_grant(
+    db,
+    caller_bot.name,
+    parent_gid,
+    child_gid,
+    target,
+    child_ro,
+    max_c,
+    rt.clock.now
+  )
   framed = "[Delegated from #{caller_bot.name} (session #{parent_session_id})] #{task}"
   case run_turn_at_depth(
     rt,
@@ -184,7 +204,8 @@ fn execute_delegation(
     trust,
     child_ro,
     framed,
-    depth + 1
+    depth + 1,
+    Some(child_gid)
   )
     Ok(rep):
       var header = "Delegated to #{target} (session #{rep.session_id}, steps=#{rep.steps}, spent=$#{rep
@@ -206,7 +227,7 @@ end
 ## enforcing exact Decimal USD caps, and pausing gated actions into Needs You.
 fn run_turn(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   budget: BudgetActor,
   policy: PolicyActor,
   scheduler: SchedulerActor,
@@ -227,13 +248,14 @@ fn run_turn(
     trust,
     routine_read_only?,
     user_text,
-    0
+    0,
+    None
   )
 end
 
 fn run_turn_at_depth(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   budget: BudgetActor,
   policy: PolicyActor,
   scheduler: SchedulerActor,
@@ -242,7 +264,8 @@ fn run_turn_at_depth(
   trust: TrustLevel,
   routine_read_only?: Bool,
   user_text: Text,
-  depth: Int
+  depth: Int,
+  grant_id_opt: Option(Text)
 ) : Result(TurnReply, MotetError)
   bot = try (try Store.get_bot(db, bot_name)).or_fail(
     ItemNotFound(message: "unknown bot: #{bot_name}")
@@ -375,26 +398,41 @@ fn run_turn_at_depth(
 
       obs = case outcome.decision
         Allow:
-          if tc.name == "bot_delegate"
-            (del_obs, child_approvals) = try execute_delegation(
-              rt,
-              db,
-              budget,
-              policy,
-              scheduler,
-              bot,
-              session_id,
-              trust,
-              routine_read_only?,
-              tc.arguments_json,
-              depth
-            )
-            for ca in child_approvals
-              pending_approvals = pending_approvals.append(ca)
-            end
-            del_obs
-          else
-            try execute_tool(rt, db, bot, session_id, tc.name, tc.arguments_json)
+          exec_allowed = case grant_id_opt
+            Some(gid):
+              gact = if tc.name == "bot_delegate": "delegate" else: effect_to_text(effect)
+              case Store.authorize_grant_action(db, gid, gact, rt.clock.now)
+                Ok(_g): Ok(Unit)
+                Error(ge): Error(ge)
+              end
+            None: Ok(Unit)
+          end
+          case exec_allowed
+            Error(ge): "GRANT_DENIED: #{ge}"
+            Ok(Unit):
+              if tc.name == "bot_delegate"
+                (del_obs, child_approvals) = try execute_delegation(
+                  rt,
+                  db,
+                  budget,
+                  policy,
+                  scheduler,
+                  bot,
+                  session_id,
+                  trust,
+                  routine_read_only?,
+                  grant_id_opt,
+                  tc.id,
+                  tc.arguments_json,
+                  depth
+                )
+                for ca in child_approvals
+                  pending_approvals = pending_approvals.append(ca)
+                end
+                del_obs
+              else
+                try execute_tool(rt, db, bot, session_id, tc.name, tc.arguments_json)
+              end
           end
         AskFirst:
           item = try Store.create_approval(
@@ -459,7 +497,7 @@ end
 ## Approves (and immediately executes) or denies a pending Needs-You approval item.
 fn resolve_approval(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   budget: BudgetActor,
   policy: PolicyActor,
   scheduler: SchedulerActor,
@@ -519,6 +557,8 @@ fn resolve_approval(
       item.session_id,
       Owner,
       false,
+      None,
+      "approval-#{approval_id}",
       item.arguments_json,
       0
     )
@@ -576,10 +616,11 @@ fn resolve_approval(
   end
 end
 
-## Executes all enabled routines whose `next_due_at <= now`, defaulting to Routine trust.
+## Executes all enabled routines whose `next_due_at <= now`, defaulting to Routine trust
+## and acquiring per-routine Claims leases so concurrent runners never double-execute.
 fn run_due_routines(
   rt: ToolRuntime,
-  db: Sqlite.Database,
+  db: Store.DbHandle,
   budget: BudgetActor,
   policy: PolicyActor,
   scheduler: SchedulerActor
@@ -592,6 +633,12 @@ fn run_due_routines(
   var results = []
 
   for r in due
+    holder = "routine-runner:#{r.bot_name}"
+    claimed = try Store.try_claim_routine(db, r.id, holder, now_time, 300)
+    if not claimed
+      results = results.append("#{r.bot_name}:#{r.name} skipped (active lease)")
+      continue
+    end
     _reg = scheduler.register_routine(r.bot_name, r.name)
     next_due = (now_time + r.interval_seconds.seconds).to_text
     case run_turn(
@@ -616,6 +663,7 @@ fn run_due_routines(
         try Store.mark_routine_ran(db, r.id, now_text, next_due)
         results = results.append("#{r.bot_name}:#{r.name} error -> #{err}")
     end
+    _rel = Store.release_routine_claim(db, r.id, holder, rt.clock.now)
   end
 
   Ok(
@@ -629,15 +677,14 @@ fn run_due_routines(
 end
 
 test "Brain pauses WriteExternal T3 thread launch into Needs You and executes on approval"
-  sqlite = Sqlite.in_memory()
-  assert sqlite.open("motet.sqlite") is Ok(db)
+  files = Files.in_memory({})
   t0 = Time.parse("2026-11-22T00:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = Store.open(files, clock)
   assert Store.seed_defaults(db, t0.to_text) is Ok(Unit)
 
-  files = Files.in_memory({})
   cmd = Command.fake({})
   env = Env.of({"ANTHROPIC_API_KEY": "test-ant", "T3_MCP_TOKEN": "test-t3"})
-  clock = Clock.fixed(t0)
 
   assert Store.get_bot(db, "chief") is Ok(Some(chief))
   assert build_prompt_tiers(db, files.read_only, chief, Owner, t0.to_text) is Ok(tiers)
@@ -726,16 +773,15 @@ test "Brain pauses WriteExternal T3 thread launch into Needs You and executes on
   assert policy.stats.pending_inbox == 0 and policy.stats.resolved_inbox == 1
 end
 
-test "Brain delegates from chief to builder with durable child session and blocks self-delegation"
-  sqlite = Sqlite.in_memory()
-  assert sqlite.open("motet.sqlite") is Ok(db)
+test "Brain delegates from chief to builder with durable child session, attenuated grant, and skips claimed routines"
+  files = Files.in_memory({})
   t0 = Time.parse("2026-11-22T12:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = Store.open(files, clock)
   assert Store.seed_defaults(db, t0.to_text) is Ok(Unit)
 
-  files = Files.in_memory({})
   cmd = Command.fake({})
   env = Env.of({"ANTHROPIC_API_KEY": "test-ant"})
-  clock = Clock.fixed(t0)
 
   assert Store.get_bot(db, "chief") is Ok(Some(chief))
   assert Store.get_bot(db, "builder") is Ok(Some(builder))
@@ -747,13 +793,25 @@ test "Brain delegates from chief to builder with durable child session and block
     "bot": Json.String("builder"),
     "task": Json.String("Summarize the build plan")
   }).to_text
-  c1_req = build_http_request(chief, "test-ant", chief_tiers, [UserMsg(content: "Ask builder for a build plan")], tool_defs)
+  c1_req = build_http_request(
+    chief,
+    "test-ant",
+    chief_tiers,
+    [UserMsg(content: "Ask builder for a build plan")],
+    tool_defs
+  )
   c1_body = "{\"content\":[{\"type\":\"text\",\"text\":\"Delegating to builder.\"},{\"type\":\"tool_use\",\"id\":\"toolu_del\",\"name\":\"bot_delegate\",\"input\":#{del_args}}],\"usage\":{\"input_tokens\":200,\"output_tokens\":30}}"
 
   parent_sid = "chief-20261122T120000Z"
   child_sid = "builder-del-20261122T120000Z-d1"
   framed = "[Delegated from chief (session #{parent_sid})] Summarize the build plan"
-  b1_req = build_http_request(builder, "test-ant", builder_tiers, [UserMsg(content: framed)], tool_defs)
+  b1_req = build_http_request(
+    builder,
+    "test-ant",
+    builder_tiers,
+    [UserMsg(content: framed)],
+    tool_defs
+  )
   b1_body = "{\"content\":[{\"type\":\"text\",\"text\":\"Plan: 1) compile, 2) test.\"}],\"usage\":{\"input_tokens\":1000,\"output_tokens\":100}}"
 
   del_obs = "Delegated to builder (session #{child_sid}, steps=1, spent=$0.006000)\n\nPlan: 1) compile, 2) test."
@@ -798,4 +856,17 @@ test "Brain delegates from chief to builder with durable child session and block
   # Child session exists durably under builder and spent $0.006 under builder's Opus budget
   assert Store.list_sessions(db, Some("builder")) is Ok(bsess) and bsess.size == 1
   assert Store.bot_daily_spend(db, "builder", "2026-11-22") == Ok(0.006)
+
+  # Attenuated child grant was persisted under `bot:chief` and revoking `bot:chief` cascades!
+  del_gid = "del:#{child_sid}:toolu_del"
+  assert Store.list_grants(db) is Ok(gs) and gs.any?(fn(g) g.id == del_gid end)
+  assert Store.authorize_grant_action(db, del_gid, "read", t0) is Ok(_)
+  assert Store.revoke_grant(db, "bot:chief", "operator", "revoke chief", t0) is Ok(_)
+  assert Store.authorize_grant_action(db, del_gid, "read", t0) is Error(PolicyDenied(message: _))
+
+  # Active Claims lease causes run_due_routines to skip claimed routine cleanly
+  assert Store.try_claim_routine(db, 1, "other-worker", t0, 300) == Ok(true)
+  assert run_due_routines(rt, db, budget, policy, sched) is Ok(tick_sum)
+  assert tick_sum.routines_ran == 0
+  assert (tick_sum.results.first or "").contains?("skipped (active lease)")
 end
