@@ -240,8 +240,8 @@ fn search_vault(
   case qmd_url_opt
     Some(url) if not url.trim.empty?:
       case Mcp.qmd_query(network, url, q, None, 8)
-        Ok(hit_text): return hit_text
-        Error(_): Unit
+        Ok(hit_text) if not hit_text.starts_with?("No qmd matches"): return hit_text
+        Ok(_) | Error(_): Unit
       end
     Some(_) | None: Unit
   end

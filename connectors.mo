@@ -160,13 +160,31 @@ fn apply_auth_headers(req: Http.Request, token: Text) : Http.Request
   end
 end
 
+fn http_error_detail(resp: Http.Response) : Text
+  raw = (resp.text or "").trim
+  return "" if raw.empty?
+  extracted = case Json.parse(raw)
+    Ok(doc): doc.text_at("error.message") or (
+      doc.text_at("error_description") or (doc.text_at("message") or raw)
+    )
+    Error(_): raw
+  end
+  one_line = extracted.replace("\n", " ").replace("\r", " ").trim
+  chars = one_line.chars
+  if chars.size <= 240: one_line else: "#{Text.from_chars(chars.take(237))}..."
+end
+
 fn get_json_authed(network: Network, url: Text, token: Text) : Result(Json, MotetError)
   pinned = network.allow_hosts([parse_host_port(url)])
   req = apply_auth_headers(Http.get(url), token).header("Accept", "application/json").within(
     25.seconds
   )
   resp = try req.send(pinned).map_error(fn(e) UpstreamFailed(message: "GET #{url}: #{e}") end)
-  return Error(UpstreamFailed(message: "GET #{url} returned HTTP #{resp.status}")) if not resp.ok?
+  if not resp.ok?
+    detail = http_error_detail(resp)
+    suffix = if detail.empty?: "" else: ": #{detail}"
+    return Error(UpstreamFailed(message: "GET #{url} returned HTTP #{resp.status}#{suffix}"))
+  end
   resp.json.map_error(fn(e) UpstreamFailed(message: "JSON parse #{url}: #{e}") end)
 end
 
@@ -175,7 +193,11 @@ fn post_json_authed(network: Network, url: Text, token: Text, body: Json) : Resu
   req = apply_auth_headers(Http.post(url), token).header("Accept", "application/json").json(body)
     .within(25.seconds)
   resp = try req.send(pinned).map_error(fn(e) UpstreamFailed(message: "POST #{url}: #{e}") end)
-  return Error(UpstreamFailed(message: "POST #{url} returned HTTP #{resp.status}")) if not resp.ok?
+  if not resp.ok?
+    detail = http_error_detail(resp)
+    suffix = if detail.empty?: "" else: ": #{detail}"
+    return Error(UpstreamFailed(message: "POST #{url} returned HTTP #{resp.status}#{suffix}"))
+  end
   txt = resp.text or ""
   if txt.trim.empty?
     return Ok(Json.Object({"ok": Json.Boolean(true)}))
