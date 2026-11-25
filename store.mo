@@ -2820,7 +2820,15 @@ fn get_settings(db: Sqlite.Database) : Result(AppSettings, MotetError)
 end
 
 fn save_settings(db: Sqlite.Database, s: AppSettings) : Result(AppSettings, MotetError)
-  try set_setting_val(db, "timezone", s.timezone.trim)
+  prev_tz = (try get_setting_val(db, "timezone", "America/Los_Angeles")).trim
+  next_tz = s.timezone.trim
+  try set_setting_val(db, "timezone", next_tz)
+  if not next_tz.empty? and next_tz != prev_tz
+    _r = try db.run(
+      "UPDATE routines SET timezone = ? WHERE timezone = ?",
+      [Sqlite.String(next_tz), Sqlite.String(prev_tz)]
+    ).map_error(db_err)
+  end
   try set_setting_val(db, "quiet_hours_start", s.quiet_hours_start.trim)
   try set_setting_val(db, "quiet_hours_end", s.quiet_hours_end.trim)
   try set_setting_val(db, "public_url", s.public_url.trim)

@@ -2,13 +2,10 @@
 ## Shares the exact same core modules and WAL SQLite database as `server.mo`.
 module Main
 use Brain
-use Budget{BudgetActor}
 use Command
 use Http
 use Llm{LlmMessage, build_http_request}
 use Mcp{parse_host_port}
-use Policy{PolicyActor}
-use Scheduler{SchedulerActor}
 use Skills
 use Store
 use Telegram
@@ -180,33 +177,14 @@ fn cmd_bot_sub(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
   2
 end
 
-fn cmd_ask(
-  rt: ToolRuntime,
-  db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
-  console: Console,
-  rest: List(Text)
-) : Int
+fn cmd_ask(rt: ToolRuntime, db: Sqlite.Database, console: Console, rest: List(Text)) : Int
   if rest.size < 2
     console.error("usage: motet ask <bot> <message...>")
     return 2
   end
   bot_name = rest.first or "chief"
   prompt = rest.drop(1).join(" ")
-  case Brain.run_turn_canonical(
-    rt,
-    db,
-    budget,
-    policy,
-    scheduler,
-    bot_name,
-    None,
-    Owner,
-    false,
-    prompt
-  )
+  case Brain.run_turn_canonical(rt, db, bot_name, None, Owner, false, prompt)
     Ok(reply):
       console.print(reply.reply)
       for a in reply.pending_approvals
@@ -219,15 +197,7 @@ fn cmd_ask(
   end
 end
 
-fn cmd_chat(
-  rt: ToolRuntime,
-  db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
-  console: Console,
-  bot_name: Text
-) : Int
+fn cmd_chat(rt: ToolRuntime, db: Sqlite.Database, console: Console, bot_name: Text) : Int
   console.print("Motet forever-chat with #{bot_name} (type /quit to exit)")
   var session_opt = None
   while true
@@ -237,18 +207,7 @@ fn cmd_chat(
         trimmed = line.trim
         break if trimmed == "/quit" or trimmed == "/exit"
         continue if trimmed.empty?
-        case Brain.run_turn_canonical(
-          rt,
-          db,
-          budget,
-          policy,
-          scheduler,
-          bot_name,
-          session_opt,
-          Owner,
-          false,
-          trimmed
-        )
+        case Brain.run_turn_canonical(rt, db, bot_name, session_opt, Owner, false, trimmed)
           Ok(reply):
             session_opt = Some(reply.session_id)
             console.print(reply.reply)
@@ -286,9 +245,6 @@ end
 fn cmd_resolve(
   rt: ToolRuntime,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   console: Console,
   rest: List(Text),
   approve?: Bool
@@ -307,7 +263,7 @@ fn cmd_resolve(
         auto_resume: Some(not no_resume?),
         always_allow: Some(false)
       )
-      case Brain.resolve_approval_with_options(rt, db, budget, policy, scheduler, id, req)
+      case Brain.resolve_approval_with_options(rt, db, id, req)
         Ok(res):
           console.print(
             "approval ##{res.approval.id} -> #{res.approval.status}: #{res.approval.result_text or
@@ -494,15 +450,7 @@ fn cmd_budget(db: Sqlite.Database, console: Console) : Int
   end
 end
 
-fn cmd_watch(
-  rt: ToolRuntime,
-  db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
-  console: Console,
-  rest: List(Text)
-) : Int
+fn cmd_watch(rt: ToolRuntime, db: Sqlite.Database, console: Console, rest: List(Text)) : Int
   secs = case rest.first
     Some(s):
       case s.to_int
@@ -515,15 +463,15 @@ fn cmd_watch(
     "motet watch started (polling async runs, Telegram & routines every #{secs}s; Ctrl+C to stop)"
   )
   while true
-    case Brain.drain_queued_runs(rt, db, budget, policy, scheduler, 5)
+    case Brain.drain_queued_runs(rt, db, 5)
       Ok(n) if n > 0: console.print("runs: processed #{n} queued run(s)")
       Ok(_) | Error(_): Unit
     end
-    case Telegram.poll_once(rt, db, budget, policy, scheduler)
+    case Telegram.poll_once(rt, db)
       Ok(t) if t > 0: console.print("telegram: processed #{t} update(s)")
       Ok(_) | Error(_): Unit
     end
-    case Brain.run_due_routines(rt, db, budget, policy, scheduler)
+    case Brain.run_due_routines(rt, db)
       Ok(sum) if sum.routines_ran > 0 or sum.routines_skipped > 0: console.print(
         "tick @ #{sum.checked_at}: ran #{sum.routines_ran}, skipped #{sum.routines_skipped}"
       )
@@ -543,10 +491,7 @@ fn main(
   network: Network,
   sqlite: Sqlite,
   clock: Clock,
-  srng: SecureRandom,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor
+  srng: SecureRandom
 ) : Int
   argv = args.list
   head = argv.first or ""
@@ -566,22 +511,21 @@ fn main(
   return cmd_init(db, env, console) if head == "init"
   return cmd_bots(db, console) if head == "bots"
   return cmd_bot_sub(db, console, rest) if head == "bot"
-  return cmd_ask(rt, db, budget, policy, scheduler, console, rest) if head == "ask"
-  return cmd_chat(rt, db, budget, policy, scheduler, console, rest.first or "chief") if head ==
-    "chat"
+  return cmd_ask(rt, db, console, rest) if head == "ask"
+  return cmd_chat(rt, db, console, rest.first or "chief") if head == "chat"
   return cmd_inbox(db, console, rest) if head == "inbox"
-  return cmd_resolve(rt, db, budget, policy, scheduler, console, rest, true) if head == "approve"
-  return cmd_resolve(rt, db, budget, policy, scheduler, console, rest, false) if head == "deny"
+  return cmd_resolve(rt, db, console, rest, true) if head == "approve"
+  return cmd_resolve(rt, db, console, rest, false) if head == "deny"
   return cmd_vault(db, env, clock, srng, console, rest) if head == "vault"
   return cmd_connectors(db, console, rest) if head == "connectors"
   return cmd_memory(db, clock, console, rest) if head == "memory"
   return cmd_skills(files.read_only, console, rest) if head == "skills"
   return cmd_budget(db, console) if head == "budget"
-  return cmd_watch(rt, db, budget, policy, scheduler, console, rest) if head == "watch"
+  return cmd_watch(rt, db, console, rest) if head == "watch"
 
   if head == "tick"
-    _drained = Brain.drain_queued_runs(rt, db, budget, policy, scheduler, 10)
-    return case Brain.run_due_routines(rt, db, budget, policy, scheduler)
+    _drained = Brain.drain_queued_runs(rt, db, 10)
+    return case Brain.run_due_routines(rt, db)
       Ok(sum):
         console.print(
           "tick @ #{sum.checked_at}: ran #{sum.routines_ran} routines, skipped #{sum
@@ -630,26 +574,9 @@ test "motet CLI initializes specialist roster, seals Vault API key, and runs can
   clock = Clock.fixed(t0)
   srng = SecureRandom.seeded(55)
   env = Env.of({"MOTET_MASTER_KEY": "cli-master-key"})
-  budget = Actor.start(BudgetActor)
-  policy = Actor.start(PolicyActor)
-  sched = Actor.start(SchedulerActor)
 
   c1 = Console.fake()
-  assert main(
-    Args.of(["init"]),
-    env,
-    c1,
-    files,
-    cmd,
-    Network.fake({}),
-    sqlite,
-    clock,
-    srng,
-    budget,
-    policy,
-    sched
-  ) ==
-    0
+  assert main(Args.of(["init"]), env, c1, files, cmd, Network.fake({}), sqlite, clock, srng) == 0
   assert c1.printed.first ==
     Some("Motet initialized: 5 active bots, 1 enabled connectors, 4 routines")
 
@@ -664,10 +591,7 @@ test "motet CLI initializes specialist roster, seals Vault API key, and runs can
     Network.fake({}),
     sqlite,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   ) ==
     0
 
@@ -681,10 +605,7 @@ test "motet CLI initializes specialist roster, seals Vault API key, and runs can
     Network.fake({}),
     sqlite,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   ) ==
     0
   assert c2.printed.first == Some("mounted connector notion -> https://mcp.notion.com/mcp")
@@ -699,10 +620,7 @@ test "motet CLI initializes specialist roster, seals Vault API key, and runs can
     Network.fake({}),
     sqlite,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   ) ==
     0
 
@@ -737,10 +655,7 @@ test "motet CLI initializes specialist roster, seals Vault API key, and runs can
     ask_net,
     sqlite,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   ) ==
     0
   assert c4.printed.first == Some("All 5 specialists ready.")

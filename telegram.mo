@@ -12,13 +12,10 @@ send_approval_card,
 answer_callback,
 poll_once
 use Brain
-use Budget{BudgetActor}
 use Command
 use Http
 use Json
 use Llm
-use Policy{PolicyActor}
-use Scheduler{SchedulerActor}
 use Store
 use Tools{ToolRuntime}
 use Types{
@@ -274,15 +271,10 @@ fn parse_updates(doc: Json) : List(TelegramUpdate)
   end)
 end
 
-fn handle_callback(
-  rt: ToolRuntime,
-  db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
-  token: Text,
-  upd: TelegramUpdate
-) : Result(Unit, MotetError)
+fn handle_callback(rt: ToolRuntime, db: Sqlite.Database, token: Text, upd: TelegramUpdate) : Result(
+  Unit,
+  MotetError
+)
   parts = upd.callback_data.trim.split(":")
   action = (parts.first or "").ascii_lowercase
   id_opt = (parts.get(1) or "").to_int
@@ -304,7 +296,7 @@ fn handle_callback(
     auto_resume: Some(true),
     always_allow: Some(false)
   )
-  case Brain.resolve_approval_with_options(rt, db, budget, policy, scheduler, id, req)
+  case Brain.resolve_approval_with_options(rt, db, id, req)
     Ok(res):
       label = if approve?: "Approved ##{id}" else: "Denied ##{id}"
       _a = answer_callback(rt.network, token, upd.callback_id, label)
@@ -323,9 +315,6 @@ end
 fn handle_text_message(
   rt: ToolRuntime,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   token: Text,
   default_bot: Text,
   public_url: Text,
@@ -365,18 +354,7 @@ fn handle_text_message(
         Ok(mid): mid
         Error(_): 0
       end
-      case Brain.run_turn_canonical(
-        rt,
-        db,
-        budget,
-        policy,
-        scheduler,
-        bname,
-        None,
-        Owner,
-        false,
-        prompt
-      )
+      case Brain.run_turn_canonical(rt, db, bname, None, Owner, false, prompt)
         Ok(rep):
           reply_txt = if rep.reply.trim.empty?: "(done)" else: "[#{bname}] #{rep.reply}"
           if placeholder_id > 0
@@ -402,13 +380,7 @@ end
 
 ## Polls Telegram `getUpdates` once, enforcing `allowed_telegram_user_id` fail-closed.
 ## Returns the number of authorized updates processed.
-fn poll_once(
-  rt: ToolRuntime,
-  db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor
-) : Result(Int, MotetError)
+fn poll_once(rt: ToolRuntime, db: Sqlite.Database) : Result(Int, MotetError)
   settings = try Store.get_settings(db)
   return Ok(0) if not settings.telegram_enabled?
   allowed_uid = settings.telegram_allowed_user_id.trim
@@ -439,15 +411,12 @@ fn poll_once(
       continue
     end
     if upd.kind == "callback"
-      try handle_callback(rt, db, budget, policy, scheduler, token, upd)
+      try handle_callback(rt, db, token, upd)
       processed += 1
     else if upd.kind == "message"
       try handle_text_message(
         rt,
         db,
-        budget,
-        policy,
-        scheduler,
         token,
         settings.telegram_default_bot,
         settings.public_url,
@@ -537,10 +506,7 @@ test "Telegram rejects unauthorized users, routes /work messages with live edit,
   )
 
   rt = ToolRuntime(files: files, command: cmd, network: net, env: env, clock: clock)
-  budget = Actor.start(BudgetActor)
-  policy = Actor.start(PolicyActor)
-  sched = Actor.start(SchedulerActor)
 
-  assert poll_once(rt, db, budget, policy, sched) == Ok(1)
+  assert poll_once(rt, db) == Ok(1)
   assert Store.get_telegram_offset(db) == Ok(101)
 end

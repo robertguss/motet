@@ -8,7 +8,6 @@
 module Server
 use Api
 use Brain
-use Budget{BudgetActor}
 use Command
 use Connectors
 use Intents
@@ -16,8 +15,7 @@ use Json
 use Mcp{parse_host_port, resolve_connector_url}
 use Memory
 use Oauth
-use Policy{PolicyActor}
-use Scheduler{SchedulerActor}
+use Scheduler
 use Skills
 use Store
 use Telegram
@@ -94,9 +92,6 @@ api
   cors "*"
   sqlite db from "motet.sqlite"
   static "/assets" from "public/assets"
-  actor budget: BudgetActor
-  actor policy: PolicyActor
-  actor scheduler: SchedulerActor
   auth Operator via authenticate
 
   job "motet.dreaming" job_run_dreaming every 1.hour
@@ -230,9 +225,6 @@ end
 fn job_drain_runs(
   _payload: Json,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   files: Files,
   command: Command,
   network: Network,
@@ -241,7 +233,7 @@ fn job_drain_runs(
 ) : Result(Unit, MotetError)
   try ensure_ready(db, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  _n = try Brain.drain_queued_runs(rt, db, budget, policy, scheduler, 4)
+  _n = try Brain.drain_queued_runs(rt, db, 4)
   Ok(Unit)
 end
 
@@ -249,9 +241,6 @@ end
 fn job_run_routines(
   _payload: Json,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   files: Files,
   command: Command,
   network: Network,
@@ -260,7 +249,7 @@ fn job_run_routines(
 ) : Result(Unit, MotetError)
   try ensure_ready(db, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  _t = try Brain.run_due_routines(rt, db, budget, policy, scheduler)
+  _t = try Brain.run_due_routines(rt, db)
   Ok(Unit)
 end
 
@@ -268,9 +257,6 @@ end
 fn job_poll_telegram(
   _payload: Json,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   files: Files,
   command: Command,
   network: Network,
@@ -279,7 +265,7 @@ fn job_poll_telegram(
 ) : Result(Unit, MotetError)
   try ensure_ready(db, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  _n = Telegram.poll_once(rt, db, budget, policy, scheduler)
+  _n = Telegram.poll_once(rt, db)
   Ok(Unit)
 end
 
@@ -551,9 +537,6 @@ end
 fn post_ask_bot(
   _op: Operator,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   files: Files,
   command: Command,
   network: Network,
@@ -565,31 +548,9 @@ fn post_ask_bot(
   try ensure_ready(db, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
   if body.use_canonical or false
-    Brain.run_turn_canonical(
-      rt,
-      db,
-      budget,
-      policy,
-      scheduler,
-      name,
-      body.session_id,
-      Owner,
-      false,
-      body.message
-    )
+    Brain.run_turn_canonical(rt, db, name, body.session_id, Owner, false, body.message)
   else
-    Brain.run_turn(
-      rt,
-      db,
-      budget,
-      policy,
-      scheduler,
-      name,
-      body.session_id,
-      Owner,
-      false,
-      body.message
-    )
+    Brain.run_turn(rt, db, name, body.session_id, Owner, false, body.message)
   end
 end
 
@@ -712,9 +673,6 @@ end
 fn post_resolve_approval(
   _op: Operator,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   files: Files,
   command: Command,
   network: Network,
@@ -725,16 +683,13 @@ fn post_resolve_approval(
 ) : Result(ApprovalResolution, MotetError)
   try ensure_ready(db, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  Brain.resolve_approval_with_options(rt, db, budget, policy, scheduler, id, body)
+  Brain.resolve_approval_with_options(rt, db, id, body)
 end
 
 ## Approves a Needs-You item, executes its paused tool action, and auto-resumes the bot turn.
 fn post_approve(
   _op: Operator,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   files: Files,
   command: Command,
   network: Network,
@@ -747,9 +702,6 @@ fn post_approve(
   res = try Brain.resolve_approval_with_options(
     rt,
     db,
-    budget,
-    policy,
-    scheduler,
     id,
     ResolveApprovalRequest(
       approve: true,
@@ -766,9 +718,6 @@ end
 fn post_deny(
   _op: Operator,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   files: Files,
   command: Command,
   network: Network,
@@ -778,7 +727,7 @@ fn post_deny(
 ) : Result(ApprovalItem, MotetError)
   try ensure_ready(db, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  Brain.resolve_approval(rt, db, budget, policy, scheduler, id, false)
+  Brain.resolve_approval(rt, db, id, false)
 end
 
 ## Lists write-only AES-256-GCM Vault secret metadata (NEVER returns secret values).
@@ -1074,20 +1023,16 @@ fn get_routines(_op: Operator, db: Sqlite.Database, clock: Clock) : Result(
 end
 
 ## Registers or updates a standing routine for a bot.
-fn post_routine(
-  _op: Operator,
-  db: Sqlite.Database,
-  scheduler: SchedulerActor,
-  clock: Clock,
-  body: CreateRoutineRequest
-) : Result(RoutineSpec, MotetError)
+fn post_routine(_op: Operator, db: Sqlite.Database, clock: Clock, body: CreateRoutineRequest) : Result(
+  RoutineSpec,
+  MotetError
+)
   try ensure_ready(db, clock)
   return Error(BadInput(message: "routine name and prompt required")) if body.name.trim.empty? or
     body.prompt.trim.empty?
   _bot = try (try Store.get_bot(db, body.bot_name)).or_fail(
     ItemNotFound(message: "unknown bot: #{body.bot_name}")
   )
-  _reg = scheduler.register_routine(body.bot_name, body.name.trim)
   settings = try Store.get_settings(db)
   Store.upsert_routine_full(
     db,
@@ -1109,9 +1054,6 @@ end
 fn post_tick_routines(
   _op: Operator,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   files: Files,
   command: Command,
   network: Network,
@@ -1120,7 +1062,7 @@ fn post_tick_routines(
 ) : Result(TickSummary, MotetError)
   try ensure_ready(db, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  Brain.run_due_routines(rt, db, budget, policy, scheduler)
+  Brain.run_due_routines(rt, db)
 end
 
 ## Pauses, resumes, or flips a standing routine by id.
@@ -1857,9 +1799,6 @@ end
 fn post_mcp(
   _op: Operator,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   files: Files,
   command: Command,
   network: Network,
@@ -1969,18 +1908,7 @@ fn post_mcp(
       bot_name = args.text_at("bot") or "chief"
       msg = args.text_at("message") or ""
       rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-      reply = try Brain.run_turn_canonical(
-        rt,
-        db,
-        budget,
-        policy,
-        scheduler,
-        bot_name,
-        None,
-        Owner,
-        false,
-        msg
-      )
+      reply = try Brain.run_turn_canonical(rt, db, bot_name, None, Owner, false, msg)
       return Ok(mcp_ok(id, mcp_text_result(reply.reply, reply.to_json)))
     end
     return Ok(mcp_err(id, -32601, "unknown Motet MCP tool: #{tname}"))
@@ -1991,43 +1919,20 @@ end
 
 test "Motet v1 API serves specialist roster, write-only Vault, async runs + job drain, and HMAC webhooks"
   sqlite = Sqlite.in_memory()
-  budget = Actor.start(BudgetActor)
-  policy = Actor.start(PolicyActor)
-  sched = Actor.start(SchedulerActor)
   srng = SecureRandom.seeded(123)
   env = Env.of({"MOTET_API_TOKEN": "secret-op", "MOTET_MASTER_KEY": "master-test-key-v1"})
   t0 = Time.parse("2026-11-25T09:00:00Z") or stop "time"
   clock = Clock.fixed(t0)
 
   # 1. Public PWA UI, icon, OpenAPI spec, and auth enforcement
-  ui_resp = ApiTest.send(Server, Api.get("/"), sqlite, env, clock, srng, budget, policy, sched)
+  ui_resp = ApiTest.send(Server, Api.get("/"), sqlite, env, clock, srng)
   assert ui_resp.status == 200 and ui_resp.text.contains?("Motet")
-  oa_resp = ApiTest.send(
-    Server,
-    Api.get("/openapi.json"),
-    sqlite,
-    env,
-    clock,
-    srng,
-    budget,
-    policy,
-    sched
-  )
+  oa_resp = ApiTest.send(Server, Api.get("/openapi.json"), sqlite, env, clock, srng)
   assert oa_resp.status == 200 and
     oa_resp.text.contains?("/v1/vault/secrets") and
     oa_resp.text.contains?("/v1/bots/{name}/runs")
 
-  unauth = ApiTest.send(
-    Server,
-    Api.get("/v1/bots"),
-    sqlite,
-    env,
-    clock,
-    srng,
-    budget,
-    policy,
-    sched
-  )
+  unauth = ApiTest.send(Server, Api.get("/v1/bots"), sqlite, env, clock, srng)
   assert unauth.status == 401
   authed = ApiTest.send(
     Server,
@@ -2035,10 +1940,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert authed.status == 200
   assert Json.decode[List(BotConfig)](authed.text) is Ok(bots) and bots.size == 7
@@ -2058,10 +1960,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert cloned.status == 200 and
     Json.decode[BotConfig](cloned.text) is Ok(trv) and
@@ -2076,10 +1975,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert save_sec.status == 200 and not save_sec.text.contains?("whsec_live_999")
   list_sec = ApiTest.send(
@@ -2088,10 +1984,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert list_sec.status == 200 and
     list_sec.text.contains?("WH_SECRET_RECEIPTS") and
@@ -2111,10 +2004,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert wh_cfg.status == 200
 
@@ -2128,10 +2018,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert bad_hook.status == 401
 
@@ -2142,10 +2029,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert good_hook.status == 200
   assert Json.decode[WebhookReceipt](good_hook.text) is Ok(wr) and
@@ -2159,10 +2043,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert canon.status == 200 and Json.decode[SessionSummary](canon.text) is Ok(cs) and cs.canonical?
 
@@ -2174,10 +2055,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert enq.status == 200 and Json.decode[BotRun](enq.text) is Ok(run0) and run0.status == "queued"
 
@@ -2189,10 +2067,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert steered.status == 200
 
@@ -2205,10 +2080,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert mcp_save.status == 200 and mcp_save.text.contains?("Hearth Arvo")
 
@@ -2219,10 +2091,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert sse.status == 200 and sse.header("content-type") == Some("text/event-stream")
 
@@ -2233,10 +2102,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     Network.fake({}),
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert bad_cb.status == 400 and bad_cb.text.contains?("Expired or Unknown Sign-In")
 
@@ -2257,10 +2123,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     vcmd,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert v_save.status == 200 and v_save.text.contains?("notes/trip.md")
 
@@ -2272,10 +2135,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     Network.fake({}),
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert v_search.status == 200 and v_search.text.contains?("notes/trip.md")
 
@@ -2286,10 +2146,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     Network.fake({}),
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert ha_test.status == 200 and
     ha_test.text.contains?("hearth_get_snapshot") and
@@ -2302,10 +2159,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert dream_resp.status == 200 and Json.decode[DreamingDigest](dream_resp.text) is Ok(dd)
   rb_resp = ApiTest.send(
@@ -2314,10 +2168,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert rb_resp.status == 200 and rb_resp.text.contains?("\"rolled_back?\":true")
 
@@ -2337,10 +2188,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert int_resp.status == 200 and int_resp.text.contains?("watch-permit")
 
@@ -2352,10 +2200,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     sqlite,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert eval_resp.status == 200 and
     Json.decode[EvaluateIntentsResponse](eval_resp.text) is Ok(evr) and
@@ -2368,10 +2213,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     vfiles,
     env,
     clock,
-    srng,
-    budget,
-    policy,
-    sched
+    srng
   )
   assert audit_resp.status == 200 and audit_resp.text.contains?("Motet Weekly Self-Audit")
 end

@@ -14,15 +14,15 @@ resolve_approval_with_options,
 execute_run,
 drain_queued_runs,
 run_due_routines
-use Budget{BudgetActor}
+use Budget
 use Command
 use Compaction
 use Http
 use Json
 use Llm{LlmMessage, PromptTiers, build_http_request}
 use Memory
-use Policy{PolicyActor}
-use Scheduler{SchedulerActor}
+use Policy
+use Scheduler
 use Skills
 use Store
 use Tools{
@@ -196,9 +196,6 @@ end
 fn execute_delegation(
   rt: ToolRuntime,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   caller_bot: BotConfig,
   parent_session_id: Text,
   trust: TrustLevel,
@@ -230,9 +227,6 @@ fn execute_delegation(
   case run_turn_internal(
     rt,
     db,
-    budget,
-    policy,
-    scheduler,
     target,
     Some(child_sid),
     false,
@@ -263,9 +257,6 @@ end
 fn run_turn(
   rt: ToolRuntime,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   bot_name: Text,
   session_id_opt: Option(Text),
   trust: TrustLevel,
@@ -275,9 +266,6 @@ fn run_turn(
   run_turn_internal(
     rt,
     db,
-    budget,
-    policy,
-    scheduler,
     bot_name,
     session_id_opt,
     false,
@@ -293,9 +281,6 @@ end
 fn run_turn_canonical(
   rt: ToolRuntime,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   bot_name: Text,
   session_id_opt: Option(Text),
   trust: TrustLevel,
@@ -305,9 +290,6 @@ fn run_turn_canonical(
   run_turn_internal(
     rt,
     db,
-    budget,
-    policy,
-    scheduler,
     bot_name,
     session_id_opt,
     true,
@@ -322,9 +304,6 @@ end
 fn run_turn_internal(
   rt: ToolRuntime,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   bot_name: Text,
   session_id_opt: Option(Text),
   use_canonical?: Bool,
@@ -382,7 +361,6 @@ fn run_turn_internal(
     rt.network,
     rt.clock,
     db,
-    budget,
     bot,
     api_key,
     session_id,
@@ -451,7 +429,7 @@ fn run_turn_internal(
     end
 
     day_spent = try Store.bot_daily_spend(db, bot.name, Store.utc_day_prefix(now_text))
-    if day_spent >= bot.daily_budget_usd or not budget.can_spend(bot.name, bot.daily_budget_usd)
+    if bot.daily_budget_usd <= 0.0 or day_spent >= bot.daily_budget_usd
       stopped_reason = Some("daily budget exhausted for #{bot.name}")
       break
     end
@@ -477,20 +455,6 @@ fn run_turn_internal(
       Error(_): 0.0
     end
 
-    case budget.record_spend(
-      bot.name,
-      bot.daily_budget_usd,
-      resp.input_tokens,
-      resp.output_tokens,
-      resp.cached_input_tokens,
-      bot.model_tier
-    )
-      Ok(_snap): Unit
-      Error(berr):
-        stopped_reason = Some("budget limit reached: #{berr}")
-        break
-    end
-
     try Store.record_spend_ledger_full(
       db,
       bot.name,
@@ -508,6 +472,11 @@ fn run_turn_internal(
     case active_run_id
       Some(rid): try Store.update_run_progress(db, rid, steps, total_spent, step_now)
       None: Unit
+    end
+
+    if day_spent + step_cost > bot.daily_budget_usd and not resp.tool_calls.empty?
+      stopped_reason = Some("daily budget exhausted for #{bot.name}")
+      break
     end
 
     if resp.tool_calls.empty?
@@ -562,7 +531,6 @@ fn run_turn_internal(
             Policy.evaluate_action(bot.name, trust, effect, policy_key, routine_read_only?, rules)
           end
       end
-      _pstats = policy.record_decision(outcome.decision)
 
       obs = case outcome.decision
         Allow:
@@ -570,9 +538,6 @@ fn run_turn_internal(
             (del_obs, child_approvals) = try execute_delegation(
               rt,
               db,
-              budget,
-              policy,
-              scheduler,
               bot,
               session_id,
               trust,
@@ -671,9 +636,6 @@ end
 fn resolve_approval_with_options(
   rt: ToolRuntime,
   db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
   approval_id: Int,
   req: ResolveApprovalRequest
 ) : Result(ApprovalResolution, MotetError)
@@ -685,7 +647,6 @@ fn resolve_approval_with_options(
     Pending
 
   now_text = rt.clock.now.to_text
-  _p = policy.record_resolved
   should_resume? = req.auto_resume or true
 
   if not req.approve
@@ -719,18 +680,7 @@ fn resolve_approval_with_options(
     )
     resumed = if should_resume?
       resume_prompt = "I denied approval ##{approval_id} (#{item.tool_name}). Reason: #{deny_reason}. Acknowledge briefly and adjust your plan without retrying the denied action."
-      case run_turn(
-        rt,
-        db,
-        budget,
-        policy,
-        scheduler,
-        item.bot_name,
-        Some(item.session_id),
-        Owner,
-        false,
-        resume_prompt
-      )
+      case run_turn(rt, db, item.bot_name, Some(item.session_id), Owner, false, resume_prompt)
         Ok(rep): Some(rep)
         Error(_): None
       end
@@ -768,19 +718,7 @@ fn resolve_approval_with_options(
   end
 
   exec_res = if item.tool_name == "bot_delegate"
-    case execute_delegation(
-      rt,
-      db,
-      budget,
-      policy,
-      scheduler,
-      bot,
-      item.session_id,
-      Owner,
-      false,
-      final_args,
-      0
-    )
+    case execute_delegation(rt, db, bot, item.session_id, Owner, false, final_args, 0)
       Ok((del_txt, _child_p)): Ok(del_txt)
       Error(err): Error(err)
     end
@@ -816,18 +754,7 @@ fn resolve_approval_with_options(
       )
       resumed = if should_resume?
         resume_prompt = "Approval ##{approval_id} (#{item.tool_name}) was approved and executed with result: #{output}. Continue and give the user a clear update."
-        case run_turn(
-          rt,
-          db,
-          budget,
-          policy,
-          scheduler,
-          item.bot_name,
-          Some(item.session_id),
-          Owner,
-          false,
-          resume_prompt
-        )
+        case run_turn(rt, db, item.bot_name, Some(item.session_id), Owner, false, resume_prompt)
           Ok(rep): Some(rep)
           Error(_): None
         end
@@ -855,21 +782,13 @@ fn resolve_approval_with_options(
 end
 
 ## Legacy wrapper: resolves approval without auto-resume (use `resolve_approval_with_options` for auto-resume).
-fn resolve_approval(
-  rt: ToolRuntime,
-  db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
-  approval_id: Int,
-  approve?: Bool
-) : Result(ApprovalItem, MotetError)
+fn resolve_approval(rt: ToolRuntime, db: Sqlite.Database, approval_id: Int, approve?: Bool) : Result(
+  ApprovalItem,
+  MotetError
+)
   res = try resolve_approval_with_options(
     rt,
     db,
-    budget,
-    policy,
-    scheduler,
     approval_id,
     ResolveApprovalRequest(
       approve: approve?,
@@ -883,20 +802,10 @@ fn resolve_approval(
 end
 
 ## Executes a single claimed async BotRun, updating progress & status durably in SQLite.
-fn execute_run(
-  rt: ToolRuntime,
-  db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
-  run: BotRun
-) : Result(BotRun, MotetError)
+fn execute_run(rt: ToolRuntime, db: Sqlite.Database, run: BotRun) : Result(BotRun, MotetError)
   case run_turn_internal(
     rt,
     db,
-    budget,
-    policy,
-    scheduler,
     run.bot_name,
     Some(run.session_id),
     false,
@@ -938,21 +847,14 @@ fn execute_run(
 end
 
 ## Drains up to `max_runs` queued async BotRuns atomically (invoked by `mo serve` job & `motet watch`).
-fn drain_queued_runs(
-  rt: ToolRuntime,
-  db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor,
-  max_runs: Int
-) : Result(Int, MotetError)
+fn drain_queued_runs(rt: ToolRuntime, db: Sqlite.Database, max_runs: Int) : Result(Int, MotetError)
   cap = if max_runs > 0 and max_runs <= 20: max_runs else: 5
   var processed = 0
   while processed < cap
     case try Store.claim_next_queued_run(db, rt.clock.now.to_text)
       None: break
       Some(run):
-        _done = try execute_run(rt, db, budget, policy, scheduler, run)
+        _done = try execute_run(rt, db, run)
         processed += 1
     end
   end
@@ -989,13 +891,7 @@ end
 
 ## Executes all enabled routines whose wall-clock slot or interval is due,
 ## enforcing at-most-once occurrence slots, zero-token prechecks, and Routine trust.
-fn run_due_routines(
-  rt: ToolRuntime,
-  db: Sqlite.Database,
-  budget: BudgetActor,
-  policy: PolicyActor,
-  scheduler: SchedulerActor
-) : Result(TickSummary, MotetError)
+fn run_due_routines(rt: ToolRuntime, db: Sqlite.Database) : Result(TickSummary, MotetError)
   now_time = rt.clock.now
   now_text = now_time.to_text
   candidates = try Store.list_due_routines(db, now_text)
@@ -1033,7 +929,6 @@ fn run_due_routines(
       continue
     end
 
-    _reg = scheduler.register_routine(r.bot_name, r.name)
     mem_hint = if r.skip_memory?
       " (Unattended routine: do NOT call memory_save unless explicitly asked by owner.)"
     else
@@ -1042,9 +937,6 @@ fn run_due_routines(
     case run_turn(
       rt,
       db,
-      budget,
-      policy,
-      scheduler,
       r.bot_name,
       None,
       Routine,
@@ -1053,7 +945,6 @@ fn run_due_routines(
     )
       Ok(reply):
         try Store.mark_routine_ran(db, r.id, now_text, next_due)
-        _m = scheduler.mark_ran(r.bot_name, r.name)
         ran += 1
         approvals += reply.pending_approvals.size
         results = results.append("#{r.bot_name}:#{r.name} -> #{reply.reply}")
@@ -1197,22 +1088,8 @@ test "Brain pauses WriteExternal, supports edited approval + Always-Allow rule +
   )
 
   rt = ToolRuntime(files: files, command: cmd, network: net, env: env, clock: clock)
-  budget = Actor.start(BudgetActor)
-  policy = Actor.start(PolicyActor)
-  sched = Actor.start(SchedulerActor)
 
-  assert run_turn_canonical(
-    rt,
-    db,
-    budget,
-    policy,
-    sched,
-    "work",
-    None,
-    Owner,
-    false,
-    "Email Sarah the update"
-  ) is
+  assert run_turn_canonical(rt, db, "work", None, Owner, false, "Email Sarah the update") is
     Ok(reply)
   assert reply.session_id == "work-main" and reply.pending_approvals.size == 1
 
@@ -1224,9 +1101,6 @@ test "Brain pauses WriteExternal, supports edited approval + Always-Allow rule +
   assert resolve_approval_with_options(
     rt,
     db,
-    budget,
-    policy,
-    sched,
     1,
     ResolveApprovalRequest(
       approve: true,
@@ -1333,9 +1207,6 @@ test "Brain enforces strict specialist wall, delegates chief -> finance (Gemini)
     ])
   )
   rt = ToolRuntime(files: files, command: cmd, network: net, env: env, clock: clock)
-  budget = Actor.start(BudgetActor)
-  policy = Actor.start(PolicyActor)
-  sched = Actor.start(SchedulerActor)
 
   # Enqueue as async run and drain via drain_queued_runs!
   assert Store.get_or_create_canonical_session(db, "chief", t0.to_text) is Ok(_)
@@ -1350,7 +1221,7 @@ test "Brain enforces strict specialist wall, delegates chief -> finance (Gemini)
     t0.to_text
   ) is
     Ok(_)
-  assert drain_queued_runs(rt, db, budget, policy, sched, 5) == Ok(1)
+  assert drain_queued_runs(rt, db, 5) == Ok(1)
   assert Store.get_run(db, "run-async-1") is Ok(Some(done_run))
   assert done_run.status == "completed" and
     done_run.reply == "Finance reports $1,420 Safe-to-Spend."
@@ -1404,11 +1275,8 @@ test "Brain trips 3-denial circuit breaker and cleanly cancels interrupted async
   env = Env.of({"ANTHROPIC_API_KEY": "test-ant"})
   clock = Clock.fixed(t0)
   rt = ToolRuntime(files: files, command: cmd, network: Network.fake({}), env: env, clock: clock)
-  budget = Actor.start(BudgetActor)
-  policy = Actor.start(PolicyActor)
-  sched = Actor.start(SchedulerActor)
 
-  assert drain_queued_runs(rt, db, budget, policy, sched, 5) == Ok(1)
+  assert drain_queued_runs(rt, db, 5) == Ok(1)
   assert Store.get_run(db, "run-int-1") is Ok(Some(canceled))
   assert canceled.status == "cancelled" and canceled.steps == 0
 end

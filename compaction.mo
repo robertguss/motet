@@ -3,7 +3,7 @@
 ## compaction, preserves a clean UserMsg-aligned tail, and never auto-promotes untrusted data.
 module Compaction
 expose estimate_messages_tokens, needs_compaction?, split_for_compaction, compact_session_if_needed
-use Budget{BudgetActor}
+use Budget
 use Http
 use Json
 use Llm{LlmMessage, PromptTiers, build_http_request}
@@ -93,7 +93,6 @@ fn compact_session_if_needed(
   network: Network,
   clock: Clock,
   db: Sqlite.Database,
-  budget: BudgetActor,
   bot: BotConfig,
   api_key: Text,
   session_id: Text,
@@ -132,14 +131,6 @@ fn compact_session_if_needed(
     Ok(c): c
     Error(_): 0.0
   end
-  _b = budget.record_spend(
-    bot.name,
-    bot.daily_budget_usd,
-    resp.input_tokens,
-    resp.output_tokens,
-    resp.cached_input_tokens,
-    bot.model_tier
-  )
   try Store.record_spend_ledger_full(
     db,
     bot.name,
@@ -237,13 +228,11 @@ test "Warm-Request Compaction aligns on UserMsg boundary, flushes owner facts, a
   }).to_text
   net = Network.fake(Http.replies([(expected_req, Http.reply(200, reply_json))]))
   clock = Clock.fixed(t0)
-  budget = Actor.start(BudgetActor)
 
   assert compact_session_if_needed(
     net,
     clock,
     db,
-    budget,
     chief,
     "k-comp",
     sess.id,
