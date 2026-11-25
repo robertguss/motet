@@ -1,83 +1,73 @@
 # Motet
 
-**Motet** is a standalone, single-binary personal and software-engineering agent framework written in [Mo](https://github.com/robertguss/mo).
+**Motet** is a standalone personal and executive AI agent roster written natively in [Mo](https://github.com/robertguss/mo) and stored in pure-Mo **MoDB** (`motet.modb` + physically isolated `motet-secrets.modb`).
 
 It combines:
-- **Grok Bot simplicity:** a small roster of named persistent teammates (`chief`, `watcher`, `builder`), tiered memory (shared "About you" + per-bot rules & work log), standing routines, and a single **Needs You** approval inbox.
-- **Hermes power without Python bloat:** dual-protocol LLM client (OpenAI-compatible + Anthropic Messages API with explicit prompt-cache breakpoints), progressive-disclosure `SKILL.md` skills (`agentskills.io`), append-only WAL SQLite session logs with full-text token search, and confined local workspace tools.
-- **Devin Bot supervision + T3 Code orchestration:** standing engineering responsibilities backed by a unified Streamable-HTTP MCP connector engine — with **T3 Code** mounted as Connector #1 so bots can monitor projects/threads/PRs and coordinate isolated worktree threads, while future connectors (Slack, Notion, Linear, GitHub, Gmail) plug into the exact same contract.
+- **Strictly Walled Specialist Roster:** 5 active everyday bots (`chief`, `work`, `personal`, `finance`, `researcher`) plus dormant engineering presets (`builder`, `watcher`) and custom bot cloning/creation. Multi-agent delegation (`bot_delegate`) issues attenuated **MoDB Grants**.
+- **Pure-Mo MoDB Engine & Physical Secret Isolation:** Crash-safe CoW B+Tree storage (`motet.modb`) with batched inverted Unicode search (`event_tokens`, `memory_tokens`), tamper-evident SHA-256 hash-chained audit ledger, commit-time `Ledger.schema` invariants, time-bounded `Claims` leases, lossless selective-undo `Replay`, canonical SHA-256 `Export`, and bare Layer 1/2 `motet-secrets.modb` keeping AES-256-GCM Vault secrets & OAuth tokens out of audit logs and exports.
+- **React 19 + Tailwind CSS v4 Dashboard PWA & Telegram:** Full control-plane UI (`frontend/` → `public/`) with Live Chat, Needs You inbox (inline arg edits + auto-resume), Bot Builder, Write-Only AES-256-GCM Vault, Git-backed Markdown Vault + `tobi/qmd`, Overnight Dreaming + 1-click Rollback, Standing Intents, Analytics, and the **MoDB Integrity & Audit** panel — plus lean Telegram `/<bot>` routing with inline Approve/Deny buttons and Web Push alerts.
+- **Native Anthropic & Google Gemini + Everyday Connectors:** Explicit Anthropic `cache_control` breakpoints, native Gemini `generateContent`, Work/Personal Google OAuth 2.0 + PKCE (`gmail-*`, `gcal-*`, `gdocs-*`), Notion MCP, Todoist, and Hearth Arvo (Mercury sync + Undo).
 
 ## Quickstart
 
 ### 1. Run tests (zero sockets, deterministic)
 
 ```sh
+mo test store.mo
+mo test tools.mo
+mo test brain.mo
+mo test telegram.mo
+mo test migrate-sqlite.mo
 mo test main.mo
 mo test server.mo
+(cd frontend && npm run typecheck && npm test && npm run build)
 ```
 
-### 2. Install the `motet` CLI
+### 2. Install the `motet` CLI & verify MoDB
 
 ```sh
-mo install main.mo --name motet --state-dir ~/.local/share/motet
+mo install main.mo --name motet --root ~/.local/share/motet
 motet init
 motet bots
+motet verify
+motet audit 10
 ```
 
-### 3. Set a provider key and talk to your roster
+### 3. Set provider / vault keys and talk to your roster
 
 ```sh
-# Anthropic Messages API (default for seeded chief/builder/watcher, with prompt caching)
 export ANTHROPIC_API_KEY="..."
-
-# Or OpenAI-compatible (Google Gemini, xAI/Grok, OpenAI, OpenRouter, Ollama/vLLM)
 export GEMINI_API_KEY="..."
-export XAI_API_KEY="..."
 
-motet ask chief "Summarize what you can monitor for me"
+motet ask chief "Summarize what needs my attention today"
 motet chat chief
 ```
 
-### 4. Start the unified API + Responsive PWA UI + Built-in MCP Server
+### 4. Start the unified API + React PWA Dashboard + Built-in MCP Server
 
 ```sh
-export MOTET_API_TOKEN="choose-a-strong-local-token"   # optional on loopback
+export MOTET_API_TOKEN="choose-a-strong-local-token"
+export MOTET_MASTER_KEY="choose-a-strong-32-byte-secret"
 mo serve server.mo --port 8787 --data .motet
 ```
 
-- **Responsive Web UI (iPhone/macOS PWA):** `http://127.0.0.1:8787/` — 3-pane desktop studio + 4-tab mobile bottom bar (`Chat`, `Inbox`, `Roster`, `Ops`), Bot Studio create/edit modal with provider presets, replayable session history & full-text search, **Needs You** approval cards, inline editors for `SKILL.md` skills, memory, routines, MCP connectors, policy rules, and artifacts
-- **Interactive OpenAPI 3.1 Docs:** `http://127.0.0.1:8787/docs` and `/openapi.json` (ready for future SwiftUI Mac/iOS or Electron clients)
-- **Built-in MCP endpoint (for T3 Code → Motet):** `POST http://127.0.0.1:8787/mcp`
-- **Webhook receiver (`External` trust):** `POST http://127.0.0.1:8787/webhooks/<source>`
+- **React Control Plane & PWA:** `http://127.0.0.1:8787/` (built from `frontend/` into `public/`)
+- **OpenAPI 3.1 Docs:** `http://127.0.0.1:8787/docs` and `/openapi.json`
+- **MoDB Integrity, Audit, Export, Grants, Claims & Replay:** `/v1/modb/*`
+- **Built-in Streamable HTTP MCP Endpoint:** `POST http://127.0.0.1:8787/mcp` (includes `motet_verify`, `motet_audit`)
+- **Webhook Receiver (`External` trust):** `POST http://127.0.0.1:8787/webhooks/<source>`
 
-### 5. Deploy to an `exe.dev` VM
+### 5. Migrate legacy SQLite data (one-time)
 
 ```sh
-./deploy.sh    # syncs repo, runs mo test remotely, reinstalls CLI, restarts systemd services
+mo run --root ~/.local/share/motet migrate-sqlite.mo
+motet verify
 ```
 
-### 6. Connect T3 Code and future MCP integrations
-
-T3 Code is pre-registered as connector `t3code` and Motet includes a built-in **standard MCP OAuth 2.0 + PKCE client** (RFC 9728 / 8414 / 7591 / 7636):
-
-1. In T3 Code, open **Settings → Environments → Copy MCP URL** (with T3 Connect enabled).
-2. In Motet's Web UI (**Ops → Connectors**), click **Edit URL** on `t3code` and paste your `https://<env>/mcp` URL.
-3. Click **Connect OAuth**, choose the access level (**Auto** or **Read only**) on T3 Code's Approve screen, and click **Test Tools**.
-
-You can also mount additional HTTP MCP servers (OAuth or env-var Bearer token) with zero code changes:
+### 6. Deploy to an `exe.dev` VM
 
 ```sh
-motet connectors add notion https://mcp.notion.com/mcp NOTION_TOKEN write_external
-motet connectors add linear https://mcp.linear.app/mcp LINEAR_TOKEN write_external
-```
-
-### 6. Run standing routines and review Needs You approvals
-
-```sh
-motet tick          # run due routines once
-motet watch 60      # always-on background polling loop
-motet inbox         # inspect actions paused by host policy
-motet approve 1     # execute a paused action and log its result
+./deploy.sh    # builds SPA, syncs ../modb + motet, runs all tests remotely, installs CLI, restarts systemd & verifies MoDB
 ```
 
 See [DESIGN.md](DESIGN.md) for the full architecture and security boundaries.
