@@ -841,7 +841,7 @@ fn seed_defaults(db: Sqlite.Database, now_text: Text) : Result(Unit, MotetError)
       ConnectorSpec(
         name: "todoist",
         kind: "todoist",
-        url: "https://api.todoist.com/rest/v2",
+        url: "https://api.todoist.com/api/v1",
         auth_env: "TODOIST_API_TOKEN",
         allowed_host: "api.todoist.com:443",
         default_effect: WriteExternal,

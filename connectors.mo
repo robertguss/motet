@@ -296,32 +296,34 @@ fn gdocs_publish_page(network: Network, token: Text, title: Text, content: Text)
 end
 
 # ==============================================================================
-# Todoist REST API
+# Todoist Unified API v1 (https://api.todoist.com/api/v1)
 # ==============================================================================
 fn todoist_list_tasks(network: Network, token: Text, filter_opt: Option(Text)) : Result(
   Text,
   MotetError
 )
-  qs = case filter_opt
-    Some(f) if not f.trim.empty?: "?filter=#{f.trim.replace(" ", "+")}"
-    Some(_) | None: ""
+  url = case filter_opt
+    Some(f) if not f.trim.empty?: "https://api.todoist.com/api/v1/tasks/filter?query=#{f.trim
+      .replace(" ", "+")}"
+    Some(_) | None: "https://api.todoist.com/api/v1/tasks?limit=50"
   end
-  doc = try get_json_authed(network, "https://api.todoist.com/rest/v2/tasks#{qs}", token)
+  doc = try get_json_authed(network, url, token)
   items = case doc
     Json.Array(arr): arr
-    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): []
+    Json.Object(_): doc.list_at("results") or []
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_): []
   end
   if items.empty?
     return Ok("No matching Todoist tasks.")
   end
-  lines = items.take(25).map(fn(t)
+  lines = items.take(30).map(fn(t)
     id = t.text_at("id") or ""
     c = t.text_at("content") or ""
     due = t.text_at("due.string") or ""
     due_tag = if due.empty?: "" else: " (due: #{due})"
     "- [#{id}] #{c}#{due_tag}"
   end)
-  Ok(lines.join("\n"))
+  Ok("Found #{items.size} Todoist task(s):\n#{lines.join("\n")}")
 end
 
 fn todoist_add_task(
@@ -342,7 +344,7 @@ fn todoist_add_task(
   end
   doc = try post_json_authed(
     network,
-    "https://api.todoist.com/rest/v2/tasks",
+    "https://api.todoist.com/api/v1/tasks",
     token,
     Json.Object(obj)
   )
@@ -353,7 +355,7 @@ end
 fn todoist_complete_task(network: Network, token: Text, task_id: Text) : Result(Text, MotetError)
   _doc = try post_json_authed(
     network,
-    "https://api.todoist.com/rest/v2/tasks/#{task_id.trim}/close",
+    "https://api.todoist.com/api/v1/tasks/#{task_id.trim}/close",
     token,
     Json.Object({})
   )
@@ -537,13 +539,14 @@ fn dispatch_builtin_tool(
 end
 
 test "Connectors dispatch Todoist, Hearth Arvo Safe-to-Spend, and Google Docs Page publish over fake Network"
-  # 1. Todoist add + list
-  t_req = Http.post("https://api.todoist.com/rest/v2/tasks").header(
-    "Authorization",
-    "Bearer td-tok"
-  ).header("Accept", "application/json").json(
-    Json.Object({"content": Json.String("Call dentist"), "due_string": Json.String("tomorrow 9am")})
-  ).within(25.seconds)
+  # 1. Todoist add + list (API v1)
+  t_req = Http.post("https://api.todoist.com/api/v1/tasks").header("Authorization", "Bearer td-tok")
+    .header("Accept", "application/json").json(
+      Json.Object({
+        "content": Json.String("Call dentist"),
+        "due_string": Json.String("tomorrow 9am")
+      })
+    ).within(25.seconds)
 
   # 2. Hearth Arvo snapshot
   h_req = Http.get("https://hearth.exe.xyz/api/v1/agent/snapshot").header(
@@ -585,7 +588,7 @@ test "Connectors dispatch Todoist, Hearth Arvo Safe-to-Spend, and Google Docs Pa
   td_spec = ConnectorSpec(
     name: "todoist",
     kind: "todoist",
-    url: "https://api.todoist.com/rest/v2",
+    url: "https://api.todoist.com/api/v1",
     auth_env: "TODOIST_API_TOKEN",
     allowed_host: "api.todoist.com:443",
     default_effect: WriteExternal,

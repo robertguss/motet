@@ -43,7 +43,7 @@ const CONNECTOR_PRESETS = [
   { name: 'gmail-personal', url: 'https://gmail.googleapis.com/gmail/v1', auth_env: 'GMAIL_PERSONAL_TOKEN', default_effect: 'write_external' as EffectClass },
   { name: 'gcal-personal', url: 'https://www.googleapis.com/calendar/v3', auth_env: 'GCAL_PERSONAL_TOKEN', default_effect: 'write_external' as EffectClass },
   { name: 'gdocs-personal', url: 'https://docs.googleapis.com/v1', auth_env: 'GDOCS_PERSONAL_TOKEN', default_effect: 'write_external' as EffectClass },
-  { name: 'todoist', url: 'https://api.todoist.com/rest/v2', auth_env: 'TODOIST_API_TOKEN', default_effect: 'write_external' as EffectClass },
+  { name: 'todoist', url: 'https://api.todoist.com/api/v1', auth_env: 'TODOIST_API_TOKEN', default_effect: 'write_external' as EffectClass },
   { name: 'hearth-arvo', url: 'https://hearth.exe.xyz/api/v1/agent', auth_env: 'HEARTH_API_TOKEN', default_effect: 'write_external' as EffectClass },
   { name: 'qmd', url: 'http://127.0.0.1:8181/mcp', auth_env: '', default_effect: 'read' as EffectClass },
 ];
