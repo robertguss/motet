@@ -1,4 +1,4 @@
-## Motet CLI and always-on routine watcher (`mo install main.mo --name motet`).
+## Motet CLI and always-on worker (`mo install main.mo --name motet`).
 ## Shares the exact same core modules and WAL SQLite database as `server.mo`.
 module Main
 use Brain
@@ -18,6 +18,7 @@ use Types{
   EffectClass,
   MotetError,
   ProviderKind,
+  ResolveApprovalRequest,
   TrustLevel,
   effect_from_text
 }
@@ -25,20 +26,23 @@ use Types{
 fn print_usage(console: Console)
   console.print(
     [
-      "motet — living agent roster & T3 Code orchestrator in Mo",
+      "motet — daily-driver living agent roster in Mo",
       "",
       "Commands:",
-      "  motet init                                       Initialize DB, starter roster, and T3 connector",
+      "  motet init                                       Initialize DB and specialist-wall roster",
       "  motet bots                                       List bots in the roster",
       "  motet bot show <name>                            Show one bot's configuration",
-      "  motet bot create <name> <role> <model> [provider]",
-      "  motet ask <bot> <message...>                     Send one message to a bot",
-      "  motet chat [bot]                                 Interactive chat (defaults to chief)",
+      "  motet bot create <name> <role> <model> [anthropic|gemini|openai]",
+      "  motet ask <bot> <message...>                     Send one message to a bot (canonical chat)",
+      "  motet chat [bot]                                 Interactive forever-chat (defaults to chief)",
       "  motet inbox [--all]                              Show Needs-You approval inbox",
-      "  motet approve <id>                               Approve and execute a paused action",
-      "  motet deny <id>                                  Deny a paused action",
-      "  motet tick                                       Run due routines once",
-      "  motet watch [interval_seconds]                   Run background routine loop (Clock.sleep)",
+      "  motet approve <id> [--no-resume]                 Approve, execute, and auto-resume",
+      "  motet deny <id> [reason...]                      Deny a paused action with optional reason",
+      "  motet vault list                                 List configured AES-256-GCM Vault secrets",
+      "  motet vault set <name> <value> [scope]           Seal a secret into the encrypted Vault",
+      "  motet vault delete <name>                        Remove a secret from the Vault",
+      "  motet tick                                       Run due routines and queued async runs once",
+      "  motet watch [interval_seconds]                   Run background worker (runs + routines)",
       "  motet connectors                                 List mounted MCP/HTTP connectors",
       "  motet connectors add <name> <url> <auth_env> [effect]",
       "  motet memory [scope]                             List persistent memory",
@@ -64,11 +68,11 @@ fn print_err(console: Console, err: MotetError) : Int
   1
 end
 
-fn cmd_init(db: Sqlite.Database, console: Console) : Int
-  case Store.health_summary(db)
+fn cmd_init(db: Sqlite.Database, env: Env, console: Console) : Int
+  case Store.health_summary(db, env)
     Ok(h):
       console.print(
-        "Motet initialized: #{h.bots} bots, #{h.connectors} connectors, #{h.routines} routines"
+        "Motet initialized: #{h.bots} active bots, #{h.connectors} enabled connectors, #{h.routines} routines"
       )
       0
     Error(err): print_err(console, err)
@@ -80,8 +84,9 @@ fn cmd_bots(db: Sqlite.Database, console: Console) : Int
     Ok(bots):
       for b in bots
         star = if b.is_primary?: " [primary]" else: ""
+        state = if b.active?: "" else: " [dormant]"
         console.print(
-          "#{b.name}#{star} — #{b.role} (#{b.model}, tier=#{b.model_tier}, budget=$#{b
+          "#{b.name}#{star}#{state} — #{b.role} (#{b.provider}/#{b.model}, tier=#{b.model_tier}, budget=$#{b
             .daily_budget_usd.to_fixed(2)}/day)"
         )
       end
@@ -100,12 +105,13 @@ fn cmd_bot_sub(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
           [
             "name: #{b.name}",
             "role: #{b.role}",
-            "primary: #{b.is_primary?}",
+            "primary: #{b.is_primary?} (active=#{b.active?})",
             "model: #{b.model} (#{b.provider}, tier=#{b.model_tier})",
-            "endpoint: #{b.endpoint} (key_env=#{b.api_key_env})",
+            "endpoint: #{b.endpoint} (key=#{b.api_key_env})",
             "workspace: #{b.workspace}",
             "allowed_programs: #{b.allowed_programs.join(", ")}",
             "connectors: #{b.connectors.join(", ")}",
+            "read_only_connectors: #{b.read_only_connectors.join(", ")}",
             "daily_budget_usd: $#{b.daily_budget_usd.to_fixed(2)} (max_steps=#{b.max_steps})",
             "persona: #{b.persona}"
           ].join("\n")
@@ -117,32 +123,45 @@ fn cmd_bot_sub(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
   end
   if sub == "create" and rest.size >= 4
     name = (rest.get(1) or "").trim
-    role = (rest.get(2) or "Assistant").trim
+    role = (rest.get(2) or "Specialist").trim
     model = (rest.get(3) or "claude-sonnet-5-5").trim
     prov_str = (rest.get(4) or "anthropic").ascii_lowercase
-    prov = if prov_str == "openai": OpenAiCompat else: Anthropic
+    prov = if prov_str == "gemini" or prov_str == "google"
+      Gemini
+    else if prov_str == "openai"
+      OpenAiCompat
+    else
+      Anthropic
+    end
     ep = case prov
       Anthropic: "https://api.anthropic.com/v1/messages"
-      OpenAiCompat: "https://api.x.ai/v1/chat/completions"
+      Gemini: "https://generativelanguage.googleapis.com/v1beta/models"
+      OpenAiCompat: "https://api.openai.com/v1/chat/completions"
     end
     key_env = case prov
       Anthropic: "ANTHROPIC_API_KEY"
-      OpenAiCompat: "XAI_API_KEY"
+      Gemini: "GEMINI_API_KEY"
+      OpenAiCompat: "OPENAI_API_KEY"
+    end
+    tier = case prov
+      Gemini: "gemini_flash"
+      Anthropic | OpenAiCompat: "smart"
     end
     bot = BotConfig(
       name: name,
       role: role,
       persona: "You are #{name}, #{role}.",
       is_primary?: false,
-      model_tier: "smart",
+      model_tier: tier,
       provider: prov,
       endpoint: ep,
       api_key_env: key_env,
       model: model,
       workspace: ".",
-      allowed_programs: ["mo", "git"],
+      allowed_programs: [],
       allowed_hosts: [parse_host_port(ep)],
-      connectors: ["t3code"],
+      connectors: [],
+      read_only_connectors: [],
       daily_budget_usd: 5.00,
       max_steps: 10,
       active?: true
@@ -154,7 +173,9 @@ fn cmd_bot_sub(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
       Error(err): print_err(console, err)
     end
   end
-  console.error("usage: motet bot (show <name> | create <name> <role> <model> [anthropic|openai])")
+  console.error(
+    "usage: motet bot (show <name> | create <name> <role> <model> [anthropic|gemini|openai])"
+  )
   2
 end
 
@@ -173,7 +194,18 @@ fn cmd_ask(
   end
   bot_name = rest.first or "chief"
   prompt = rest.drop(1).join(" ")
-  case Brain.run_turn(rt, db, budget, policy, scheduler, bot_name, None, Owner, false, prompt)
+  case Brain.run_turn_canonical(
+    rt,
+    db,
+    budget,
+    policy,
+    scheduler,
+    bot_name,
+    None,
+    Owner,
+    false,
+    prompt
+  )
     Ok(reply):
       console.print(reply.reply)
       for a in reply.pending_approvals
@@ -195,7 +227,7 @@ fn cmd_chat(
   console: Console,
   bot_name: Text
 ) : Int
-  console.print("Motet chat with #{bot_name} (type /quit to exit)")
+  console.print("Motet forever-chat with #{bot_name} (type /quit to exit)")
   var session_opt = None
   while true
     case console.read_line
@@ -204,7 +236,7 @@ fn cmd_chat(
         trimmed = line.trim
         break if trimmed == "/quit" or trimmed == "/exit"
         continue if trimmed.empty?
-        case Brain.run_turn(
+        case Brain.run_turn_canonical(
           rt,
           db,
           budget,
@@ -257,19 +289,83 @@ fn cmd_resolve(
   policy: PolicyActor,
   scheduler: SchedulerActor,
   console: Console,
-  id_str: Text,
+  rest: List(Text),
   approve?: Bool
 ) : Int
+  id_str = rest.first or ""
+  tail = rest.drop(1)
+  no_resume? = tail.contains?("--no-resume")
+  reason_text = tail.filter(fn(t) t != "--no-resume" end).join(" ").trim
   case id_str.to_int
     None: print_err(console, BadInput(message: "invalid approval id: #{id_str}"))
     Some(id):
-      case Brain.resolve_approval(rt, db, budget, policy, scheduler, id, approve?)
-        Ok(item):
-          console.print("approval ##{item.id} -> #{item.status}: #{item.result_text or "(ok)"}")
+      req = ResolveApprovalRequest(
+        approve: approve?,
+        edited_arguments_json: None,
+        reason: if reason_text.empty?: None else: Some(reason_text),
+        auto_resume: Some(not no_resume?),
+        always_allow: Some(false)
+      )
+      case Brain.resolve_approval_with_options(rt, db, budget, policy, scheduler, id, req)
+        Ok(res):
+          console.print(
+            "approval ##{res.approval.id} -> #{res.approval.status}: #{res.approval.result_text or
+              "(ok)"}"
+          )
+          if res.resumed_turn is Some(rt_turn) and not rt_turn.reply.trim.empty?
+            console.print("\n#{rt_turn.bot_name}: #{rt_turn.reply}")
+          end
           0
         Error(err): print_err(console, err)
       end
   end
+end
+
+fn cmd_vault(
+  db: Sqlite.Database,
+  env: Env,
+  clock: Clock,
+  srng: SecureRandom,
+  console: Console,
+  rest: List(Text)
+) : Int
+  sub = rest.first or "list"
+  if sub == "list"
+    return case Store.list_vault_secrets(db, env)
+      Ok(items):
+        if items.empty?
+          console.print("Vault has no configured secrets yet.")
+        else
+          for m in items
+            console.print("#{m.name} [#{m.scope}] source=#{m.source}")
+          end
+        end
+        0
+      Error(err): print_err(console, err)
+    end
+  end
+  if sub == "set" and rest.size >= 3
+    name = rest.get(1) or ""
+    value = rest.get(2) or ""
+    scope = rest.get(3) or "global"
+    return case Store.save_vault_secret(db, env, srng, name, scope, value, clock.now.to_text)
+      Ok(meta):
+        console.print("sealed secret #{meta.name} in AES-256-GCM Vault [#{meta.scope}]")
+        0
+      Error(err): print_err(console, err)
+    end
+  end
+  if sub == "delete" and rest.size == 2
+    name = rest.get(1) or ""
+    return case Store.delete_vault_secret(db, name)
+      Ok(Unit):
+        console.print("deleted Vault secret #{name}")
+        0
+      Error(err): print_err(console, err)
+    end
+  end
+  console.error("usage: motet vault (list | set <name> <value> [scope] | delete <name>)")
+  2
 end
 
 fn cmd_connectors(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
@@ -277,8 +373,10 @@ fn cmd_connectors(db: Sqlite.Database, console: Console, rest: List(Text)) : Int
     return case Store.list_connectors(db)
       Ok(list):
         for c in list
+          st = if c.enabled?: "enabled" else: "disabled"
           console.print(
-            "#{c.name} (#{c.kind}) -> #{c.url} [auth=#{c.auth_env}, default=#{c.default_effect}]"
+            "#{c.name} (#{c.kind}, #{st}) -> #{c.url} [auth=#{c.auth_env}, default=#{c
+              .default_effect}]"
           )
         end
         0
@@ -407,13 +505,19 @@ fn cmd_watch(
   secs = case rest.first
     Some(s):
       case s.to_int
-        Some(n) if n >= 5: n
-        Some(_) | None: 60
+        Some(n) if n >= 1: n
+        Some(_) | None: 5
       end
-    None: 60
+    None: 5
   end
-  console.print("motet watch started (polling every #{secs}s; Ctrl+C to stop)")
+  console.print(
+    "motet watch started (polling async runs & routines every #{secs}s; Ctrl+C to stop)"
+  )
   while true
+    case Brain.drain_queued_runs(rt, db, budget, policy, scheduler, 5)
+      Ok(n) if n > 0: console.print("runs: processed #{n} queued run(s)")
+      Ok(_) | Error(_): Unit
+    end
     case Brain.run_due_routines(rt, db, budget, policy, scheduler)
       Ok(sum) if sum.routines_ran > 0: console.print(
         "tick @ #{sum.checked_at}: ran #{sum.routines_ran}"
@@ -434,6 +538,7 @@ fn main(
   network: Network,
   sqlite: Sqlite,
   clock: Clock,
+  srng: SecureRandom,
   budget: BudgetActor,
   policy: PolicyActor,
   scheduler: SchedulerActor
@@ -453,17 +558,16 @@ fn main(
   end
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
 
-  return cmd_init(db, console) if head == "init"
+  return cmd_init(db, env, console) if head == "init"
   return cmd_bots(db, console) if head == "bots"
   return cmd_bot_sub(db, console, rest) if head == "bot"
   return cmd_ask(rt, db, budget, policy, scheduler, console, rest) if head == "ask"
   return cmd_chat(rt, db, budget, policy, scheduler, console, rest.first or "chief") if head ==
     "chat"
   return cmd_inbox(db, console, rest) if head == "inbox"
-  return cmd_resolve(rt, db, budget, policy, scheduler, console, rest.first or "", true) if head ==
-    "approve"
-  return cmd_resolve(rt, db, budget, policy, scheduler, console, rest.first or "", false) if head ==
-    "deny"
+  return cmd_resolve(rt, db, budget, policy, scheduler, console, rest, true) if head == "approve"
+  return cmd_resolve(rt, db, budget, policy, scheduler, console, rest, false) if head == "deny"
+  return cmd_vault(db, env, clock, srng, console, rest) if head == "vault"
   return cmd_connectors(db, console, rest) if head == "connectors"
   return cmd_memory(db, clock, console, rest) if head == "memory"
   return cmd_skills(files.read_only, console, rest) if head == "skills"
@@ -471,6 +575,7 @@ fn main(
   return cmd_watch(rt, db, budget, policy, scheduler, console, rest) if head == "watch"
 
   if head == "tick"
+    _drained = Brain.drain_queued_runs(rt, db, budget, policy, scheduler, 10)
     return case Brain.run_due_routines(rt, db, budget, policy, scheduler)
       Ok(sum):
         console.print(
@@ -511,13 +616,14 @@ fn main(
   2
 end
 
-test "motet CLI initializes roster, manages connectors and memory, and runs bot ask end-to-end"
+test "motet CLI initializes specialist roster, seals Vault API key, and runs canonical ask end-to-end"
   sqlite = Sqlite.in_memory()
   files = Files.in_memory({})
   cmd = Command.fake({})
-  t0 = Time.parse("2026-11-22T00:00:00Z") or stop "time"
+  t0 = Time.parse("2026-11-25T00:00:00Z") or stop "time"
   clock = Clock.fixed(t0)
-  env = Env.of({"ANTHROPIC_API_KEY": "k-cli"})
+  srng = SecureRandom.seeded(55)
+  env = Env.of({"MOTET_MASTER_KEY": "cli-master-key"})
   budget = Actor.start(BudgetActor)
   policy = Actor.start(PolicyActor)
   sched = Actor.start(SchedulerActor)
@@ -532,12 +638,32 @@ test "motet CLI initializes roster, manages connectors and memory, and runs bot 
     Network.fake({}),
     sqlite,
     clock,
+    srng,
     budget,
     policy,
     sched
   ) ==
     0
-  assert c1.printed.first == Some("Motet initialized: 3 bots, 1 connectors, 1 routines")
+  assert c1.printed.first ==
+    Some("Motet initialized: 5 active bots, 1 enabled connectors, 1 routines")
+
+  # Seal ANTHROPIC_API_KEY right into the AES-256-GCM Vault (NOT in Env!)
+  c_v = Console.fake()
+  assert main(
+    Args.of(["vault", "set", "ANTHROPIC_API_KEY", "k-vault-cli", "llm"]),
+    env,
+    c_v,
+    files,
+    cmd,
+    Network.fake({}),
+    sqlite,
+    clock,
+    srng,
+    budget,
+    policy,
+    sched
+  ) ==
+    0
 
   c2 = Console.fake()
   assert main(
@@ -549,6 +675,7 @@ test "motet CLI initializes roster, manages connectors and memory, and runs bot 
     Network.fake({}),
     sqlite,
     clock,
+    srng,
     budget,
     policy,
     sched
@@ -558,7 +685,7 @@ test "motet CLI initializes roster, manages connectors and memory, and runs bot 
 
   c3 = Console.fake()
   assert main(
-    Args.of(["memory", "add", "shared", "profile", "Prefers", "Mo", "over", "Python"]),
+    Args.of(["memory", "add", "shared", "profile", "Uses", "Todoist", "and", "Hearth", "Arvo"]),
     env,
     c3,
     files,
@@ -566,6 +693,7 @@ test "motet CLI initializes roster, manages connectors and memory, and runs bot 
     Network.fake({}),
     sqlite,
     clock,
+    srng,
     budget,
     policy,
     sched
@@ -577,7 +705,7 @@ test "motet CLI initializes roster, manages connectors and memory, and runs bot 
   assert Brain.build_prompt_tiers(db, files.read_only, chief, Owner, t0.to_text) is Ok(tiers)
   ask_req = build_http_request(
     chief,
-    "k-cli",
+    "k-vault-cli",
     tiers,
     [UserMsg(content: "status check")],
     core_tool_defs()
@@ -588,7 +716,7 @@ test "motet CLI initializes roster, manages connectors and memory, and runs bot 
         ask_req,
         Http.reply(
           200,
-          "{\"content\":[{\"type\":\"text\",\"text\":\"All 3 bots nominal.\"}],\"usage\":{\"input_tokens\":120,\"output_tokens\":12}}"
+          "{\"content\":[{\"type\":\"text\",\"text\":\"All 5 specialists ready.\"}],\"usage\":{\"input_tokens\":120,\"output_tokens\":12}}"
         )
       )
     ])
@@ -603,10 +731,11 @@ test "motet CLI initializes roster, manages connectors and memory, and runs bot 
     ask_net,
     sqlite,
     clock,
+    srng,
     budget,
     policy,
     sched
   ) ==
     0
-  assert c4.printed.first == Some("All 3 bots nominal.")
+  assert c4.printed.first == Some("All 5 specialists ready.")
 end

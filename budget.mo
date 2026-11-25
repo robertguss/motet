@@ -1,4 +1,5 @@
-## Exact 128-bit Decimal USD spend and step-budget actor for Motet bots.
+## Exact 128-bit Decimal USD spend and step-budget actor for Motet bots,
+## tracking Anthropic & Google Gemini pricing tiers and prompt-cache savings.
 module Budget
 expose BudgetActor, BudgetError(..), BotQuota(..), compute_cost_usd, tier_rates
 use Types{BudgetSnapshot}
@@ -19,16 +20,20 @@ struct BotQuota
   turns: Int
   input_tokens: Int
   output_tokens: Int
+  cached_input_tokens: Int
 end
 
 struct BudgetState
   quotas: Map(Text, BotQuota)
 end
 
-## Per-million (input, output) USD rates by named model tier (Claude 5.x defaults).
+## Per-million (input, output) USD rates by named model tier (Anthropic + Google Gemini defaults).
 fn tier_rates(tier: Text) : (Decimal, Decimal)
   examples
     tier_rates("fast") == (0.10, 0.50)
+    tier_rates("gemini_lite") == (0.075, 0.30)
+    tier_rates("gemini_flash") == (0.15, 0.60)
+    tier_rates("gemini_pro") == (1.25, 10.00)
     tier_rates("smart") == (2.00, 10.00)
     tier_rates("opus") == (4.00, 20.00)
     tier_rates("frontier") == (8.00, 40.00)
@@ -38,8 +43,14 @@ fn tier_rates(tier: Text) : (Decimal, Decimal)
   low = tier.trim.ascii_lowercase
   if low == "local" or low == "free"
     (0.00, 0.00)
+  else if low == "gemini_lite" or low == "flash_lite"
+    (0.075, 0.30)
   else if low == "fast" or low == "mini" or low == "haiku"
     (0.10, 0.50)
+  else if low == "gemini_flash" or low == "flash"
+    (0.15, 0.60)
+  else if low == "gemini_pro" or low == "pro"
+    (1.25, 10.00)
   else if low == "opus"
     (4.00, 20.00)
   else if low == "frontier" or low == "fable"
@@ -63,6 +74,7 @@ fn compute_cost_usd(input_tokens: Int, output_tokens: Int, cached_input_tokens: 
   examples
     compute_cost_usd(1000, 100, 0, "smart") == Ok(0.003)
     compute_cost_usd(1000, 100, 800, "smart") == Ok(0.00156)
+    compute_cost_usd(1000, 100, 0, "gemini_flash") == Ok(0.00021)
     compute_cost_usd(1000, 100, 0, "opus") == Ok(0.006)
     compute_cost_usd(1000, 100, 0, "local") == Ok(0.0)
   end
@@ -114,7 +126,8 @@ fn to_snapshot(q: BotQuota) : BudgetSnapshot
     remaining_usd: rem,
     turns: q.turns,
     input_tokens: q.input_tokens,
-    output_tokens: q.output_tokens
+    output_tokens: q.output_tokens,
+    cached_input_tokens: q.cached_input_tokens
   )
 end
 
@@ -134,7 +147,8 @@ fn configure(state: BudgetState, _now: Time, bot_name: Text, limit_usd: Decimal)
         spent_usd: prev.spent_usd,
         turns: prev.turns,
         input_tokens: prev.input_tokens,
-        output_tokens: prev.output_tokens
+        output_tokens: prev.output_tokens,
+        cached_input_tokens: prev.cached_input_tokens
       )
     None: BotQuota(
       bot_name: clean,
@@ -142,7 +156,8 @@ fn configure(state: BudgetState, _now: Time, bot_name: Text, limit_usd: Decimal)
       spent_usd: 0.0,
       turns: 0,
       input_tokens: 0,
-      output_tokens: 0
+      output_tokens: 0,
+      cached_input_tokens: 0
     )
   end
   next = BudgetState(quotas: state.quotas.set(clean, next_q))
@@ -179,7 +194,8 @@ fn record_spend(
         spent_usd: 0.0,
         turns: 0,
         input_tokens: 0,
-        output_tokens: 0
+        output_tokens: 0,
+        cached_input_tokens: 0
       )
   end
   next_spent = (base.spent_usd + cost).round(6)
@@ -192,7 +208,8 @@ fn record_spend(
     spent_usd: next_spent,
     turns: base.turns.saturating_add(1),
     input_tokens: base.input_tokens.saturating_add(input_tokens),
-    output_tokens: base.output_tokens.saturating_add(output_tokens)
+    output_tokens: base.output_tokens.saturating_add(output_tokens),
+    cached_input_tokens: base.cached_input_tokens.saturating_add(cached_input_tokens)
   )
   next = BudgetState(quotas: state.quotas.set(clean, updated))
   Ok((next, to_snapshot(updated)))
@@ -217,21 +234,22 @@ fn reset_daily(state: BudgetState, _now: Time) : BudgetState
         spent_usd: 0.0,
         turns: 0,
         input_tokens: 0,
-        output_tokens: 0
+        output_tokens: 0,
+        cached_input_tokens: 0
       )
     )
   end
   BudgetState(quotas: next)
 end
 
-test "BudgetActor enforces exact Decimal USD caps and daily resets"
+test "BudgetActor enforces exact Decimal USD caps, cache savings, and daily resets"
   actor_b = Actor.start(BudgetActor)
-  assert actor_b.configure("watcher", 0.01) is Ok(_)
-  assert actor_b.record_spend("watcher", 0.01, 1000, 100, 0, "smart") is Ok(snap1)
-  assert snap1.spent_usd == 0.003
-  assert actor_b.record_spend("watcher", 0.01, 2000, 1000, 0, "smart") is
+  assert actor_b.configure("finance", 0.01) is Ok(_)
+  assert actor_b.record_spend("finance", 0.01, 1000, 100, 800, "smart") is Ok(snap1)
+  assert snap1.spent_usd == 0.00156 and snap1.cached_input_tokens == 800
+  assert actor_b.record_spend("finance", 0.01, 2000, 1000, 0, "smart") is
     Error(LimitExceeded(bot_name: _, spent_usd: _, limit_usd: _))
   Actor.advance(actor_b, 1.day)
-  assert actor_b.record_spend("watcher", 0.01, 1000, 100, 0, "smart") is Ok(snap2)
-  assert snap2.spent_usd == 0.003
+  assert actor_b.record_spend("finance", 0.01, 1000, 100, 0, "gemini_flash") is Ok(snap2)
+  assert snap2.spent_usd == 0.00021
 end

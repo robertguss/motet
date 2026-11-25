@@ -1,9 +1,16 @@
-## Dual-protocol LLM wire client for Motet:
-## - OpenAI-compatible Chat Completions (xAI/Grok, OpenAI, OpenRouter, Gemini OpenAI, Ollama/vLLM, mo-gateway)
-## - Anthropic Messages API (native tool_use + explicit prompt cache_control breakpoints)
+## Multi-protocol LLM wire client for Motet:
+## - Anthropic Messages API (native tool_use, parallel tool_result merging, explicit cache_control)
+## - Google Gemini API (native generateContent, x-goog-api-key header, functionCall/functionResponse, cachedContentTokenCount)
+## - OpenAI-compatible Chat Completions (OpenAI, xAI/Grok, OpenRouter, Ollama/vLLM)
 ## With host-pinned Network calls and deterministic Clock.sleep backoff on 429/529.
 module Llm
-expose PromptTiers(..), ToolDef(..), LlmMessage(..), LlmResponse(..), build_http_request, chat_turn
+expose PromptTiers(..),
+ToolDef(..),
+LlmMessage(..),
+LlmResponse(..),
+build_http_request,
+chat_turn,
+chat_turn_with_key
 use Http
 use Json
 use Mcp{parse_host_port}
@@ -42,15 +49,19 @@ fn parse_json_or_empty_obj(raw: Text) : Json
   end
 end
 
+fn combined_system_text(tiers: PromptTiers) : Text
+  [tiers.stable, tiers.context, tiers.volatile].filter(fn(s) not s.trim.empty? end).join(
+    "\n\n---\n\n"
+  )
+end
+
 fn build_openai_payload(
   bot: BotConfig,
   tiers: PromptTiers,
   messages: List(LlmMessage),
   tools: List(ToolDef)
 ) : Json
-  sys_text = [tiers.stable, tiers.context, tiers.volatile].filter(fn(s) not s.trim.empty? end).join(
-    "\n\n---\n\n"
-  )
+  sys_text = combined_system_text(tiers)
   var wire_msgs = [Json.Object({"role": Json.String("system"), "content": Json.String(sys_text)})]
   for msg in messages
     case msg
@@ -180,13 +191,36 @@ fn build_anthropic_payload(
     )
   end
 
+  # Merge consecutive ToolResultMsg entries into one user turn so parallel tool calls stay valid.
   var wire_msgs = []
+  var pending_tool_blocks = []
   for msg in messages
     case msg
-      UserMsg(content: c): wire_msgs = wire_msgs.append(
-        Json.Object({"role": Json.String("user"), "content": Json.String(c)})
-      )
+      ToolResultMsg(tool_call_id: cid, tool_name: _tname, content: c): pending_tool_blocks = pending_tool_blocks
+        .append(
+          Json.Object({
+            "type": Json.String("tool_result"),
+            "tool_use_id": Json.String(cid),
+            "content": Json.String(c)
+          })
+        )
+      UserMsg(content: c):
+        if not pending_tool_blocks.empty?
+          wire_msgs = wire_msgs.append(
+            Json.Object({"role": Json.String("user"), "content": Json.Array(pending_tool_blocks)})
+          )
+          pending_tool_blocks = []
+        end
+        wire_msgs = wire_msgs.append(
+          Json.Object({"role": Json.String("user"), "content": Json.String(c)})
+        )
       AssistantMsg(content: c, tool_calls: tcs):
+        if not pending_tool_blocks.empty?
+          wire_msgs = wire_msgs.append(
+            Json.Object({"role": Json.String("user"), "content": Json.Array(pending_tool_blocks)})
+          )
+          pending_tool_blocks = []
+        end
         var blocks = []
         if not c.trim.empty?
           blocks = blocks.append(Json.Object({"type": Json.String("text"), "text": Json.String(c)}))
@@ -201,22 +235,18 @@ fn build_anthropic_payload(
             })
           )
         end
+        if blocks.empty?
+          blocks = [Json.Object({"type": Json.String("text"), "text": Json.String("(ok)")})]
+        end
         wire_msgs = wire_msgs.append(
           Json.Object({"role": Json.String("assistant"), "content": Json.Array(blocks)})
         )
-      ToolResultMsg(tool_call_id: cid, tool_name: _tname, content: c): wire_msgs = wire_msgs.append(
-        Json.Object({
-          "role": Json.String("user"),
-          "content": Json.Array([
-            Json.Object({
-              "type": Json.String("tool_result"),
-              "tool_use_id": Json.String(cid),
-              "content": Json.String(c)
-            })
-          ])
-        })
-      )
     end
+  end
+  if not pending_tool_blocks.empty?
+    wire_msgs = wire_msgs.append(
+      Json.Object({"role": Json.String("user"), "content": Json.Array(pending_tool_blocks)})
+    )
   end
 
   wire_tools = tools.map(fn(t)
@@ -276,6 +306,146 @@ fn parse_anthropic_response(doc: Json) : Result(LlmResponse, MotetError)
   )
 end
 
+## Resolves native Google Gemini generateContent endpoint URL from base or full URL.
+fn resolve_gemini_url(endpoint: Text, model: Text) : Text
+  trimmed = endpoint.trim
+  if trimmed.contains?(":generateContent")
+    trimmed
+  else
+    clean = case trimmed.drop_suffix("/")
+      Some(s): s
+      None: trimmed
+    end
+    base = if clean.empty?
+      "https://generativelanguage.googleapis.com/v1beta/models"
+    else
+      clean
+    end
+    "#{base}/#{model.trim}:generateContent"
+  end
+end
+
+fn build_gemini_payload(tiers: PromptTiers, messages: List(LlmMessage), tools: List(ToolDef)) : Json
+  sys_parts = [tiers.stable, tiers.context, tiers.volatile].filter(fn(s) not s.trim.empty? end).map(
+    fn(s) Json.Object({"text": Json.String(s)}) end
+  )
+
+  var contents = []
+  var pending_fn_resps = []
+  for msg in messages
+    case msg
+      ToolResultMsg(tool_call_id: _cid, tool_name: tname, content: c): pending_fn_resps = pending_fn_resps
+        .append(
+          Json.Object({
+            "functionResponse": Json.Object({
+              "name": Json.String(tname),
+              "response": Json.Object({"result": Json.String(c)})
+            })
+          })
+        )
+      UserMsg(content: c):
+        if not pending_fn_resps.empty?
+          contents = contents.append(
+            Json.Object({"role": Json.String("user"), "parts": Json.Array(pending_fn_resps)})
+          )
+          pending_fn_resps = []
+        end
+        contents = contents.append(
+          Json.Object({
+            "role": Json.String("user"),
+            "parts": Json.Array([Json.Object({"text": Json.String(c)})])
+          })
+        )
+      AssistantMsg(content: c, tool_calls: tcs):
+        if not pending_fn_resps.empty?
+          contents = contents.append(
+            Json.Object({"role": Json.String("user"), "parts": Json.Array(pending_fn_resps)})
+          )
+          pending_fn_resps = []
+        end
+        var parts = []
+        if not c.trim.empty?
+          parts = parts.append(Json.Object({"text": Json.String(c)}))
+        end
+        for tc in tcs
+          parts = parts.append(
+            Json.Object({
+              "functionCall": Json.Object({
+                "name": Json.String(tc.name),
+                "args": parse_json_or_empty_obj(tc.arguments_json)
+              })
+            })
+          )
+        end
+        if parts.empty?
+          parts = [Json.Object({"text": Json.String("(ok)")})]
+        end
+        contents = contents.append(
+          Json.Object({"role": Json.String("model"), "parts": Json.Array(parts)})
+        )
+    end
+  end
+  if not pending_fn_resps.empty?
+    contents = contents.append(
+      Json.Object({"role": Json.String("user"), "parts": Json.Array(pending_fn_resps)})
+    )
+  end
+
+  var obj = {
+    "contents": Json.Array(contents),
+    "generationConfig": Json.Object({"temperature": Json.decimal(0.2)})
+  }
+  if not sys_parts.empty?
+    obj = obj.set("systemInstruction", Json.Object({"parts": Json.Array(sys_parts)}))
+  end
+  if not tools.empty?
+    decls = tools.map(fn(t)
+      Json.Object({
+        "name": Json.String(t.name),
+        "description": Json.String(t.description),
+        "parameters": t.schema
+      })
+    end)
+    obj = obj.set("tools", Json.Array([Json.Object({"functionDeclarations": Json.Array(decls)})]))
+  end
+  Json.Object(obj)
+end
+
+fn parse_gemini_response(doc: Json) : Result(LlmResponse, MotetError)
+  parts = doc.list_at("candidates.0.content.parts") or []
+  var texts = []
+  var calls = []
+  for (idx, p) in parts.enumerate
+    case p.text_at("text")
+      Some(t): texts = texts.append(t)
+      None: Unit
+    end
+    case p.path("functionCall")
+      Some(fc):
+        case fc.text_at("name")
+          Some(fname):
+            cid = fc.text_at("id") or "gem_call_#{idx + 1}"
+            fargs = fc.get("args") or Json.Object({})
+            calls = calls.append(ToolCallReq(id: cid, name: fname, arguments_json: fargs.to_text))
+          None: Unit
+        end
+      None: Unit
+    end
+  end
+  prompt_toks = doc.int_at("usageMetadata.promptTokenCount") or 0
+  cand_toks = doc.int_at("usageMetadata.candidatesTokenCount") or 0
+  cached_toks = doc.int_at("usageMetadata.cachedContentTokenCount") or 0
+  Ok(
+    LlmResponse(
+      text: texts.join("\n").trim,
+      tool_calls: calls,
+      input_tokens: prompt_toks,
+      output_tokens: cand_toks,
+      cached_input_tokens: cached_toks
+    )
+  )
+end
+
 fn build_http_request(
   bot: BotConfig,
   api_key: Text,
@@ -295,32 +465,37 @@ fn build_http_request(
       payload = build_anthropic_payload(bot, tiers, messages, tools)
       Http.post(bot.endpoint).header("x-api-key", api_key).header("anthropic-version", "2023-06-01")
         .json(payload).within(60.seconds)
+    Gemini:
+      url = resolve_gemini_url(bot.endpoint, bot.model)
+      payload = build_gemini_payload(tiers, messages, tools)
+      Http.post(url).header("x-goog-api-key", api_key).json(payload).within(60.seconds)
   end
 end
 
-## Sends one LLM turn with host-pinned Network and Clock.sleep retry on HTTP 429/529.
-fn chat_turn(
+## Sends one LLM turn using an already-resolved API key (Vault or Env) with 429/529 retry.
+fn chat_turn_with_key(
   network: Network,
-  env: Env,
   clock: Clock,
   bot: BotConfig,
+  api_key: Text,
   tiers: PromptTiers,
   messages: List(LlmMessage),
   tools: List(ToolDef)
 ) : Result(LlmResponse, MotetError)
-  api_key = if bot.api_key_env.trim.empty?
-    ""
-  else
-    env.get(bot.api_key_env.trim) or ""
-  end
-  if not bot.api_key_env.trim.empty? and api_key.empty? and bot.model_tier != "local"
+  if not bot.api_key_env.trim.empty? and api_key.trim.empty? and bot.model_tier != "local"
     return Error(
-      UpstreamFailed(message: "missing API key env var #{bot.api_key_env} for bot #{bot.name}")
+      UpstreamFailed(
+        message: "missing API key '#{bot.api_key_env}' in Vault or Env for bot #{bot.name}"
+      )
     )
   end
 
-  pinned = network.allow_hosts([parse_host_port(bot.endpoint)])
-  req = build_http_request(bot, api_key, tiers, messages, tools)
+  target_url = case bot.provider
+    Gemini: resolve_gemini_url(bot.endpoint, bot.model)
+    OpenAiCompat | Anthropic: bot.endpoint
+  end
+  pinned = network.allow_hosts([parse_host_port(target_url)])
+  req = build_http_request(bot, api_key.trim, tiers, messages, tools)
 
   var attempt = 0
   while attempt < 3
@@ -344,13 +519,32 @@ fn chat_turn(
     return case bot.provider
       OpenAiCompat: parse_openai_response(doc)
       Anthropic: parse_anthropic_response(doc)
+      Gemini: parse_gemini_response(doc)
     end
   end
   Error(UpstreamFailed(message: "LLM retry loop exhausted"))
 end
 
-test "OpenAI-compatible and Anthropic wire adapters parse tool calls and cache usage"
-  tiers = PromptTiers(stable: "You are Chief.", context: "Repo: motet", volatile: "Now: t0")
+## Sends one LLM turn reading its API key from Env (compatible helper).
+fn chat_turn(
+  network: Network,
+  env: Env,
+  clock: Clock,
+  bot: BotConfig,
+  tiers: PromptTiers,
+  messages: List(LlmMessage),
+  tools: List(ToolDef)
+) : Result(LlmResponse, MotetError)
+  api_key = if bot.api_key_env.trim.empty?
+    ""
+  else
+    env.get(bot.api_key_env.trim) or ""
+  end
+  chat_turn_with_key(network, clock, bot, api_key, tiers, messages, tools)
+end
+
+test "OpenAI-compatible, Anthropic (with parallel tool_result merge), and native Google Gemini adapters work"
+  tiers = PromptTiers(stable: "You are Chief.", context: "Wall: personal", volatile: "Now: t0")
   tools = [
     ToolDef(
       name: "memory_save",
@@ -358,14 +552,15 @@ test "OpenAI-compatible and Anthropic wire adapters parse tool calls and cache u
       schema: Json.Object({"type": Json.String("object")})
     )
   ]
-  msgs = [UserMsg(content: "Remember my timezone is EST")]
+  msgs = [UserMsg(content: "Remember my timezone is America/Los_Angeles")]
+  clock = Clock.fixed(Time.parse("2026-11-25T00:00:00Z") or stop "time")
 
-  # 1. OpenAI-compatible (xAI/Grok, OpenAI, OpenRouter)
-  grok_bot = BotConfig(
-    name: "chief",
-    role: "Chief",
-    persona: "Chief",
-    is_primary?: true,
+  # 1. OpenAI-compatible
+  oai_bot = BotConfig(
+    name: "oai",
+    role: "Test",
+    persona: "Test",
+    is_primary?: false,
     model_tier: "smart",
     provider: OpenAiCompat,
     endpoint: "https://api.x.ai/v1/chat/completions",
@@ -375,24 +570,24 @@ test "OpenAI-compatible and Anthropic wire adapters parse tool calls and cache u
     allowed_programs: [],
     allowed_hosts: ["api.x.ai:443"],
     connectors: [],
+    read_only_connectors: [],
     daily_budget_usd: 5.0,
     max_steps: 6,
     active?: true
   )
-  oai_req = build_http_request(grok_bot, "xai-k", tiers, msgs, tools)
-  oai_body = "{\"choices\":[{\"message\":{\"content\":\"Saving now.\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"memory_save\",\"arguments\":\"{\\\"content\\\":\\\"EST\\\"}\"}}]}}],\"usage\":{\"prompt_tokens\":200,\"completion_tokens\":40}}"
+  oai_req = build_http_request(oai_bot, "xai-k", tiers, msgs, tools)
+  oai_body = "{\"choices\":[{\"message\":{\"content\":\"Saving now.\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"memory_save\",\"arguments\":\"{\\\"content\\\":\\\"PST\\\"}\"}}]}}],\"usage\":{\"prompt_tokens\":200,\"completion_tokens\":40}}"
   net1 = Network.fake(Http.replies([(oai_req, Http.reply(200, oai_body))]))
-  clock = Clock.fixed(Time.parse("2026-11-22T00:00:00Z") or stop "time")
-  assert chat_turn(net1, Env.of({"XAI_API_KEY": "xai-k"}), clock, grok_bot, tiers, msgs, tools) is
+  assert chat_turn(net1, Env.of({"XAI_API_KEY": "xai-k"}), clock, oai_bot, tiers, msgs, tools) is
     Ok(r1)
   assert r1.text == "Saving now." and r1.tool_calls.size == 1 and r1.input_tokens == 200
 
-  # 2. Anthropic Messages API with prompt cache breakpoints
+  # 2. Anthropic Messages API with parallel tool_result merging + prompt cache usage
   claude_bot = BotConfig(
-    name: "builder",
-    role: "Builder",
-    persona: "Builder",
-    is_primary?: false,
+    name: "chief",
+    role: "Chief",
+    persona: "Chief",
+    is_primary?: true,
     model_tier: "smart",
     provider: Anthropic,
     endpoint: "https://api.anthropic.com/v1/messages",
@@ -402,12 +597,28 @@ test "OpenAI-compatible and Anthropic wire adapters parse tool calls and cache u
     allowed_programs: [],
     allowed_hosts: ["api.anthropic.com:443"],
     connectors: [],
+    read_only_connectors: [],
     daily_budget_usd: 10.0,
     max_steps: 6,
     active?: true
   )
+  par_msgs = [
+    UserMsg(content: "Check two things"),
+    AssistantMsg(
+      content: "",
+      tool_calls: [
+        ToolCallReq(id: "t1", name: "memory_save", arguments_json: "{}"),
+        ToolCallReq(id: "t2", name: "memory_save", arguments_json: "{}")
+      ]
+    ),
+    ToolResultMsg(tool_call_id: "t1", tool_name: "memory_save", content: "ok1"),
+    ToolResultMsg(tool_call_id: "t2", tool_name: "memory_save", content: "ok2")
+  ]
+  ant_payload = build_anthropic_payload(claude_bot, tiers, par_msgs, tools)
+  # 3 wire messages total (user, assistant, single merged user with 2 tool_result blocks)
+  assert (ant_payload.list_at("messages") or []).size == 3
   ant_req = build_http_request(claude_bot, "sk-ant", tiers, msgs, tools)
-  ant_body = "{\"content\":[{\"type\":\"text\",\"text\":\"Done.\"},{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"memory_save\",\"input\":{\"content\":\"EST\"}}],\"usage\":{\"input_tokens\":50,\"cache_read_input_tokens\":300,\"output_tokens\":25}}"
+  ant_body = "{\"content\":[{\"type\":\"text\",\"text\":\"Done.\"},{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"memory_save\",\"input\":{\"content\":\"PST\"}}],\"usage\":{\"input_tokens\":50,\"cache_read_input_tokens\":300,\"output_tokens\":25}}"
   net2 = Network.fake(Http.replies([(ant_req, Http.reply(200, ant_body))]))
   assert chat_turn(
     net2,
@@ -423,4 +634,42 @@ test "OpenAI-compatible and Anthropic wire adapters parse tool calls and cache u
     r2.tool_calls.size == 1 and
     r2.cached_input_tokens == 300 and
     r2.input_tokens == 350
+
+  # 3. Native Google Gemini generateContent with x-goog-api-key + functionCall + cached tokens
+  gem_bot = BotConfig(
+    name: "finance",
+    role: "Household Finance",
+    persona: "Finance",
+    is_primary?: false,
+    model_tier: "gemini_flash",
+    provider: Gemini,
+    endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
+    api_key_env: "GEMINI_API_KEY",
+    model: "gemini-2.5-flash",
+    workspace: ".",
+    allowed_programs: [],
+    allowed_hosts: ["generativelanguage.googleapis.com:443"],
+    connectors: [],
+    read_only_connectors: [],
+    daily_budget_usd: 3.0,
+    max_steps: 8,
+    active?: true
+  )
+  gem_req = build_http_request(gem_bot, "gem-key-1", tiers, msgs, tools)
+  gem_body = "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Saving to memory.\"},{\"functionCall\":{\"name\":\"memory_save\",\"args\":{\"content\":\"PST\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":400,\"candidatesTokenCount\":30,\"cachedContentTokenCount\":250}}"
+  net3 = Network.fake(Http.replies([(gem_req, Http.reply(200, gem_body))]))
+  assert chat_turn(
+    net3,
+    Env.of({"GEMINI_API_KEY": "gem-key-1"}),
+    clock,
+    gem_bot,
+    tiers,
+    msgs,
+    tools
+  ) is
+    Ok(r3)
+  assert r3.text == "Saving to memory." and
+    r3.tool_calls.size == 1 and
+    r3.input_tokens == 400 and
+    r3.cached_input_tokens == 250
 end

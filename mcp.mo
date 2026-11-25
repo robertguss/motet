@@ -204,12 +204,10 @@ fn send_rpc(
   Ok((doc, next_sid))
 end
 
-fn initialize_session(
-  network: Network,
-  env: Env,
-  spec: ConnectorSpec,
-  stored_token: Option(Text)
-) : Result(Option(Text), MotetError)
+fn initialize_session(network: Network, env: Env, spec: ConnectorSpec, stored_token: Option(Text)) : Result(
+  Option(Text),
+  MotetError
+)
   payload = Json.Object({
     "jsonrpc": Json.String("2.0"),
     "id": Json.int(1),
@@ -225,12 +223,10 @@ fn initialize_session(
 end
 
 ## Progressive discovery: queries `tools/list` on one mounted MCP connector.
-fn list_tools(
-  network: Network,
-  env: Env,
-  spec: ConnectorSpec,
-  stored_token: Option(Text)
-) : Result(List(McpToolInfo), MotetError)
+fn list_tools(network: Network, env: Env, spec: ConnectorSpec, stored_token: Option(Text)) : Result(
+  List(McpToolInfo),
+  MotetError
+)
   sid = try initialize_session(network, env, spec, stored_token)
   payload = Json.Object({
     "jsonrpc": Json.String("2.0"),

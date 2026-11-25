@@ -69,20 +69,19 @@ fn safe_public_url?(url: Text) : Bool
 end
 
 fn decode_entities(s: Text) : Text
-  s
-    .replace("&nbsp;", " ")
-    .replace("&amp;", "&")
-    .replace("&lt;", "<")
-    .replace("&gt;", ">")
-    .replace("&quot;", "\"")
-    .replace("&#39;", "'")
-    .replace("&#x27;", "'")
+  s.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace(
+    "&quot;",
+    "\""
+  ).replace("&#39;", "'").replace("&#x27;", "'")
 end
 
 ## Strips script/style blocks and HTML tags into readable plain text capped at `max_chars`.
 fn strip_html(raw: Text, max_chars: Int) : Text
   examples
-    strip_html("<html><head><style>body{color:red}</style></head><body><h1>Hi &amp; Welcome</h1><script>alert(1)</script><p>World</p></body></html>", 200) ==
+    strip_html(
+      "<html><head><style>body{color:red}</style></head><body><h1>Hi &amp; Welcome</h1><script>alert(1)</script><p>World</p></body></html>",
+      200
+    ) ==
       "Hi & Welcome\nWorld"
   end
 
@@ -163,25 +162,25 @@ fn web_fetch(network: Network, url: Text) : Result(Text, MotetError)
   var hops = 0
   while hops < 4
     if not safe_public_url?(cur)
-      return Error(
-        BadInput(message: "blocked unsafe or non-public URL for web_fetch: #{cur}")
-      )
+      return Error(BadInput(message: "blocked unsafe or non-public URL for web_fetch: #{cur}"))
     end
     host_port = parse_host_port(cur)
     scoped = network.allow_hosts([host_port])
-    req = Http.get(cur)
-      .header("User-Agent", "Motet/0.1")
-      .header("Accept", "text/html,text/plain,application/json,*/*")
-      .within(20.seconds)
-      .max_body(262_144)
-    resp = try req.send(scoped).map_error(fn(e) UpstreamFailed(message: "web_fetch failed: #{e}") end)
+    req = Http.get(cur).header("User-Agent", "Motet/0.1").header(
+      "Accept",
+      "text/html,text/plain,application/json,*/*"
+    ).within(20.seconds).max_body(262_144)
+    resp = try req.send(scoped).map_error(
+      fn(e) UpstreamFailed(message: "web_fetch failed: #{e}") end
+    )
     if is_redirect_status?(resp.status)
       case resp.header("location")
         Some(loc) if not loc.trim.empty?:
           cur = resolve_redirect(cur, loc)
           hops += 1
-        Some(_) | None:
-          return Error(UpstreamFailed(message: "web_fetch redirect missing Location header"))
+        Some(_) | None: return Error(
+          UpstreamFailed(message: "web_fetch redirect missing Location header")
+        )
       end
     else if not resp.ok?
       return Error(UpstreamFailed(message: "web_fetch HTTP #{resp.status} for #{cur}"))
@@ -210,7 +209,10 @@ fn non_empty_env(env: Env, key: Text) : Option(Text)
   end
 end
 
-fn search_tavily(network: Network, api_key: Text, query: Text, limit: Int) : Result(Text, MotetError)
+fn search_tavily(network: Network, api_key: Text, query: Text, limit: Int) : Result(
+  Text,
+  MotetError
+)
   scoped = network.allow_hosts(["api.tavily.com:443"])
   payload = Json.Object({
     "api_key": Json.String(api_key),
@@ -224,8 +226,7 @@ fn search_tavily(network: Network, api_key: Text, query: Text, limit: Int) : Res
   doc = try resp.json.map_error(fn(e) UpstreamFailed(message: "tavily json: #{e}") end)
   var lines = ["Search engine: tavily", "Query: #{query}"]
   case doc.text_at("answer")
-    Some(ans) if not ans.trim.empty?:
-      lines = lines.append("").append("Summary:").append(ans.trim)
+    Some(ans) if not ans.trim.empty?: lines = lines.append("").append("Summary:").append(ans.trim)
     Some(_) | None: Unit
   end
   results = doc.list_at("results") or []
@@ -251,12 +252,10 @@ end
 
 fn search_brave(network: Network, api_key: Text, query: Text, limit: Int) : Result(Text, MotetError)
   scoped = network.allow_hosts(["api.search.brave.com:443"])
-  req = Http.get("https://api.search.brave.com/res/v1/web/search")
-    .query("q", query)
-    .query("count", "#{limit}")
-    .header("Accept", "application/json")
-    .header("X-Subscription-Token", api_key)
-    .within(25.seconds)
+  req = Http.get("https://api.search.brave.com/res/v1/web/search").query("q", query).query(
+    "count",
+    "#{limit}"
+  ).header("Accept", "application/json").header("X-Subscription-Token", api_key).within(25.seconds)
   resp = try req.send(scoped).map_error(fn(e) UpstreamFailed(message: "brave error: #{e}") end)
   return Error(UpstreamFailed(message: "brave HTTP #{resp.status}")) if not resp.ok?
   doc = try resp.json.map_error(fn(e) UpstreamFailed(message: "brave json: #{e}") end)
@@ -281,10 +280,9 @@ fn search_exa(network: Network, api_key: Text, query: Text, limit: Int) : Result
     "numResults": Json.int(limit),
     "contents": Json.Object({"text": Json.Object({"maxCharacters": Json.int(300)})})
   })
-  req = Http.post("https://api.exa.ai/search")
-    .header("x-api-key", api_key)
-    .json(payload)
-    .within(25.seconds)
+  req = Http.post("https://api.exa.ai/search").header("x-api-key", api_key).json(payload).within(
+    25.seconds
+  )
   resp = try req.send(scoped).map_error(fn(e) UpstreamFailed(message: "exa error: #{e}") end)
   return Error(UpstreamFailed(message: "exa HTTP #{resp.status}")) if not resp.ok?
   doc = try resp.json.map_error(fn(e) UpstreamFailed(message: "exa json: #{e}") end)
@@ -324,11 +322,10 @@ fn search_anthropic(network: Network, api_key: Text, query: Text, limit: Int) : 
       Json.Object({"role": Json.String("user"), "content": Json.String(query)})
     ])
   })
-  req = Http.post("https://api.anthropic.com/v1/messages")
-    .header("x-api-key", api_key)
-    .header("anthropic-version", "2023-06-01")
-    .json(payload)
-    .within(40.seconds)
+  req = Http.post("https://api.anthropic.com/v1/messages").header("x-api-key", api_key).header(
+    "anthropic-version",
+    "2023-06-01"
+  ).json(payload).within(40.seconds)
   resp = try req.send(scoped).map_error(fn(e)
     UpstreamFailed(message: "anthropic web_search error: #{e}")
   end)
@@ -336,7 +333,9 @@ fn search_anthropic(network: Network, api_key: Text, query: Text, limit: Int) : 
     detail = resp.text or "HTTP #{resp.status}"
     return Error(UpstreamFailed(message: "anthropic web_search HTTP #{resp.status}: #{detail}"))
   end
-  doc = try resp.json.map_error(fn(e) UpstreamFailed(message: "anthropic web_search json: #{e}") end)
+  doc = try resp.json.map_error(
+    fn(e) UpstreamFailed(message: "anthropic web_search json: #{e}") end
+  )
   blocks = doc.list_at("content") or []
   var texts = []
   var seen_urls = []
@@ -378,14 +377,15 @@ end
 
 fn search_wikipedia_fallback(network: Network, query: Text, limit: Int) : Result(Text, MotetError)
   scoped = network.allow_hosts(["en.wikipedia.org:443"])
-  req = Http.get("https://en.wikipedia.org/w/api.php")
-    .query("action", "opensearch")
-    .query("search", query)
-    .query("limit", "#{limit}")
-    .query("format", "json")
-    .header("User-Agent", "Motet/0.1")
-    .within(15.seconds)
-  resp = try req.send(scoped).map_error(fn(e) UpstreamFailed(message: "wiki fallback error: #{e}") end)
+  req = Http.get("https://en.wikipedia.org/w/api.php").query("action", "opensearch").query(
+    "search",
+    query
+  ).query("limit", "#{limit}").query("format", "json").header("User-Agent", "Motet/0.1").within(
+    15.seconds
+  )
+  resp = try req.send(scoped).map_error(
+    fn(e) UpstreamFailed(message: "wiki fallback error: #{e}") end
+  )
   return Error(UpstreamFailed(message: "wiki fallback HTTP #{resp.status}")) if not resp.ok?
   doc = try resp.json.map_error(fn(e) UpstreamFailed(message: "wiki fallback json: #{e}") end)
   titles = doc.list_at("1") or []
@@ -438,11 +438,10 @@ test "Web search supports Anthropic web_search and Tavily, and web_fetch strips 
     Error(BadInput(message: _))
 
   # 2. web_fetch fetches public HTML and strips script/style tags cleanly
-  fetch_req = Http.get("https://example.com/guide")
-    .header("User-Agent", "Motet/0.1")
-    .header("Accept", "text/html,text/plain,application/json,*/*")
-    .within(20.seconds)
-    .max_body(262_144)
+  fetch_req = Http.get("https://example.com/guide").header("User-Agent", "Motet/0.1").header(
+    "Accept",
+    "text/html,text/plain,application/json,*/*"
+  ).within(20.seconds).max_body(262_144)
   fetch_net = Network.fake(
     Http.replies([
       (
@@ -458,10 +457,8 @@ test "Web search supports Anthropic web_search and Tavily, and web_fetch strips 
   assert page.contains?("Motet") and page.contains?("Fast & safe") and not page.contains?("bad()")
 
   # 3. web_search via Anthropic native web_search_20250305 when ANTHROPIC_API_KEY is set
-  ant_req = Http.post("https://api.anthropic.com/v1/messages")
-    .header("x-api-key", "sk-ant-test")
-    .header("anthropic-version", "2023-06-01")
-    .json(
+  ant_req = Http.post("https://api.anthropic.com/v1/messages").header("x-api-key", "sk-ant-test")
+    .header("anthropic-version", "2023-06-01").json(
       Json.Object({
         "model": Json.String("claude-haiku-5-5"),
         "max_tokens": Json.int(768),
@@ -479,8 +476,7 @@ test "Web search supports Anthropic web_search and Tavily, and web_fetch strips 
           Json.Object({"role": Json.String("user"), "content": Json.String("latest Mo release")})
         ])
       })
-    )
-    .within(40.seconds)
+    ).within(40.seconds)
   ant_body = "{\"content\":[{\"type\":\"web_search_tool_result\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"Mo Releases\",\"url\":\"https://github.com/robertguss/mo\"}]},{\"type\":\"text\",\"text\":\"Mo 0.3.0 is the latest release.\"}]}"
   ant_net = Network.fake(Http.replies([(ant_req, Http.reply(200, ant_body))]))
   assert web_search(ant_net, Env.of({"ANTHROPIC_API_KEY": "sk-ant-test"}), "latest Mo release", 5) is

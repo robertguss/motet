@@ -1,5 +1,6 @@
-## Core domain types for Motet: bots, sessions, memory, skills, routines,
-## connectors, policy decisions, approvals, artifacts, and errors.
+## Core domain types for Motet v1: bots, strict specialist walls, async runs,
+## write-only vault metadata, sessions, memory, skills, routines, connectors,
+## policy decisions, editable approvals, artifacts, webhooks, and errors.
 module Types
 expose ProviderKind(..),
 EffectClass(..),
@@ -8,6 +9,7 @@ ApprovalDecision(..),
 ApprovalStatus(..),
 BotConfig(..),
 CreateBotRequest(..),
+CloneBotRequest(..),
 PolicyRule(..),
 CreateRuleRequest(..),
 ConnectorSpec(..),
@@ -19,13 +21,21 @@ SaveSkillRequest(..),
 RoutineSpec(..),
 CreateRoutineRequest(..),
 ApprovalItem(..),
+ResolveApprovalRequest(..),
+ApprovalResolution(..),
 ArtifactItem(..),
 SessionSummary(..),
 SessionEvent(..),
 ToolCallReq(..),
 AskRequest(..),
+EnqueueRunRequest(..),
+SteerRunRequest(..),
+BotRun(..),
 TurnReply(..),
 BudgetSnapshot(..),
+VaultSecretMeta(..),
+SaveSecretRequest(..),
+WebhookConfig(..),
 WebhookReceipt(..),
 TickSummary(..),
 HealthSummary(..),
@@ -51,6 +61,7 @@ approval_status_from_text
 enum ProviderKind
   OpenAiCompat
   Anthropic
+  Gemini
 end
 
 enum EffectClass
@@ -80,6 +91,17 @@ enum ApprovalStatus
   ExecutionFailed
 end
 
+enum MotetError
+  Unauthorized
+  ItemNotFound(message: Text)
+  BadInput(message: Text)
+  Conflict(message: Text)
+  BudgetExceeded(message: Text)
+  PolicyDenied(message: Text)
+  UpstreamFailed(message: Text)
+  StorageFailed(message: Text)
+end
+
 struct BotConfig
   name: Text
   role: Text
@@ -94,6 +116,7 @@ struct BotConfig
   allowed_programs: List(Text)
   allowed_hosts: List(Text)
   connectors: List(Text)
+  read_only_connectors: List(Text)
   daily_budget_usd: Decimal
   max_steps: Int
   active?: Bool
@@ -113,8 +136,18 @@ struct CreateBotRequest
   allowed_programs: Option(List(Text))
   allowed_hosts: Option(List(Text))
   connectors: Option(List(Text))
+  read_only_connectors: Option(List(Text))
   daily_budget_usd: Option(Decimal)
   max_steps: Option(Int)
+  active: Option(Bool)
+end
+
+struct CloneBotRequest
+  new_name: Text
+  role: Option(Text)
+  persona: Option(Text)
+  connectors: Option(List(Text))
+  read_only_connectors: Option(List(Text))
 end
 
 struct PolicyRule
@@ -212,6 +245,14 @@ struct ApprovalItem
   created_at: Text
 end
 
+struct ResolveApprovalRequest
+  approve: Bool
+  edited_arguments_json: Option(Text)
+  reason: Option(Text)
+  auto_resume: Option(Bool)
+  always_allow: Option(Bool)
+end
+
 struct ArtifactItem
   id: Int
   bot_name: Text
@@ -227,6 +268,8 @@ struct SessionSummary
   bot_name: Text
   title: Text
   trust: TrustLevel
+  canonical?: Bool
+  compaction_seq: Int
   created_at: Text
   updated_at: Text
   event_count: Int
@@ -241,6 +284,7 @@ struct SessionEvent
   content: Text
   tool_name: Option(Text)
   tool_call_id: Option(Text)
+  tool_calls_json: Option(Text)
   cost_usd: Decimal
   created_at: Text
 end
@@ -254,6 +298,34 @@ end
 struct AskRequest
   message: Text
   session_id: Option(Text)
+  use_canonical: Option(Bool)
+end
+
+struct EnqueueRunRequest
+  message: Text
+  session_id: Option(Text)
+  use_canonical: Option(Bool)
+end
+
+struct SteerRunRequest
+  mode: Text
+  message: Option(Text)
+end
+
+struct BotRun
+  id: Text
+  bot_name: Text
+  session_id: Text
+  trust: TrustLevel
+  routine_read_only?: Bool
+  status: Text
+  prompt: Text
+  steps: Int
+  spent_usd: Decimal
+  reply: Text
+  error: Option(Text)
+  created_at: Text
+  updated_at: Text
 end
 
 struct TurnReply
@@ -267,6 +339,12 @@ struct TurnReply
   stopped_reason: Option(Text)
 end
 
+struct ApprovalResolution
+  approval: ApprovalItem
+  resumed_turn: Option(TurnReply)
+  created_rule: Option(PolicyRule)
+end
+
 struct BudgetSnapshot
   bot_name: Text
   limit_usd: Decimal
@@ -275,6 +353,27 @@ struct BudgetSnapshot
   turns: Int
   input_tokens: Int
   output_tokens: Int
+  cached_input_tokens: Int
+end
+
+struct VaultSecretMeta
+  name: Text
+  scope: Text
+  updated_at: Text
+  source: Text
+end
+
+struct SaveSecretRequest
+  name: Text
+  value: Text
+  scope: Option(Text)
+end
+
+struct WebhookConfig
+  source: Text
+  target_bot: Text
+  secret_name: Text
+  enabled?: Bool
 end
 
 struct WebhookReceipt
@@ -282,6 +381,7 @@ struct WebhookReceipt
   session_id: Text
   routed_bot: Text
   event_id: Int
+  run_id: Option(Text)
 end
 
 struct TickSummary
@@ -298,6 +398,9 @@ struct HealthSummary
   pending_approvals: Int
   connectors: Int
   routines: Int
+  queued_runs: Int
+  vault_secrets: Int
+  master_key_set?: Bool
 end
 
 struct ToggleRequest
@@ -338,36 +441,36 @@ struct ConnectorTestResult
   error: Option(Text)
 end
 
-enum MotetError
-  Unauthorized
-  ItemNotFound(message: Text)
-  BadInput(message: Text)
-  Conflict(message: Text)
-  BudgetExceeded(message: Text)
-  PolicyDenied(message: Text)
-  UpstreamFailed(message: Text)
-  StorageFailed(message: Text)
-end
-
 fn provider_to_text(p: ProviderKind) : Text
   examples
     provider_to_text(OpenAiCompat) == "openai_compat"
     provider_to_text(Anthropic) == "anthropic"
+    provider_to_text(Gemini) == "gemini"
   end
 
   case p
     OpenAiCompat: "openai_compat"
     Anthropic: "anthropic"
+    Gemini: "gemini"
   end
 end
 
 fn provider_from_text(s: Text) : ProviderKind
   examples
     provider_from_text("anthropic") == Anthropic
+    provider_from_text("gemini") == Gemini
+    provider_from_text("google") == Gemini
     provider_from_text("openai_compat") == OpenAiCompat
   end
 
-  if s.trim.ascii_lowercase == "anthropic": Anthropic else: OpenAiCompat
+  low = s.trim.ascii_lowercase
+  if low == "anthropic"
+    Anthropic
+  else if low == "gemini" or low == "google"
+    Gemini
+  else
+    OpenAiCompat
+  end
 end
 
 fn effect_to_text(e: EffectClass) : Text

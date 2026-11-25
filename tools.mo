@@ -1,13 +1,15 @@
 ## Unified tool registry and pluggable Hands for Motet:
 ## - Local Workspace Hand (Files.within + Command.allow_programs under Landlock/seccomp)
-## - Unified Streamable-HTTP MCP Connector Hand (T3 Code + Slack/Notion/Linear/GitHub/Gmail)
-## - Built-in Memory, Progressive Skills, Session Search, Artifacts, and Self-Scheduling.
+## - Unified Streamable-HTTP MCP Connector Hand with AES-256-GCM Vault & OAuth token resolution
+## - Defense-in-depth strict per-bot specialist connector wall checks
+## - Built-in Memory, Progressive Skills, Session Search, Artifacts, Web, and Bot Delegation.
 module Tools
-expose ToolRuntime(..), core_tool_defs, classify_tool_effect, execute_tool
+expose ToolRuntime(..), core_tool_defs, classify_tool_effect, extract_connector_name, execute_tool
 use Command
 use Json
 use Llm{ToolDef}
 use Mcp
+use Policy
 use Skills
 use Store
 use Types{BotConfig, ConnectorSpec, EffectClass, MotetError, ProviderKind}
@@ -37,7 +39,7 @@ fn obj_schema(props: Map(Text, Json), required: List(Text)) : Json
   })
 end
 
-## Lean 13-tool core surface (progressive disclosure for skills & remote MCP connectors).
+## Lean core tool surface (progressive disclosure for skills & remote MCP connectors).
 fn core_tool_defs() : List(ToolDef)
   [
     ToolDef(
@@ -73,7 +75,7 @@ fn core_tool_defs() : List(ToolDef)
       schema: obj_schema(
         {
           "name": str_prop("Skill slug (letters, digits, hyphens, underscores)"),
-          "description": str_prop("One-line summary for the stable skills index"),
+          "description": str_prop("One-line summary for the stable skills index (<= 60 chars)"),
           "body": str_prop("Full markdown instructions")
         },
         ["name", "description", "body"]
@@ -81,19 +83,19 @@ fn core_tool_defs() : List(ToolDef)
     ),
     ToolDef(
       name: "artifact_save",
-      description: "Save a durable artifact (report, brief, plan, patch, or summary) for the user.",
+      description: "Save a durable Page or artifact (brief, report, plan, note, draft) for the user.",
       schema: obj_schema(
         {
-          "kind": str_prop("Artifact kind: report, plan, diff, note"),
+          "kind": str_prop("Artifact kind: page, brief, report, plan, diff, note"),
           "title": str_prop("Short title"),
-          "content": str_prop("Full artifact content")
+          "content": str_prop("Full markdown artifact content")
         },
         ["kind", "title", "content"]
       )
     ),
     ToolDef(
       name: "schedule_checkin",
-      description: "Schedule a standing or follow-up check-in routine for this bot (Devin-Bot / Dots style).",
+      description: "Schedule a standing or follow-up check-in routine for this bot.",
       schema: obj_schema(
         {
           "name": str_prop("Unique routine name for this bot"),
@@ -126,7 +128,7 @@ fn core_tool_defs() : List(ToolDef)
     ),
     ToolDef(
       name: "cmd_run",
-      description: "Run an allowlisted offline binary (e.g. mo, git) inside the confined Landlock/seccomp workspace.",
+      description: "Run an allowlisted offline binary (e.g. git) inside the confined Landlock/seccomp workspace.",
       schema: obj_schema(
         {
           "program": str_prop("Allowed program basename (no slashes)"),
@@ -141,12 +143,12 @@ fn core_tool_defs() : List(ToolDef)
     ),
     ToolDef(
       name: "connector_tools",
-      description: "Progressive discovery: list tools exposed by a mounted MCP connector (such as 't3code', 'notion', 'slack', 'linear', 'github').",
+      description: "Progressive discovery: list tools exposed by a mounted MCP connector (e.g. 'qmd', 'notion', 'todoist', 'hearth-arvo', 'gmail-work').",
       schema: obj_schema({"connector": str_prop("Mounted connector name")}, ["connector"])
     ),
     ToolDef(
       name: "connector_call",
-      description: "Invoke a tool on a mounted MCP connector (e.g. connector='t3code', tool='t3_thread_list' or 't3_thread_launch').",
+      description: "Invoke a tool on a mounted MCP connector within this bot's strict specialist wall.",
       schema: obj_schema(
         {
           "connector": str_prop("Mounted connector name"),
@@ -177,15 +179,17 @@ fn core_tool_defs() : List(ToolDef)
     ),
     ToolDef(
       name: "bot_list",
-      description: "List active specialist bots in this Motet roster along with their roles, models, and mounted connectors.",
+      description: "List active specialist bots in this Motet roster along with their roles, models, and strict connector walls.",
       schema: obj_schema({}, [])
     ),
     ToolDef(
       name: "bot_delegate",
-      description: "Delegate a focused sub-task to another bot in the roster (e.g. 'builder' for deep engineering or 'watcher' for fast monitoring) and receive its reply. Runs in a durable child session under the child bot's budget.",
+      description: "Delegate a focused sub-task to another active specialist bot (e.g. 'work', 'personal', 'finance', 'researcher') and receive its reply.",
       schema: obj_schema(
         {
-          "bot": str_prop("Target bot name from the roster (e.g. 'builder' or 'watcher')"),
+          "bot": str_prop(
+            "Target specialist bot name (e.g. 'work', 'personal', 'finance', 'researcher')"
+          ),
           "task": str_prop("Clear, self-contained task brief and expected output"),
           "read_only": Json.Object({
             "type": Json.String("boolean"),
@@ -205,6 +209,17 @@ fn parse_args_obj(raw: Text) : Json
   end
 end
 
+## Extracts the target connector name when a tool call targets a mounted MCP connector.
+fn extract_connector_name(tool_name: Text, arguments_json: Text) : Option(Text)
+  if tool_name == "connector_call" or tool_name == "connector_tools"
+    args = parse_args_obj(arguments_json)
+    cname = (args.text_at("connector") or "").trim
+    if cname.empty?: None else: Some(cname)
+  else
+    None
+  end
+end
+
 ## Deterministically classifies a proposed tool call into `(EffectClass, policy_key)`
 ## BEFORE execution so PolicyActor can allow, ask first, or deny safely.
 fn classify_tool_effect(tool_name: Text, arguments_json: Text, connectors: List(ConnectorSpec)) : (
@@ -219,25 +234,29 @@ fn classify_tool_effect(tool_name: Text, arguments_json: Text, connectors: List(
     )
     classify_tool_effect(
       "connector_call",
-      "{\"connector\":\"t3code\",\"tool\":\"t3_thread_list\"}",
+      "{\"connector\":\"gmail-work\",\"tool\":\"list_messages\"}",
       []
-    ) == (Read, "t3code:t3_thread_list")
+    ) == (Read, "gmail-work:list_messages")
     classify_tool_effect(
       "connector_call",
-      "{\"connector\":\"t3code\",\"tool\":\"pull_request_merge\"}",
+      "{\"connector\":\"hearth-arvo\",\"tool\":\"delete_transaction\"}",
       []
-    ) == (Irreversible, "t3code:pull_request_merge")
+    ) == (Irreversible, "hearth-arvo:delete_transaction")
     classify_tool_effect("web_search", "{\"query\":\"Mo language\"}", []) == (Read, "web_search")
-    classify_tool_effect("web_fetch", "{\"url\":\"https://example.com\"}", []) == (Read, "web_fetch")
+    classify_tool_effect("web_fetch", "{\"url\":\"https://example.com\"}", []) == (
+      Read,
+      "web_fetch"
+    )
     classify_tool_effect(
       "bot_delegate",
-      "{\"bot\":\"builder\",\"task\":\"review diff\",\"read_only\":true}",
+      "{\"bot\":\"work\",\"task\":\"summarize inbox\",\"read_only\":true}",
       []
-    ) == (Read, "bot_delegate:builder")
-    classify_tool_effect("bot_delegate", "{\"bot\":\"builder\",\"task\":\"implement fix\"}", []) == (
-      WriteLocal,
-      "bot_delegate:builder"
-    )
+    ) == (Read, "bot_delegate:work")
+    classify_tool_effect(
+      "bot_delegate",
+      "{\"bot\":\"finance\",\"task\":\"reconcile receipts\"}",
+      []
+    ) == (WriteLocal, "bot_delegate:finance")
   end
 
   if tool_name == "memory_search" or
@@ -325,6 +344,20 @@ fn resolve_workspace_cmd(cmd: Command, bot: BotConfig) : Command
   scoped.allow_programs(bot.allowed_programs)
 end
 
+## Resolves an encrypted OAuth token or Vault-stored connector secret before falling back to Env.
+fn resolve_stored_connector_token(db: Sqlite.Database, env: Env, spec: ConnectorSpec) : Result(
+  Option(Text),
+  MotetError
+)
+  if not spec.auth_env.trim.empty?
+    case try Store.get_vault_secret(db, env, spec.auth_env.trim)
+      Some(v) if not v.trim.empty?: return Ok(Some(v.trim))
+      Some(_) | None: Unit
+    end
+  end
+  Store.get_connector_token_opened(db, env, spec.name)
+end
+
 ## Executes an already-authorized tool call using confined capabilities.
 fn execute_tool(
   rt: ToolRuntime,
@@ -386,7 +419,7 @@ fn execute_tool(
   end
 
   if tool_name == "artifact_save"
-    kind = args.text_at("kind") or "note"
+    kind = args.text_at("kind") or "page"
     title = args.text_at("title") or "Untitled"
     content = args.text_at("content") or ""
     art = try Store.save_artifact(db, bot.name, session_id, kind, title, content, now_text)
@@ -448,8 +481,9 @@ fn execute_tool(
 
   if tool_name == "connector_tools"
     cname = args.text_at("connector") or ""
-    if not bot.connectors.contains?(cname)
-      return Ok("connector_error: bot #{bot.name} does not mount connector '#{cname}'")
+    case Policy.check_connector_wall(bot, cname, Read)
+      Some(blocked): return Ok("connector_error: #{blocked.reason}")
+      None: Unit
     end
     spec_opt = try Store.get_connector(db, cname)
     return case spec_opt
@@ -458,7 +492,7 @@ fn execute_tool(
         if not spec.enabled?
           Ok("connector_error: connector '#{cname}' is disabled")
         else
-          stored_tok = try Store.get_connector_token(db, spec.name)
+          stored_tok = try resolve_stored_connector_token(db, rt.env, spec)
           case Mcp.list_tools(rt.network, rt.env, spec, stored_tok)
             Ok(tools):
               lines = tools.map(fn(t) "#{t.name} [#{t.effect_class}]: #{t.description}" end)
@@ -472,10 +506,15 @@ fn execute_tool(
   if tool_name == "connector_call"
     cname = args.text_at("connector") or ""
     rtool = args.text_at("tool") or ""
-    if not bot.connectors.contains?(cname)
-      return Ok("connector_error: bot #{bot.name} does not mount connector '#{cname}'")
-    end
     spec_opt = try Store.get_connector(db, cname)
+    eff = case spec_opt
+      Some(sp): Mcp.infer_tool_effect(cname, rtool, sp.default_effect)
+      None: WriteExternal
+    end
+    case Policy.check_connector_wall(bot, cname, eff)
+      Some(blocked): return Ok("connector_error: #{blocked.reason}")
+      None: Unit
+    end
     return case spec_opt
       None: Ok("connector_error: unknown connector '#{cname}'")
       Some(spec):
@@ -483,7 +522,7 @@ fn execute_tool(
           Ok("connector_error: connector '#{cname}' is disabled")
         else
           rargs = (args.get("arguments") or Json.Object({})).to_text
-          stored_tok = try Store.get_connector_token(db, spec.name)
+          stored_tok = try resolve_stored_connector_token(db, rt.env, spec)
           case Mcp.call_tool(rt.network, rt.env, spec, stored_tok, rtool, rargs)
             Ok(out): Ok(out)
             Error(err): Ok("connector_error: #{err}")
@@ -513,9 +552,11 @@ fn execute_tool(
     bots = try Store.list_bots(db)
     lines = bots.filter(fn(b) b.active? end).map(fn(b)
       conns = if b.connectors.empty?: "none" else: b.connectors.join(",")
+      ro = if b.read_only_connectors.empty?: "" else: " (read-only: #{b.read_only_connectors.join(
+        ","
+      )})"
       tag = if b.name == bot.name: " (you)" else: ""
-      "- #{b.name}#{tag}: #{b.role} | model=#{b.model} (#{b.model_tier}) | connectors=#{conns} | workspace=#{b
-        .workspace}"
+      "- #{b.name}#{tag}: #{b.role} | model=#{b.model} (#{b.model_tier}) | connectors=#{conns}#{ro}"
     end)
     return Ok(if lines.empty?: "no active bots" else: lines.join("\n"))
   end
@@ -527,35 +568,36 @@ fn execute_tool(
   Ok("unknown tool: #{tool_name}")
 end
 
-test "local hand confines file escapes and disallowed commands"
+test "local hand confines file escapes, disallowed commands, and strict connector walls"
   sqlite = Sqlite.in_memory()
   assert sqlite.open("t.sqlite") is Ok(db)
   assert Store.init_schema(db) is Ok(Unit)
-  files = Files.in_memory({"repo/app.mo": "module App\n", "secret.txt": "nope"})
+  files = Files.in_memory({"vault/notes.md": "# Notes\n", "secret.txt": "nope"})
   cmd = Command.fake({})
   net = Network.fake({})
-  clock = Clock.fixed(Time.parse("2026-11-22T00:00:00Z") or stop "time")
+  clock = Clock.fixed(Time.parse("2026-11-25T00:00:00Z") or stop "time")
   rt = ToolRuntime(files: files, command: cmd, network: net, env: Env.of({}), clock: clock)
   bot = BotConfig(
-    name: "builder",
-    role: "Builder",
-    persona: "Builder",
+    name: "finance",
+    role: "Household Finance",
+    persona: "Finance",
     is_primary?: false,
-    model_tier: "smart",
-    provider: OpenAiCompat,
-    endpoint: "https://api.x.ai/v1/chat/completions",
-    api_key_env: "XAI_API_KEY",
-    model: "grok-4",
-    workspace: "repo",
-    allowed_programs: ["mo", "git"],
-    allowed_hosts: ["api.x.ai:443"],
-    connectors: ["t3code"],
-    daily_budget_usd: 5.0,
+    model_tier: "gemini_flash",
+    provider: Gemini,
+    endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
+    api_key_env: "GEMINI_API_KEY",
+    model: "gemini-2.5-flash",
+    workspace: "vault",
+    allowed_programs: ["git"],
+    allowed_hosts: ["generativelanguage.googleapis.com:443"],
+    connectors: ["hearth-arvo", "gmail-personal"],
+    read_only_connectors: ["gmail-personal"],
+    daily_budget_usd: 3.0,
     max_steps: 5,
     active?: true
   )
 
-  assert execute_tool(rt, db, bot, "s1", "file_read", "{\"path\":\"app.mo\"}") == Ok("module App\n")
+  assert execute_tool(rt, db, bot, "s1", "file_read", "{\"path\":\"notes.md\"}") == Ok("# Notes\n")
   assert execute_tool(rt, db, bot, "s1", "file_read", "{\"path\":\"../secret.txt\"}") is Ok(esc)
   assert esc.starts_with?("file_error:")
   assert execute_tool(
@@ -567,4 +609,14 @@ test "local hand confines file escapes and disallowed commands"
     "{\"program\":\"curl\",\"args\":[\"https://evil.org\"]}"
   ) ==
     Ok("command_error: not_permitted curl")
+  assert execute_tool(
+    rt,
+    db,
+    bot,
+    "s1",
+    "connector_call",
+    "{\"connector\":\"gmail-personal\",\"tool\":\"send_message\",\"arguments\":{}}"
+  ) is
+    Ok(wall_err) and
+    wall_err.contains?("read-only connector wall")
 end
