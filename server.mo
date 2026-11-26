@@ -19,8 +19,11 @@ use Mcp{parse_host_port, resolve_connector_url}
 use Memory
 use Modb.Claims
 use Modb.Export
+use Modb.Feeds
 use Modb.Grants
 use Modb.Ledger
+use Modb.Policy
+use Modb.Proposals
 use Modb.Replay
 use Modb.Views
 use Modb.World{BucketDiffSummary, ChildLandResult, LandOutcome, LandResult, PriorityTicket, WorldRecord}
@@ -56,6 +59,7 @@ use Types{
   EvaluateIntentsResponse,
   EventSearchResponse,
   HealthSummary,
+  AckFeedRequest,
   MemoryEntry,
   MemorySearchResponse,
   ModbVerifySummary,
@@ -78,12 +82,15 @@ use Types{
   SearchReindexResult,
   SessionEvent,
   SessionSummary,
+  SetClearanceRequest,
   SkillDoc,
   SkillSummary,
   StandingIntent,
   StartOAuthRequest,
   StartOAuthResponse,
   SteerRunRequest,
+  SubmitGovProposalRequest,
+  SubscribeFeedRequest,
   TelegramConfig,
   TelegramTestResult,
   TickSummary,
@@ -250,6 +257,21 @@ api
   post "/v1/modb/replay/simulate" post_modb_replay_simulate
   post "/v1/modb/replay/proposals/:id/accept" post_modb_replay_accept
   post "/v1/modb/replay/proposals/:id/discard" post_modb_replay_discard
+  get "/v1/modb/policy" get_modb_policy
+  post "/v1/modb/policy/clearances" post_modb_policy_clearance
+  get "/v1/modb/export/governed" get_modb_export_governed
+  get "/v1/modb/proposals" get_modb_proposals
+  post "/v1/modb/proposals" post_modb_proposals
+  post "/v1/modb/proposals/:id/approve" post_modb_proposal_approve
+  post "/v1/modb/proposals/:id/reject" post_modb_proposal_reject
+  post "/v1/modb/proposals/:id/withdraw" post_modb_proposal_withdraw
+  get "/v1/modb/feeds" get_modb_feeds
+  post "/v1/modb/feeds" post_modb_feeds
+  get "/v1/modb/feeds/:id/poll" get_modb_feed_poll
+  post "/v1/modb/feeds/:id/ack" post_modb_feed_ack
+  post "/v1/modb/feeds/:id/consume" post_modb_feed_consume
+  post "/v1/modb/feeds/:id/resync" post_modb_feed_resync
+  delete "/v1/modb/feeds/:id" delete_modb_feed
 
   post "/webhooks/:source" post_webhook
   post "/mcp" post_mcp
@@ -2197,6 +2219,360 @@ fn post_modb_replay_discard(op: Operator, files: Files, clock: Clock, id: Text) 
   Ok(Store.proposal_to_view(prop, prop.base_audit_seq, prop.base_call_seq))
 end
 
+## Milestone 12: Sensitivity Clearances, Governed Export, Governance Proposals, & Reactive Feeds.
+fn parse_proposal_sensitivity(raw: Text) : Result(Policy.Sensitivity, MotetError)
+  Policy.sensitivity_from_text(raw).or_fail(
+    BadInput(message: "invalid sensitivity '#{raw}' (expected public|internal|confidential|secret)")
+  )
+end
+
+fn parse_proposal_kind_req(body: SubmitGovProposalRequest) : Result(
+  Proposals.ProposalKind,
+  MotetError
+)
+  k = body.kind.trim.ascii_lowercase
+  desc = body.description or "agent governance proposal"
+  if k == "view"
+    vname = try body.view_name.or_fail(
+      BadInput(message: "view proposal requires 'view_name'")
+    )
+    bview = try body.base_view.or_fail(
+      BadInput(message: "view proposal requires 'base_view'")
+    )
+    flds = try body.fields.or_fail(BadInput(message: "view proposal requires 'fields'"))
+    var fsens = {}
+    case body.field_sensitivities
+      Some(m):
+        for (fname, sval) in m.entries
+          ps = try parse_proposal_sensitivity(sval)
+          fsens = fsens.set(fname, ps)
+        end
+      None: Unit
+    end
+    Ok(
+      Proposals.ProposeView(
+        spec: Proposals.DynamicViewSpec(
+          name: vname.trim,
+          description: desc,
+          base_view: bview.trim,
+          fields: flds,
+          field_sensitivities: fsens
+        )
+      )
+    )
+  else if k == "release_policy"
+    rname = try body.release_name.or_fail(
+      BadInput(message: "release_policy proposal requires 'release_name'")
+    )
+    in_s = try parse_proposal_sensitivity(body.input_sensitivity or "confidential")
+    out_s = try parse_proposal_sensitivity(body.output_sensitivity or "public")
+    min_k = body.min_group_size or 2
+    Ok(
+      Proposals.ProposeReleasePolicy(
+        spec: Proposals.DynamicReleaseSpec(
+          release_name: rname.trim,
+          description: desc,
+          input_sensitivity: in_s,
+          output_sensitivity: out_s,
+          min_group_size: min_k
+        )
+      )
+    )
+  else if k == "clearance"
+    tg = case body.target_grant_id
+      Some(g) if not g.trim.empty?: g.trim
+      Some(_) | None:
+        case body.proposer_grant_id
+          Some(g) if not g.trim.empty?: g.trim
+          Some(_) | None:
+            return Error(BadInput(message: "clearance proposal requires 'target_grant_id'"))
+        end
+    end
+    tc_raw = try body.target_clearance.or_fail(
+      BadInput(message: "clearance proposal requires 'target_clearance'")
+    )
+    tc = try parse_proposal_sensitivity(tc_raw)
+    Ok(Proposals.ProposeClearance(grant_id: tg, target_clearance: tc, justification: desc))
+  else if k == "invariant"
+    iname = try body.invariant_name.or_fail(
+      BadInput(message: "invariant proposal requires 'invariant_name'")
+    )
+    bname = try body.bucket.or_fail(
+      BadInput(message: "invariant proposal requires 'bucket'")
+    )
+    fld = try body.field.or_fail(BadInput(message: "invariant proposal requires 'field'"))
+    rk = (body.rule_kind or "non_empty").trim.ascii_lowercase
+    rule = if rk == "non_empty" or rk == "field_non_empty"
+      Proposals.FieldNonEmpty(field: fld)
+    else if rk == "int_range"
+      Proposals.IntRange(field: fld, min: body.min, max: body.max)
+    else if rk == "allowed_values"
+      vs = try body.allowed_values.or_fail(
+        BadInput(message: "allowed_values invariant requires 'allowed_values'")
+      )
+      Proposals.AllowedValues(field: fld, values: vs)
+    else
+      return Error(
+        BadInput(
+          message: "unknown invariant rule_kind '#{rk}' (expected non_empty|int_range|allowed_values)"
+        )
+      )
+    end
+    Ok(
+      Proposals.ProposeInvariant(
+        spec: Proposals.DynamicInvariantSpec(
+          name: iname.trim,
+          description: desc,
+          bucket: bname.trim,
+          rule: rule
+        )
+      )
+    )
+  else
+    Error(
+      BadInput(
+        message: "unknown proposal kind '#{body.kind}' (expected view|release_policy|clearance|invariant)"
+      )
+    )
+  end
+end
+
+fn parse_optional_text_opt(raw_opt: Option(Text)) : Option(Text)
+  case raw_opt
+    Some(s) if not s.trim.empty?: Some(s.trim)
+    Some(_) | None: None
+  end
+end
+
+fn encode_governed_export_json(res: Policy.GovernedExportResult) : Json
+  snap_json = case Json.parse(Export.encode_snapshot_json(res.snapshot))
+    Ok(v): v
+    Error(_): Json.Null
+  end
+  Json.Object({
+    "clearance": Policy.sensitivity_to_text(res.clearance).to_json,
+    "max_sensitivity_exported": Policy.sensitivity_to_text(res.max_sensitivity_exported).to_json,
+    "exported_buckets": res.exported_buckets.to_json,
+    "redacted_buckets": res.redacted_buckets.to_json,
+    "snapshot": snap_json
+  })
+end
+
+fn get_modb_policy(_op: Operator, files: Files, clock: Clock) : Result(
+  Store.PolicyOverview,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.get_policy_overview(db)
+end
+
+fn post_modb_policy_clearance(
+  op: Operator,
+  files: Files,
+  clock: Clock,
+  body: SetClearanceRequest
+) : Result(Policy.ClearanceRecord, MotetError)
+  db = try ensure_ready(files, clock)
+  Store.set_grant_clearance(
+    db,
+    body.grant_id,
+    body.max_sensitivity,
+    op.subject,
+    body.reason or "set clearance via API",
+    clock.now
+  )
+end
+
+fn get_modb_export_governed(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  grant_id: Option(Text),
+  mode: Option(Text),
+  include_internal: Option(Bool)
+) : Result(Json, MotetError)
+  db = try ensure_ready(files, clock)
+  res = try Store.export_governed_snapshot(
+    db,
+    parse_optional_text_opt(grant_id),
+    mode or "redact",
+    include_internal or false,
+    clock.now
+  )
+  Ok(encode_governed_export_json(res))
+end
+
+fn get_modb_proposals(_op: Operator, files: Files, clock: Clock, status: Option(Text)) : Result(
+  List(Proposals.GovernanceProposal),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_gov_proposals(db, status)
+end
+
+fn post_modb_proposals(op: Operator, files: Files, clock: Clock, body: SubmitGovProposalRequest) : Result(
+  Proposals.GovernanceProposal,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  kind = try parse_proposal_kind_req(body)
+  proposer = case parse_optional_text_opt(body.proposer)
+    Some(p): p
+    None: op.subject
+  end
+  gid_opt = parse_optional_text_opt(body.proposer_grant_id)
+  rsn = case parse_optional_text_opt(body.reason)
+    Some(r): r
+    None: body.description or "submit governance proposal"
+  end
+  Store.submit_gov_proposal(db, body.id, kind, proposer, gid_opt, rsn, clock.now)
+end
+
+fn post_modb_proposal_approve(
+  op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  req: Api.Request
+) : Result(Proposals.GovernanceProposal, MotetError)
+  db = try ensure_ready(files, clock)
+  j = try parse_optional_json(req)
+  note = j.text_at("note") or (j.text_at("reason") or "approved via API")
+  Store.approve_gov_proposal(db, id, op.subject, note, clock.now)
+end
+
+fn post_modb_proposal_reject(
+  op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  req: Api.Request
+) : Result(Proposals.GovernanceProposal, MotetError)
+  db = try ensure_ready(files, clock)
+  j = try parse_optional_json(req)
+  note = j.text_at("note") or (j.text_at("reason") or "rejected via API")
+  Store.reject_gov_proposal(db, id, op.subject, note, clock.now)
+end
+
+fn post_modb_proposal_withdraw(
+  op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  req: Api.Request
+) : Result(Proposals.GovernanceProposal, MotetError)
+  db = try ensure_ready(files, clock)
+  j = try parse_optional_json(req)
+  principal = j.text_at("principal") or op.subject
+  reason = j.text_at("reason") or "withdrawn via API"
+  Store.withdraw_gov_proposal(db, id, principal, true, reason, clock.now)
+end
+
+fn get_modb_feeds(_op: Operator, files: Files, clock: Clock) : Result(
+  List(Feeds.FeedSubscription),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_feeds(db)
+end
+
+fn post_modb_feeds(op: Operator, files: Files, clock: Clock, body: SubscribeFeedRequest) : Result(
+  Feeds.FeedSubscription,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  principal = case parse_optional_text_opt(body.principal)
+    Some(p): p
+    None: op.subject
+  end
+  spec = Feeds.FeedSpec(
+    id: body.id,
+    principal: principal,
+    grant_id: parse_optional_text_opt(body.grant_id),
+    buckets: body.buckets or [],
+    include_internal: body.include_internal or false,
+    from_beginning: body.from_beginning or false
+  )
+  Store.subscribe_feed(db, spec, body.reason or "subscribe feed via API", clock.now)
+end
+
+fn get_modb_feed_poll(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  limit: Option(Int),
+  admin: Option(Bool)
+) : Result(Feeds.FeedBatch, MotetError)
+  db = try ensure_ready(files, clock)
+  Store.poll_feed(db, id, admin or false, limit or 100, clock.now)
+end
+
+fn post_modb_feed_ack(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  body: AckFeedRequest
+) : Result(Feeds.FeedSubscription, MotetError)
+  db = try ensure_ready(files, clock)
+  Store.ack_feed(db, id, body.up_to_txid, body.delivered_count or 0, clock.now)
+end
+
+fn post_modb_feed_consume(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  limit: Option(Int),
+  admin: Option(Bool),
+  req: Api.Request
+) : Result(Store.FeedConsumeResult, MotetError)
+  db = try ensure_ready(files, clock)
+  j = try parse_optional_json(req)
+  lim = case j.int_at("limit")
+    Some(v): v
+    None: limit or 100
+  end
+  is_adm = case j.bool_at("admin")
+    Some(v): v
+    None: admin or false
+  end
+  Store.consume_feed(db, id, is_adm, lim, clock.now)
+end
+
+fn post_modb_feed_resync(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  from_beginning: Option(Bool),
+  req: Api.Request
+) : Result(Feeds.FeedSubscription, MotetError)
+  db = try ensure_ready(files, clock)
+  j = try parse_optional_json(req)
+  from_beg = case j.bool_at("from_beginning")
+    Some(v): v
+    None: from_beginning or false
+  end
+  Store.resync_feed(db, id, from_beg, clock.now)
+end
+
+fn delete_modb_feed(op: Operator, files: Files, clock: Clock, id: Text, reason: Option(Text)) : Result(
+  Json,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  _u = try Store.unsubscribe_feed(
+    db,
+    id,
+    op.subject,
+    reason or "unsubscribe feed via API",
+    clock.now
+  )
+  Ok(Json.Object({"id": id.to_json, "status": "unsubscribed".to_json}))
+end
+
 ## Receives an external webhook payload with HMAC-SHA256 verification (when configured),
 ## logs it under External trust, and enqueues an External-trust async BotRun for the target bot.
 fn post_webhook(
@@ -2469,6 +2845,80 @@ fn post_mcp(
             "program": Json.Object({"type": Json.String("object")})
           })
         })
+      }),
+      Json.Object({
+        "name": Json.String("motet_policy"),
+        "description": Json.String(
+          "Inspect sensitivity policy & clearances, set non-widening grant clearances, or run a governed redacted/strict SHA-256 export"
+        ),
+        "inputSchema": Json.Object({
+          "type": Json.String("object"),
+          "properties": Json.Object({
+            "action": Json.Object({"type": Json.String("string")}),
+            "grant_id": Json.Object({"type": Json.String("string")}),
+            "max_sensitivity": Json.Object({"type": Json.String("string")}),
+            "mode": Json.Object({"type": Json.String("string")}),
+            "include_internal": Json.Object({"type": Json.String("boolean")}),
+            "reason": Json.Object({"type": Json.String("string")})
+          })
+        })
+      }),
+      Json.Object({
+        "name": Json.String("motet_proposals"),
+        "description": Json.String(
+          "List, submit (view|release_policy|clearance|invariant with machine-checked CapabilityDiff), approve, reject, or withdraw governance proposals"
+        ),
+        "inputSchema": Json.Object({
+          "type": Json.String("object"),
+          "properties": Json.Object({
+            "action": Json.Object({"type": Json.String("string")}),
+            "status": Json.Object({"type": Json.String("string")}),
+            "id": Json.Object({"type": Json.String("string")}),
+            "proposal_id": Json.Object({"type": Json.String("string")}),
+            "kind": Json.Object({"type": Json.String("string")}),
+            "view_name": Json.Object({"type": Json.String("string")}),
+            "base_view": Json.Object({"type": Json.String("string")}),
+            "fields": Json.Object({
+              "type": Json.String("array"),
+              "items": Json.Object({"type": Json.String("string")})
+            }),
+            "release_name": Json.Object({"type": Json.String("string")}),
+            "target_grant_id": Json.Object({"type": Json.String("string")}),
+            "target_clearance": Json.Object({"type": Json.String("string")}),
+            "invariant_name": Json.Object({"type": Json.String("string")}),
+            "bucket": Json.Object({"type": Json.String("string")}),
+            "rule_kind": Json.Object({"type": Json.String("string")}),
+            "field": Json.Object({"type": Json.String("string")}),
+            "note": Json.Object({"type": Json.String("string")}),
+            "reason": Json.Object({"type": Json.String("string")})
+          })
+        })
+      }),
+      Json.Object({
+        "name": Json.String("motet_feeds"),
+        "description": Json.String(
+          "Subscribe, poll O(diff) with sensitivity skipping, ack, consume, resync, or unsubscribe CoW-pinned reactive change feeds"
+        ),
+        "inputSchema": Json.Object({
+          "type": Json.String("object"),
+          "properties": Json.Object({
+            "action": Json.Object({"type": Json.String("string")}),
+            "feed_id": Json.Object({"type": Json.String("string")}),
+            "id": Json.Object({"type": Json.String("string")}),
+            "grant_id": Json.Object({"type": Json.String("string")}),
+            "buckets": Json.Object({
+              "type": Json.String("array"),
+              "items": Json.Object({"type": Json.String("string")})
+            }),
+            "include_internal": Json.Object({"type": Json.String("boolean")}),
+            "from_beginning": Json.Object({"type": Json.String("boolean")}),
+            "limit": Json.Object({"type": Json.String("integer")}),
+            "admin": Json.Object({"type": Json.String("boolean")}),
+            "up_to_txid": Json.Object({"type": Json.String("integer")}),
+            "delivered_count": Json.Object({"type": Json.String("integer")}),
+            "reason": Json.Object({"type": Json.String("string")})
+          })
+        })
       })
     ])
     return Ok(mcp_ok(id, Json.Object({"tools": tool_list})))
@@ -2664,6 +3114,171 @@ fn post_mcp(
       end
       qres = try Store.run_read_program(db, "mcp", gid_opt, prog, clock.now)
       return Ok(mcp_ok(id, mcp_text_result(Json.encode(qres), qres.to_json)))
+    end
+    if tname == "motet_policy"
+      act = (args.text_at("action") or "overview").trim
+      if act == "set_clearance"
+        gid = (args.text_at("grant_id") or "").trim
+        ms = (args.text_at("max_sensitivity") or "").trim
+        return Error(BadInput(message: "grant_id and max_sensitivity required")) if gid.empty? or
+          ms.empty?
+        clr = try Store.set_grant_clearance(
+          db,
+          gid,
+          ms,
+          "mcp",
+          args.text_at("reason") or "set clearance via MCP",
+          clock.now
+        )
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(clr), clr.to_json)))
+      end
+      if act == "export_governed"
+        exp = try Store.export_governed_snapshot(
+          db,
+          parse_optional_text_opt(args.text_at("grant_id")),
+          args.text_at("mode") or "redact",
+          args.bool_at("include_internal") or false,
+          clock.now
+        )
+        out = encode_governed_export_json(exp)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(out), out)))
+      end
+      ov = try Store.get_policy_overview(db)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(ov), ov.to_json)))
+    end
+    if tname == "motet_proposals"
+      act = (args.text_at("action") or "list").trim
+      if act == "submit"
+        req_b = try Json.decode[SubmitGovProposalRequest](args.to_text).map_error(fn(e)
+          BadInput(message: "invalid governance proposal args: #{e}")
+        end)
+        kind = try parse_proposal_kind_req(req_b)
+        proposer = case parse_optional_text_opt(req_b.proposer)
+          Some(p): p
+          None: "mcp"
+        end
+        rsn = case parse_optional_text_opt(req_b.reason)
+          Some(r): r
+          None: req_b.description or "submit proposal via MCP"
+        end
+        prop = try Store.submit_gov_proposal(
+          db,
+          req_b.id,
+          kind,
+          proposer,
+          parse_optional_text_opt(req_b.proposer_grant_id),
+          rsn,
+          clock.now
+        )
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(prop), prop.to_json)))
+      end
+      pid = (args.text_at("proposal_id") or (args.text_at("id") or "")).trim
+      if act == "approve"
+        return Error(BadInput(message: "proposal_id or id required")) if pid.empty?
+        prop = try Store.approve_gov_proposal(
+          db,
+          pid,
+          "mcp",
+          args.text_at("note") or (args.text_at("reason") or "approved via MCP"),
+          clock.now
+        )
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(prop), prop.to_json)))
+      end
+      if act == "reject"
+        return Error(BadInput(message: "proposal_id or id required")) if pid.empty?
+        prop = try Store.reject_gov_proposal(
+          db,
+          pid,
+          "mcp",
+          args.text_at("note") or (args.text_at("reason") or "rejected via MCP"),
+          clock.now
+        )
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(prop), prop.to_json)))
+      end
+      if act == "withdraw"
+        return Error(BadInput(message: "proposal_id or id required")) if pid.empty?
+        prop = try Store.withdraw_gov_proposal(
+          db,
+          pid,
+          "mcp",
+          true,
+          args.text_at("reason") or "withdrawn via MCP",
+          clock.now
+        )
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(prop), prop.to_json)))
+      end
+      props = try Store.list_gov_proposals(db, args.text_at("status"))
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(props), props.to_json)))
+    end
+    if tname == "motet_feeds"
+      act = (args.text_at("action") or "list").trim
+      fid = (args.text_at("feed_id") or (args.text_at("id") or "")).trim
+      if act == "subscribe"
+        return Error(BadInput(message: "feed_id or id required")) if fid.empty?
+        bkts = case args.path("buckets")
+          Some(bj): try Json.decode[List(Text)](bj.to_text).map_error(fn(e)
+            BadInput(message: "invalid buckets list: #{e}")
+          end)
+          None: []
+        end
+        spec = Feeds.FeedSpec(
+          id: fid,
+          principal: "mcp",
+          grant_id: parse_optional_text_opt(args.text_at("grant_id")),
+          buckets: bkts,
+          include_internal: args.bool_at("include_internal") or false,
+          from_beginning: args.bool_at("from_beginning") or false
+        )
+        fsub = try Store.subscribe_feed(db, spec, args.text_at("reason") or "subscribe via MCP", clock.now)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(fsub), fsub.to_json)))
+      end
+      if act == "poll"
+        return Error(BadInput(message: "feed_id or id required")) if fid.empty?
+        batch = try Store.poll_feed(
+          db,
+          fid,
+          args.bool_at("admin") or false,
+          args.int_at("limit") or 100,
+          clock.now
+        )
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(batch), batch.to_json)))
+      end
+      if act == "ack"
+        return Error(BadInput(message: "feed_id or id required")) if fid.empty?
+        up_to = try args.int_at("up_to_txid").or_fail(BadInput(message: "up_to_txid required"))
+        fsub = try Store.ack_feed(db, fid, up_to, args.int_at("delivered_count") or 0, clock.now)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(fsub), fsub.to_json)))
+      end
+      if act == "consume"
+        return Error(BadInput(message: "feed_id or id required")) if fid.empty?
+        cres = try Store.consume_feed(
+          db,
+          fid,
+          args.bool_at("admin") or false,
+          args.int_at("limit") or 100,
+          clock.now
+        )
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(cres), cres.to_json)))
+      end
+      if act == "resync"
+        return Error(BadInput(message: "feed_id or id required")) if fid.empty?
+        fsub = try Store.resync_feed(db, fid, args.bool_at("from_beginning") or false, clock.now)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(fsub), fsub.to_json)))
+      end
+      if act == "unsubscribe"
+        return Error(BadInput(message: "feed_id or id required")) if fid.empty?
+        _u = try Store.unsubscribe_feed(
+          db,
+          fid,
+          "mcp",
+          args.text_at("reason") or "unsubscribe via MCP",
+          clock.now
+        )
+        out = Json.Object({"id": fid.to_json, "status": "unsubscribed".to_json})
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(out), out)))
+      end
+      flist = try Store.list_feeds(db)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(flist), flist.to_json)))
     end
     if tname == "motet_ask"
       bot_name = args.text_at("bot") or "chief"
@@ -3791,4 +4406,224 @@ test "HTTP and MCP serve hybrid/BM25/semantic search, Vault Gemini reindex, and 
     srng
   )
   assert mcp_ms.status == 200 and mcp_ms.text.contains?("SFO")
+
+  # Milestone 12: Sensitivity Clearances, Governed Export, Governance Proposals, & Reactive Feeds (REST + MCP)
+  pol0 = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/policy").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert pol0.status == 200 and
+    pol0.text.contains?("webhook_configs") and
+    pol0.text.contains?("memory_scope_summary")
+
+  clr_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/policy/clearances").with_bearer("secret-op").with_json(
+      SetClearanceRequest(
+        grant_id: "bot:chief",
+        max_sensitivity: "public",
+        reason: Some("strict public API check")
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert clr_resp.status == 200 and clr_resp.text.contains?("bot:chief")
+
+  exp_strict = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/export/governed").with_bearer("secret-op").with_query(
+      "grant_id",
+      "bot:chief"
+    ).with_query("mode", "strict"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert exp_strict.status == 403
+
+  exp_red = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/export/governed").with_bearer("secret-op").with_query(
+      "grant_id",
+      "bot:chief"
+    ).with_query("mode", "redact"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert exp_red.status == 200 and
+    exp_red.text.contains?("redacted_buckets") and
+    exp_red.text.contains?("bots")
+
+  prop_sub = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/proposals").with_bearer("secret-op").with_json(
+      SubmitGovProposalRequest(
+        id: "srv-prop-bots-roles",
+        kind: "view",
+        proposer: Some("bot:chief"),
+        proposer_grant_id: None,
+        description: Some("Narrowed bots role view"),
+        view_name: Some("bots_roles_only"),
+        base_view: Some("bots"),
+        fields: Some(["name", "role"]),
+        field_sensitivities: Some({"name": "public", "role": "public"}),
+        release_name: None,
+        input_sensitivity: None,
+        output_sensitivity: None,
+        min_group_size: None,
+        target_grant_id: None,
+        target_clearance: None,
+        invariant_name: None,
+        bucket: None,
+        rule_kind: None,
+        field: None,
+        min: None,
+        max: None,
+        allowed_values: None,
+        reason: Some("safe minimal view")
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert prop_sub.status == 200 and
+    prop_sub.text.contains?("srv-prop-bots-roles") and
+    prop_sub.text.contains?("narrows_only")
+
+  prop_app = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/proposals/srv-prop-bots-roles/approve").with_bearer("secret-op").with_text(
+      "{\"note\":\"approved in test\"}"
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert prop_app.status == 200 and prop_app.text.contains?("bots_roles_only")
+
+  dyn_q = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/query").with_bearer("secret-op").with_json(
+      Views.ReadProgram(
+        view: "bots_roles_only",
+        where_clause: None,
+        select: Some(["name", "role"]),
+        group_by: None,
+        aggregates: None,
+        order_by: None,
+        limit: Some(3)
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert dyn_q.status == 200 and dyn_q.text.contains?("\"result_count\":3")
+
+  feed_sub = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/feeds").with_bearer("secret-op").with_json(
+      SubscribeFeedRequest(
+        id: "srv-feed-mem",
+        principal: None,
+        grant_id: Some("bot:chief"),
+        buckets: Some(["memories"]),
+        include_internal: Some(false),
+        from_beginning: Some(false),
+        reason: Some("watch restricted memories")
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert feed_sub.status == 200 and feed_sub.text.contains?("srv-feed-mem")
+
+  mcp_feeds = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_json(
+      Json.Object({
+        "jsonrpc": "2.0".to_json,
+        "id": 103.to_json,
+        "method": "tools/call".to_json,
+        "params": Json.Object({
+          "name": "motet_feeds".to_json,
+          "arguments": Json.Object({
+            "action": "consume".to_json,
+            "feed_id": "srv-feed-mem".to_json
+          })
+        })
+      })
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_feeds.status == 200 and mcp_feeds.text.contains?("srv-feed-mem")
+
+  mcp_pol = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_json(
+      Json.Object({
+        "jsonrpc": "2.0".to_json,
+        "id": 104.to_json,
+        "method": "tools/call".to_json,
+        "params": Json.Object({
+          "name": "motet_policy".to_json,
+          "arguments": Json.Object({"action": "overview".to_json})
+        })
+      })
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_pol.status == 200 and mcp_pol.text.contains?("bots_roles_only")
+
+  mcp_props = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_json(
+      Json.Object({
+        "jsonrpc": "2.0".to_json,
+        "id": 105.to_json,
+        "method": "tools/call".to_json,
+        "params": Json.Object({
+          "name": "motet_proposals".to_json,
+          "arguments": Json.Object({"action": "list".to_json})
+        })
+      })
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_props.status == 200 and mcp_props.text.contains?("srv-prop-bots-roles")
+
+  feed_del = ApiTest.send(
+    Server,
+    Api.delete("/v1/modb/feeds/srv-feed-mem").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert feed_del.status == 200 and feed_del.text.contains?("unsubscribed")
 end

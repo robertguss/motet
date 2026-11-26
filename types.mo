@@ -73,6 +73,10 @@ WorldCallRequest(..),
 WorldLandRequest(..),
 OpenChildWorldRequest(..),
 WorldPriorityRequest(..),
+SetClearanceRequest(..),
+SubmitGovProposalRequest(..),
+SubscribeFeedRequest(..),
+AckFeedRequest(..),
 MemorySearchHit(..),
 MemorySearchResponse(..),
 EventSearchHit(..),
@@ -679,6 +683,53 @@ struct WorldPriorityRequest
   buckets: List(Text)
   min_stale_threshold: Option(Int)
   hold_seconds: Option(Int)
+end
+
+struct SetClearanceRequest
+  grant_id: Text
+  max_sensitivity: Text
+  reason: Option(Text)
+end
+
+struct SubmitGovProposalRequest
+  id: Text
+  kind: Text
+  proposer: Option(Text)
+  proposer_grant_id: Option(Text)
+  description: Option(Text)
+  view_name: Option(Text)
+  base_view: Option(Text)
+  fields: Option(List(Text))
+  field_sensitivities: Option(Map(Text, Text))
+  release_name: Option(Text)
+  input_sensitivity: Option(Text)
+  output_sensitivity: Option(Text)
+  min_group_size: Option(Int)
+  target_grant_id: Option(Text)
+  target_clearance: Option(Text)
+  invariant_name: Option(Text)
+  bucket: Option(Text)
+  rule_kind: Option(Text)
+  field: Option(Text)
+  min: Option(Int)
+  max: Option(Int)
+  allowed_values: Option(List(Text))
+  reason: Option(Text)
+end
+
+struct SubscribeFeedRequest
+  id: Text
+  principal: Option(Text)
+  grant_id: Option(Text)
+  buckets: Option(List(Text))
+  include_internal: Option(Bool)
+  from_beginning: Option(Bool)
+  reason: Option(Text)
+end
+
+struct AckFeedRequest
+  up_to_txid: Int
+  delivered_count: Option(Int)
 end
 
 struct MemorySearchHit

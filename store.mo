@@ -20,6 +20,7 @@ ensure_seeded,
 tokenize,
 motet_schema,
 motet_view_catalog,
+motet_policy,
 motet_replay_catalog,
 DreamingRunRow(..),
 RoutineRunRow(..),
@@ -196,7 +197,24 @@ list_replay_proposals,
 proposal_to_view,
 list_replay_proposal_views,
 accept_replay_proposal,
-discard_replay_proposal
+discard_replay_proposal,
+PolicyOverview(..),
+FeedConsumeResult(..),
+get_policy_overview,
+set_grant_clearance,
+export_governed_snapshot,
+submit_gov_proposal,
+list_gov_proposals,
+approve_gov_proposal,
+reject_gov_proposal,
+withdraw_gov_proposal,
+subscribe_feed,
+list_feeds,
+poll_feed,
+ack_feed,
+consume_feed,
+resync_feed,
+unsubscribe_feed
 use Http
 use Json
 use Llm
@@ -204,9 +222,12 @@ use Modb{WriteTx}
 use Modb.Claims
 use Modb.Errors{ModbError}
 use Modb.Export{BackupReport, PortableSnapshot}
+use Modb.Feeds
 use Modb.Fts{DocumentInput, FieldInput, FtsIndex, SearchOptions}
 use Modb.Grants{GrantSpec}
 use Modb.Ledger{AuditEntry, LedgerError, Schema, WriteMeta}
+use Modb.Policy
+use Modb.Proposals
 use Modb.Replay{ReplayCatalog, ReplayFilter, ReplayProposal}
 use Modb.Table{Index, Table, TableError}
 use Modb.Vec
@@ -804,6 +825,65 @@ fn replay_err(e: Replay.ReplayError) : MotetError
     Replay.UnknownReplayAction(action: _, schema_version: _) | Replay.MissingReplayMigration(
       version: _
     ) | Replay.ReplayFailed(detail: _): StorageFailed(message: e.to_text)
+  end
+end
+
+fn policy_err(e: Policy.PolicyError) : MotetError
+  case e
+    Policy.LedgerFailure(le): ledger_err(le)
+    Policy.GrantFailure(ge): grant_err(ge)
+    Policy.ViewsFailure(ve): views_err(ve)
+    Policy.ExportFailure(ee): export_err(ee)
+    Policy.FtsFailure(fe): fts_err(fe)
+    Policy.VecFailure(ve): vec_err(ve)
+    Policy.InvalidPolicy(reason: _): BadInput(message: Policy.to_text(e))
+    Policy.ClearanceDenied(subject: _, required: _, actual: _) | Policy.ClearanceWideningDenied(
+      grant_id: _,
+      parent_id: _,
+      requested: _,
+      parent_clearance: _
+    ) | Policy.DeclassificationDenied(
+      release: _,
+      input_sensitivity: _,
+      output_sensitivity: _,
+      min_group_size: _
+    ) | Policy.ExportBlocked(bucket: _, required: _, actual: _): PolicyDenied(
+      message: Policy.to_text(e)
+    )
+  end
+end
+
+fn proposal_err(e: Proposals.ProposalError) : MotetError
+  case e
+    Proposals.LedgerFailure(le): ledger_err(le)
+    Proposals.GrantFailure(ge): grant_err(ge)
+    Proposals.PolicyFailure(pe): policy_err(pe)
+    Proposals.ProposalNotFound(id: _): ItemNotFound(message: Proposals.to_text(e))
+    Proposals.ProposalAlreadyExists(id: _) | Proposals.ProposalNotPending(id: _, status: _): Conflict(
+      message: Proposals.to_text(e)
+    )
+    Proposals.ApprovalDenied(reason: _): PolicyDenied(message: Proposals.to_text(e))
+    Proposals.InvalidProposal(reason: _) | Proposals.ExistingDataViolatesInvariant(
+      name: _,
+      bucket: _,
+      violation_count: _,
+      sample: _
+    ): BadInput(message: Proposals.to_text(e))
+  end
+end
+
+fn feed_err(e: Feeds.FeedError) : MotetError
+  case e
+    Feeds.LedgerFailure(le): ledger_err(le)
+    Feeds.GrantFailure(ge): grant_err(ge)
+    Feeds.PolicyFailure(pe): policy_err(pe)
+    Feeds.FeedNotFound(id: _): ItemNotFound(message: Feeds.to_text(e))
+    Feeds.FeedAlreadyExists(id: _) | Feeds.PinMissing(feed_id: _, pin_id: _) | Feeds.CursorStale(
+      feed_id: _,
+      expected_txid: _,
+      actual_txid: _
+    ): Conflict(message: Feeds.to_text(e))
+    Feeds.InvalidFeed(reason: _): BadInput(message: Feeds.to_text(e))
   end
 end
 
@@ -3222,6 +3302,53 @@ fn motet_view_catalog() : ViewCatalog
     ).with_invariant_doc("memories_non_empty", "Every memory entry has non-empty scope and content")
 end
 
+## Layer 4 Sensitivity Policy across Motet buckets, Views, Releases, and search scopes.
+## `motet-secrets.modb` (AES-256-GCM Vault) stays physically isolated in a separate CoW file.
+fn motet_policy() : Policy.SensitivityPolicy
+  Policy.policy().with_default_clearance(Policy.Internal).with_default_bucket_sensitivity(
+    Policy.Internal
+  ).with_bucket_sensitivity("webhook_configs", Policy.Confidential).with_bucket_sensitivity(
+    "app_settings",
+    Policy.Confidential
+  ).with_view_field_sensitivity("bots", "workspace", Policy.Internal).with_view_field_sensitivity(
+    "bots",
+    "daily_budget_usd",
+    Policy.Internal
+  ).with_view_field_sensitivity("memories", "content", Policy.Internal)
+    .with_view_field_sensitivity("memories", "provenance", Policy.Internal)
+    .with_view_field_sensitivity("sessions", "title", Policy.Internal)
+    .with_view_field_sensitivity("artifacts", "title", Policy.Internal)
+    .with_scope_sensitivity("shared", Policy.Public)
+    .with_scope_sensitivity("work", Policy.Internal)
+    .with_scope_sensitivity("personal", Policy.Confidential)
+    .with_scope_sensitivity("finance", Policy.Confidential)
+    .with_release_policy(
+      "bot_activity_summary",
+      Policy.ReleasePolicy(
+        input_sensitivity: Policy.Internal,
+        output_sensitivity: Policy.Internal,
+        min_group_size: 1
+      )
+    )
+    .with_release_policy(
+      "memory_scope_summary",
+      Policy.ReleasePolicy(
+        input_sensitivity: Policy.Confidential,
+        output_sensitivity: Policy.Public,
+        min_group_size: 2
+      )
+    )
+end
+
+fn effective_catalog_and_policy(store: Modb.Store) : Result(
+  (ViewCatalog, Policy.SensitivityPolicy),
+  MotetError
+)
+  live_cat = try Proposals.materialize_catalog(store, motet_view_catalog()).map_error(proposal_err)
+  live_pol = try Proposals.materialize_policy(store, motet_policy()).map_error(proposal_err)
+  Ok((live_cat, live_pol))
+end
+
 ## Scoped speculative queries and approved actions for MoDB Layer 4 Worlds.
 fn world_query_active_memories(tx: WriteTx, args: Json) : Result(Json, Text)
   raw_lim = args.int_at("limit") or 200
@@ -3388,8 +3515,19 @@ fn exec_replay_on(ldb: Ledger.Db, principal: Text, action: Text, reason: Text, a
   (Ledger.Db, Json),
   MotetError
 )
+  dinvs = try Proposals.list_dynamic_invariants(Ledger.store(ldb)).map_error(proposal_err)
+  eff_ldb = if dinvs.empty?
+    ldb
+  else
+    live_sc = try Proposals.apply_dynamic_invariants(Ledger.store(ldb), ldb.schema).map_error(
+      proposal_err
+    )
+    var dl = ldb
+    dl.schema = live_sc
+    dl
+  end
   meta = WriteMeta(principal: principal, action: action, reason: reason, at: at)
-  (next_ldb, rep, _rec) = try Replay.execute(ldb, motet_replay_catalog(), meta, args).map_error(
+  (next_ldb, rep, _rec) = try Replay.execute(eff_ldb, motet_replay_catalog(), meta, args).map_error(
     replay_err
   )
   Ok((next_ldb, rep))
@@ -6801,18 +6939,22 @@ fn list_active_claims(db: DbHandle, now: Time) : Result(List(Claims.Claim), Mote
   with_db_read(db, fn(ldb) Claims.list_active(Ledger.store(ldb), now).map_error(claim_err) end)
 end
 
-## Layer 4 Views & Self-Onboarding.
+## Layer 4 Views, Self-Onboarding & Sensitivity-Governed Read Execution.
 fn describe_for_caller(db: DbHandle, principal: Text, grant_id_opt: Option(Text), now: Time) : Result(
   OnboardingManifest,
   MotetError
 )
   is_admin = grant_id_opt == None
+  base_cat = motet_view_catalog()
   with_db_read(
     db,
     fn(ldb)
+      live_cat = try Proposals.materialize_catalog(Ledger.store(ldb), base_cat).map_error(
+        proposal_err
+      )
       Views.describe_for_caller(
         ldb,
-        motet_view_catalog(),
+        live_cat,
         principal,
         if is_admin: "operator" else: "delegated_bot",
         is_admin,
@@ -6833,18 +6975,28 @@ fn run_read_program(
   now: Time
 ) : Result(ReadResult, MotetError)
   is_admin = grant_id_opt == None
-  Views.execute_read_program_locked(
+  Ledger.locked(
     db.files,
     db.path,
     motet_schema(),
-    motet_view_catalog(),
-    program,
-    principal,
-    grant_id_opt,
-    is_admin,
-    Views.default_limits(),
-    now
-  ).map_error(views_err)
+    now,
+    ledger_err,
+    fn(ldb)
+      (live_cat, live_pol) = try effective_catalog_and_policy(Ledger.store(ldb))
+      (_next_ldb, gov, _entry) = try Policy.execute_read_program_governed_recorded(
+        ldb,
+        live_cat,
+        live_pol,
+        program,
+        principal,
+        grant_id_opt,
+        is_admin,
+        Views.default_limits(),
+        now
+      ).map_error(policy_err)
+      Ok(gov.result)
+    end
+  )
 end
 
 fn run_release(
@@ -6856,18 +7008,28 @@ fn run_release(
   now: Time
 ) : Result(ReleaseResult, MotetError)
   is_admin = grant_id_opt == None
-  Views.execute_release_locked(
+  Ledger.locked(
     db.files,
     db.path,
     motet_schema(),
-    motet_view_catalog(),
-    release_name,
-    args,
-    principal,
-    grant_id_opt,
-    is_admin,
-    now
-  ).map_error(views_err)
+    now,
+    ledger_err,
+    fn(ldb)
+      (live_cat, live_pol) = try effective_catalog_and_policy(Ledger.store(ldb))
+      (_next_ldb, rel, _entry) = try Policy.execute_release_governed_recorded(
+        ldb,
+        live_cat,
+        live_pol,
+        release_name,
+        args,
+        principal,
+        grant_id_opt,
+        is_admin,
+        now
+      ).map_error(policy_err)
+      Ok(rel)
+    end
+  )
 end
 
 fn list_read_log(db: DbHandle, limit: Int) : Result(List(ReadLogEntry), MotetError)
@@ -7546,6 +7708,381 @@ fn discard_replay_proposal(db: DbHandle, id: Text, principal: Text, now: Time) :
   Replay.discard_proposal_locked(db.files, db.path, motet_schema(), id, principal, now).map_error(
     replay_err
   )
+end
+
+## ---------------------------------------------------------------------------
+## Milestone 12: Sensitivity Clearances, Agent Proposals & Reactive Change Feeds
+## ---------------------------------------------------------------------------
+struct PolicyOverview
+  default_clearance: Text
+  default_bucket_sensitivity: Text
+  bucket_sensitivities: Map(Text, Text)
+  scope_sensitivities: Map(Text, Text)
+  release_policies: Map(Text, Policy.ReleasePolicy)
+  clearances: List(Policy.ClearanceRecord)
+  dynamic_views: List(Proposals.DynamicViewSpec)
+  dynamic_releases: List(Proposals.DynamicReleaseSpec)
+  dynamic_invariants: List(Proposals.DynamicInvariantSpec)
+end
+
+struct FeedConsumeResult
+  batch: Feeds.FeedBatch
+  subscription: Feeds.FeedSubscription
+end
+
+fn sensitivity_map_to_texts(m: Map(Text, Policy.Sensitivity)) : Map(Text, Text)
+  var out = {}
+  for (k, v) in m.entries
+    out = out.set(k, Policy.sensitivity_to_text(v))
+  end
+  out
+end
+
+fn parse_sensitivity_arg(raw: Text) : Result(Policy.Sensitivity, MotetError)
+  Policy.sensitivity_from_text(raw).or_fail(
+    BadInput(message: "invalid sensitivity '#{raw}' (expected public|internal|confidential|secret)")
+  )
+end
+
+fn parse_export_mode(raw: Text) : Result(Policy.ExportMode, MotetError)
+  norm = raw.trim.ascii_lowercase
+  if norm.empty? or norm == "redact" or norm == "redact_restricted"
+    Ok(Policy.RedactRestricted)
+  else if norm == "strict" or norm == "strict_fail_closed"
+    Ok(Policy.StrictFailClosed)
+  else
+    Error(BadInput(message: "invalid governed export mode '#{raw}' (expected redact|strict)"))
+  end
+end
+
+fn get_policy_overview(db: DbHandle) : Result(PolicyOverview, MotetError)
+  base_pol = motet_policy()
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      live_pol = try Proposals.materialize_policy(st, base_pol).map_error(proposal_err)
+      clrs = try Policy.list_clearances(st).map_error(policy_err)
+      dviews = try Proposals.list_dynamic_views(st).map_error(proposal_err)
+      drels = try Proposals.list_dynamic_releases(st).map_error(proposal_err)
+      dinvs = try Proposals.list_dynamic_invariants(st).map_error(proposal_err)
+      Ok(
+        PolicyOverview(
+          default_clearance: Policy.sensitivity_to_text(live_pol.default_clearance),
+          default_bucket_sensitivity: Policy.sensitivity_to_text(live_pol.default_bucket_sensitivity),
+          bucket_sensitivities: sensitivity_map_to_texts(live_pol.bucket_sensitivities),
+          scope_sensitivities: sensitivity_map_to_texts(live_pol.scope_sensitivities),
+          release_policies: live_pol.release_policies,
+          clearances: clrs,
+          dynamic_views: dviews,
+          dynamic_releases: drels,
+          dynamic_invariants: dinvs
+        )
+      )
+    end
+  )
+end
+
+fn set_grant_clearance(
+  db: DbHandle,
+  grant_id: Text,
+  sensitivity_text: Text,
+  principal: Text,
+  reason: Text,
+  now: Time
+) : Result(Policy.ClearanceRecord, MotetError)
+  sens = try parse_sensitivity_arg(sensitivity_text)
+  eff_reason = if reason.trim.empty?: "set clearance '#{sensitivity_text}'" else: reason.trim
+  meta = WriteMeta(
+    principal: principal,
+    action: "policy_set_clearance",
+    reason: eff_reason,
+    at: now
+  )
+  Policy.set_clearance_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    motet_policy(),
+    meta,
+    grant_id.trim,
+    sens,
+    now
+  ).map_error(policy_err)
+end
+
+fn export_governed_snapshot(
+  db: DbHandle,
+  grant_id_opt: Option(Text),
+  mode_text: Text,
+  include_internal: Bool,
+  now: Time
+) : Result(Policy.GovernedExportResult, MotetError)
+  mode = try parse_export_mode(mode_text)
+  eff_gid = case grant_id_opt
+    Some(g) if not g.trim.empty?: Some(g.trim)
+    Some(_) | None: None
+  end
+  is_admin = eff_gid == None
+  base_pol = motet_policy()
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      live_pol = try Proposals.materialize_policy(st, base_pol).map_error(proposal_err)
+      Policy.export_governed(st, live_pol, mode, include_internal, eff_gid, is_admin, now).map_error(
+        policy_err
+      )
+    end
+  )
+end
+
+fn submit_gov_proposal(
+  db: DbHandle,
+  id: Text,
+  kind: Proposals.ProposalKind,
+  proposer: Text,
+  grant_id_opt: Option(Text),
+  reason: Text,
+  now: Time
+) : Result(Proposals.GovernanceProposal, MotetError)
+  eff_reason = if reason.trim.empty?: "submit governance proposal '#{id}'" else: reason.trim
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (live_cat, live_pol) = try effective_catalog_and_policy(Ledger.store(ldb))
+      (_next, prop) = try Proposals.submit_proposal(
+        ldb,
+        live_cat,
+        live_pol,
+        id.trim,
+        kind,
+        proposer.trim,
+        grant_id_opt,
+        eff_reason,
+        now
+      ).map_error(proposal_err)
+      Ok(prop)
+    end
+  )
+end
+
+fn parse_proposal_status_opt(raw_opt: Option(Text)) : Result(
+  Option(Proposals.ProposalStatus),
+  MotetError
+)
+  case raw_opt
+    None: Ok(None)
+    Some(raw) if raw.trim.empty?: Ok(None)
+    Some(raw):
+      norm = raw.trim.ascii_lowercase
+      if norm == "pending"
+        Ok(Some(Proposals.Pending))
+      else if norm == "approved"
+        Ok(Some(Proposals.Approved))
+      else if norm == "rejected"
+        Ok(Some(Proposals.Rejected))
+      else if norm == "withdrawn"
+        Ok(Some(Proposals.Withdrawn))
+      else
+        Error(
+          BadInput(
+            message: "unknown proposal status '#{raw}' (expected pending|approved|rejected|withdrawn)"
+          )
+        )
+      end
+  end
+end
+
+fn list_gov_proposals(db: DbHandle, status_opt: Option(Text)) : Result(
+  List(Proposals.GovernanceProposal),
+  MotetError
+)
+  parsed_status = try parse_proposal_status_opt(status_opt)
+  with_db_read(
+    db,
+    fn(ldb)
+      Proposals.list_proposals(Ledger.store(ldb), parsed_status).map_error(proposal_err)
+    end
+  )
+end
+
+fn approve_gov_proposal(
+  db: DbHandle,
+  id: Text,
+  reviewer: Text,
+  note: Text,
+  now: Time
+) : Result(Proposals.GovernanceProposal, MotetError)
+  eff_note = if note.trim.empty?: "approved by #{reviewer}" else: note.trim
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (live_cat, live_pol) = try effective_catalog_and_policy(Ledger.store(ldb))
+      (_next, prop) = try Proposals.approve_proposal(
+        ldb,
+        live_cat,
+        live_pol,
+        id.trim,
+        reviewer.trim,
+        true,
+        eff_note,
+        now
+      ).map_error(proposal_err)
+      Ok(prop)
+    end
+  )
+end
+
+fn reject_gov_proposal(
+  db: DbHandle,
+  id: Text,
+  reviewer: Text,
+  note: Text,
+  now: Time
+) : Result(Proposals.GovernanceProposal, MotetError)
+  eff_note = if note.trim.empty?: "rejected by #{reviewer}" else: note.trim
+  Proposals.reject_proposal_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    id.trim,
+    reviewer.trim,
+    true,
+    eff_note,
+    now
+  ).map_error(proposal_err)
+end
+
+fn withdraw_gov_proposal(
+  db: DbHandle,
+  id: Text,
+  principal: Text,
+  is_admin: Bool,
+  reason: Text,
+  now: Time
+) : Result(Proposals.GovernanceProposal, MotetError)
+  eff_reason = if reason.trim.empty?: "withdrawn by #{principal}" else: reason.trim
+  Proposals.withdraw_proposal_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    id.trim,
+    principal.trim,
+    is_admin,
+    eff_reason,
+    now
+  ).map_error(proposal_err)
+end
+
+fn subscribe_feed(db: DbHandle, spec: Feeds.FeedSpec, reason: Text, now: Time) : Result(
+  Feeds.FeedSubscription,
+  MotetError
+)
+  eff_reason = if reason.trim.empty?: "subscribe feed '#{spec.id}'" else: reason.trim
+  Feeds.subscribe_locked(db.files, db.path, motet_schema(), spec, eff_reason, now).map_error(feed_err)
+end
+
+fn list_feeds(db: DbHandle) : Result(List(Feeds.FeedSubscription), MotetError)
+  with_db_read(db, fn(ldb) Feeds.list_feeds(Ledger.store(ldb)).map_error(feed_err) end)
+end
+
+fn poll_feed(
+  db: DbHandle,
+  feed_id: Text,
+  is_admin: Bool,
+  limit: Int,
+  now: Time
+) : Result(Feeds.FeedBatch, MotetError)
+  cap = if limit > 0 and limit <= 500: limit else: 100
+  base_pol = motet_policy()
+  fid = feed_id.trim
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      live_pol = try Proposals.materialize_policy(st, base_pol).map_error(proposal_err)
+      Feeds.poll_feed(st, live_pol, fid, is_admin, cap, now).map_error(feed_err)
+    end
+  )
+end
+
+fn ack_feed(
+  db: DbHandle,
+  feed_id: Text,
+  up_to_txid: Int,
+  delivered_count: Int,
+  now: Time
+) : Result(Feeds.FeedSubscription, MotetError)
+  Feeds.ack_feed_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    feed_id.trim,
+    up_to_txid,
+    delivered_count,
+    now
+  ).map_error(feed_err)
+end
+
+fn consume_feed(
+  db: DbHandle,
+  feed_id: Text,
+  is_admin: Bool,
+  limit: Int,
+  now: Time
+) : Result(FeedConsumeResult, MotetError)
+  cap = if limit > 0 and limit <= 500: limit else: 100
+  base_pol = motet_policy()
+  fid = feed_id.trim
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      live_pol = try Proposals.materialize_policy(Ledger.store(ldb), base_pol).map_error(
+        proposal_err
+      )
+      (_next, batch, sub) = try Feeds.consume_feed(
+        ldb,
+        live_pol,
+        fid,
+        is_admin,
+        cap,
+        now
+      ).map_error(feed_err)
+      Ok(FeedConsumeResult(batch: batch, subscription: sub))
+    end
+  )
+end
+
+fn resync_feed(
+  db: DbHandle,
+  feed_id: Text,
+  from_beginning: Bool,
+  now: Time
+) : Result(Feeds.FeedSubscription, MotetError)
+  Feeds.resync_feed_locked(db.files, db.path, motet_schema(), feed_id.trim, from_beginning, now)
+    .map_error(feed_err)
+end
+
+fn unsubscribe_feed(db: DbHandle, feed_id: Text, principal: Text, reason: Text, now: Time) : Result(
+  Unit,
+  MotetError
+)
+  eff_reason = if reason.trim.empty?: "unsubscribe feed '#{feed_id}'" else: reason.trim
+  meta = WriteMeta(principal: principal, action: "feed_unsubscribe", reason: eff_reason, at: now)
+  Feeds.unsubscribe_locked(db.files, db.path, motet_schema(), feed_id.trim, meta).map_error(feed_err)
 end
 
 test "store seeds specialist roster, seals vault secrets & OAuth tokens, supports canonical chats and async runs"
@@ -8297,4 +8834,173 @@ test "Schema v2 -> v3 upgrade, vector lifecycle hygiene, and Gemini neural hybri
   assert delete_memory(db, m3.id) is Ok(Unit)
   assert search_stats(db, gem_env) is Ok(st3)
   assert st3.memories_neural_docs == 0 and st3.memories_sketch_docs == 1
+end
+
+test "Milestone 12: sensitivity policy, governed export, agent proposals & reactive feeds"
+  files = Files.in_memory({})
+  t0 = Time.parse("2026-11-26T12:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = open(files, clock)
+  assert seed_defaults(db, t0.to_text) is Ok(Unit)
+  assert upsert_webhook_config(
+    db,
+    WebhookConfig(source: "github", target_bot: "chief", secret_name: "GH_SECRET", enabled?: true)
+  ) is
+    Ok(_)
+  assert save_memory(db, "shared", "fact", "Public fact A", "user", t0.to_text) is Ok(_)
+  assert save_memory(db, "shared", "fact", "Public fact B", "user", t0.to_text) is Ok(_)
+
+  # 1. Delegate narrow read-only grant & restrict clearance to Public
+  assert delegate_bot_grant(db, "chief", "bot:chief", "del:pub", "finance", true, 10, t0) is Ok(_)
+  assert set_grant_clearance(db, "del:pub", "public", "operator", "public only", t0) is Ok(clr) and
+    clr.max_sensitivity is Policy.Public
+
+  # Bots_public succeeds under Public clearance; filtering on artifacts.title fails closed!
+  assert run_read_program(
+    db,
+    "bot:finance",
+    Some("del:pub"),
+    ReadProgram(
+      view: "bots_public",
+      where_clause: None,
+      select: None,
+      group_by: None,
+      aggregates: None,
+      order_by: None,
+      limit: Some(10)
+    ),
+    t0
+  ) is
+    Ok(pub_bots) and
+    pub_bots.result_count == 7
+  assert run_read_program(
+    db,
+    "bot:finance",
+    Some("del:pub"),
+    ReadProgram(
+      view: "artifacts",
+      where_clause: Some(Views.NotNull(field: "title")),
+      select: None,
+      group_by: None,
+      aggregates: None,
+      order_by: None,
+      limit: Some(10)
+    ),
+    t0
+  ) is
+    Error(PolicyDenied(message: _))
+
+  # k-anonymous release declassifies Confidential -> Public cleanly when k >= 2
+  assert run_release(db, "bot:finance", Some("del:pub"), "memory_scope_summary", Json.Object({}), t0) is
+    Ok(rel) and
+    rel.cohort_size >= 2
+
+  # Governed export blocks StrictFailClosed on Confidential/Internal buckets, redacts in RedactRestricted mode
+  assert export_governed_snapshot(db, Some("del:pub"), "strict", false, t0) is
+    Error(PolicyDenied(message: _))
+  assert export_governed_snapshot(db, Some("del:pub"), "redact", false, t0) is Ok(exp_red) and
+    exp_red.redacted_buckets.contains?("webhook_configs") and
+    exp_red.redacted_buckets.contains?("bots")
+
+  # 2. Agent Governance Proposal: narrowed view -> inspect CapabilityDiff -> approve -> materialized live!
+  assert submit_gov_proposal(
+    db,
+    "prop-bots-names",
+    Proposals.ProposeView(
+      spec: Proposals.DynamicViewSpec(
+        name: "bots_names",
+        description: "Minimal bot roster names & roles",
+        base_view: "bots",
+        fields: ["name", "role"],
+        field_sensitivities: {"name": Policy.Public, "role": Policy.Public}
+      )
+    ),
+    "bot:finance",
+    Some("del:pub"),
+    "propose minimal roster view",
+    t0
+  ) is
+    Ok(prop0) and
+    prop0.diff.narrows_only and
+    not prop0.diff.widens_access and
+    prop0.diff.risk_level == "low"
+  assert approve_gov_proposal(db, "prop-bots-names", "operator", "looks safe", t0) is Ok(prop1) and
+    prop1.status is Proposals.Approved
+  assert describe_for_caller(db, "operator", None, t0) is Ok(man) and
+    man.allowed_views.any?(fn(vw) vw.name == "bots_names" end)
+  assert run_read_program(
+    db,
+    "operator",
+    None,
+    ReadProgram(
+      view: "bots_names",
+      where_clause: None,
+      select: Some(["name", "role"]),
+      group_by: None,
+      aggregates: None,
+      order_by: None,
+      limit: Some(5)
+    ),
+    t0
+  ) is
+    Ok(vrows) and
+    vrows.result_count == 5
+
+  # 3. Reactive CoW Change Feed: O(1) idle, O(diff) delta, sensitivity bucket skip, CAS consume
+  assert subscribe_feed(
+    db,
+    Feeds.FeedSpec(
+      id: "feed-pub",
+      principal: "bot:finance",
+      grant_id: Some("del:pub"),
+      buckets: ["webhook_configs", "memories"],
+      include_internal: false,
+      from_beginning: false
+    ),
+    "watch shared changes",
+    t0
+  ) is
+    Ok(fsub0) and
+    fsub0.id == "feed-pub"
+  assert poll_feed(db, "feed-pub", false, 50, t0) is Ok(idle_f) and
+    idle_f.events.empty? and
+    idle_f.pages_read == 0
+
+  # Confidential `webhook_configs` is skipped without exposing secret config names!
+  assert upsert_webhook_config(
+    db,
+    WebhookConfig(source: "stripe", target_bot: "finance", secret_name: "STRIPE_SEC", enabled?: true)
+  ) is
+    Ok(_)
+  assert poll_feed(db, "feed-pub", false, 50, t0) is Ok(fb1) and
+    fb1.filtered_buckets == ["webhook_configs"]
+  assert consume_feed(db, "feed-pub", false, 50, t0) is Ok(cres1) and
+    cres1.batch.filtered_buckets == ["webhook_configs"]
+  assert poll_feed(db, "feed-pub", false, 50, t0) is Ok(idle_f2) and idle_f2.pages_read == 0
+
+  # Operator (Secret clearance) sees memories mutations via feed
+  assert subscribe_feed(
+    db,
+    Feeds.FeedSpec(
+      id: "feed-op",
+      principal: "operator",
+      grant_id: None,
+      buckets: ["memories"],
+      include_internal: false,
+      from_beginning: false
+    ),
+    "watch memories",
+    t0
+  ) is
+    Ok(_)
+  assert save_memory(db, "shared", "fact", "Feed triggers event", "user", t0.to_text) is Ok(_)
+  assert consume_feed(db, "feed-op", true, 50, t0) is Ok(cres2) and not cres2.batch.events.empty? and
+    cres2.subscription.events_delivered >= 1
+  assert poll_feed(db, "feed-op", true, 50, t0) is Ok(idle_op) and
+    idle_op.events.empty? and
+    idle_op.pages_read == 0
+
+  assert unsubscribe_feed(db, "feed-pub", "operator", "done", t0) is Ok(Unit)
+  assert unsubscribe_feed(db, "feed-op", "operator", "done", t0) is Ok(Unit)
+  assert verify_all(db) is Ok(vrep) and vrep.ok? and vrep.secrets_ok?
 end

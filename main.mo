@@ -61,7 +61,10 @@ fn print_usage(console: Console)
       "  motet export                                     Export SHA-256 verified portable JSON snapshot (no secrets)",
       "  motet grants                                     List attenuated bot grants",
       "  motet claims                                     List active routine leases",
-      "  motet worlds                                     List speculative CoW Worlds & landing metrics"
+      "  motet worlds                                     List speculative CoW Worlds & landing metrics",
+      "  motet policy                                     Show Sensitivity policy, clearances & dynamic rules",
+      "  motet proposals [status]                         List governance proposals & CapabilityDiffs",
+      "  motet feeds [poll <id> [--limit N]]              List reactive change feeds or poll O(diff) deltas"
     ].join("\n")
   )
 end
@@ -713,6 +716,106 @@ fn cmd_worlds(db: Store.DbHandle, console: Console) : Int
   end
 end
 
+fn cmd_policy(db: Store.DbHandle, console: Console) : Int
+  case Store.get_policy_overview(db)
+    Ok(ov):
+      console.print(
+        "Policy default_clearance=#{ov.default_clearance} default_bucket=#{ov
+          .default_bucket_sensitivity} clearances=#{ov.clearances.size} dynamic_views=#{ov
+          .dynamic_views.size} dynamic_releases=#{ov.dynamic_releases.size} dynamic_invariants=#{ov
+          .dynamic_invariants.size}"
+      )
+      for (b, s) in ov.bucket_sensitivities.entries
+        console.print("  bucket #{b}: #{s}")
+      end
+      for (sc, s) in ov.scope_sensitivities.entries
+        console.print("  scope #{sc}: #{s}")
+      end
+      for clr in ov.clearances
+        console.print(
+          "  clearance grant=#{clr.grant_id} level=#{clr.max_sensitivity} by=#{clr.granted_by} (#{clr
+            .reason})"
+        )
+      end
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
+fn cmd_proposals(db: Store.DbHandle, console: Console, rest: List(Text)) : Int
+  status_opt = case rest.first
+    Some(s) if not s.trim.empty? and not s.starts_with?("--"): Some(s.trim)
+    Some(_) | None: None
+  end
+  case Store.list_gov_proposals(db, status_opt)
+    Ok(props):
+      if props.empty?
+        console.print("No governance proposals recorded.")
+      else
+        for p in props
+          console.print(
+            "#{p.id} status=#{p.status} proposer=#{p.proposer} risk=#{p.diff.risk_level} widens=#{p
+              .diff.widens_access} narrows_only=#{p.diff.narrows_only} — #{p.diff.summary}"
+          )
+        end
+      end
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
+fn cmd_feeds(db: Store.DbHandle, clock: Clock, console: Console, rest: List(Text)) : Int
+  sub = (rest.first or "").trim
+  if sub == "poll"
+    fid = (rest.get(1) or "").trim
+    if fid.empty?
+      console.error("usage: motet feeds poll <feed_id> [--limit N]")
+      return 2
+    end
+    var lim = 100
+    var i = 2
+    while i < rest.size
+      tok = rest.get(i) or ""
+      if tok == "--limit"
+        case rest.get(i + 1)
+          Some(n): lim = n.to_int or 100
+          None: Unit
+        end
+        i += 2
+      else
+        i += 1
+      end
+    end
+    return case Store.poll_feed(db, fid, false, lim, clock.now)
+      Ok(b):
+        console.print(
+          "feed=#{b.feed_id} tx=#{b.from_txid}->#{b.to_txid} events=#{b.events.size} filtered=#{b
+            .filtered_buckets.size} pages=#{b.pages_read} skipped=#{b.subtrees_skipped}"
+        )
+        for ev in b.events
+          console.print("  [#{ev.bucket}] #{ev.op} key=#{ev.key_text or ev.key_hex}")
+        end
+        0
+      Error(err): print_err(console, err)
+    end
+  end
+  case Store.list_feeds(db)
+    Ok(fs):
+      if fs.empty?
+        console.print("No reactive change feeds registered.")
+      else
+        for f in fs
+          console.print(
+            "#{f.id} principal=#{f.principal} cursor_tx=#{f.cursor_txid} delivered=#{f
+              .events_delivered} buckets=[#{f.buckets.join(",")}] pin=#{f.pin_id}"
+          )
+        end
+      end
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
 fn main(
   args: Args,
   env: Env,
@@ -760,6 +863,9 @@ fn main(
   return cmd_grants(db, console) if head == "grants"
   return cmd_claims(db, clock, console) if head == "claims"
   return cmd_worlds(db, console) if head == "worlds"
+  return cmd_policy(db, console) if head == "policy"
+  return cmd_proposals(db, console, rest) if head == "proposals"
+  return cmd_feeds(db, clock, console, rest) if head == "feeds"
 
   if head == "tick"
     _drained = Brain.drain_queued_runs(rt, db, 10)
@@ -926,4 +1032,16 @@ test "motet CLI initializes specialist roster, seals Vault API key, runs canonic
   ) ==
     0
   assert (c10.printed.join("\n")).contains?("Todoist")
+
+  c11 = Console.fake()
+  assert main(Args.of(["policy"]), env, c11, files, cmd, Network.fake({}), clock, srng) == 0
+  assert (c11.printed.first or "").contains?("Policy default_clearance=internal")
+
+  c12 = Console.fake()
+  assert main(Args.of(["proposals"]), env, c12, files, cmd, Network.fake({}), clock, srng) == 0
+  assert (c12.printed.first or "").contains?("No governance proposals recorded.")
+
+  c13 = Console.fake()
+  assert main(Args.of(["feeds"]), env, c13, files, cmd, Network.fake({}), clock, srng) == 0
+  assert (c13.printed.first or "").contains?("No reactive change feeds registered.")
 end

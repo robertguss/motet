@@ -548,6 +548,131 @@ export interface ModbReadLogEntry {
   at: string;
 }
 
+export interface ModbReleasePolicy {
+  input_sensitivity: unknown;
+  output_sensitivity: unknown;
+  min_group_size: number;
+}
+
+export interface ModbClearanceRecord {
+  grant_id: string;
+  max_sensitivity: unknown;
+  granted_by: string;
+  reason: string;
+  updated_at: string;
+}
+
+export interface ModbDynamicViewSpec {
+  name: string;
+  description: string;
+  base_view: string;
+  fields: string[];
+  field_sensitivities: Record<string, unknown>;
+}
+
+export interface ModbDynamicReleaseSpec {
+  release_name: string;
+  description: string;
+  input_sensitivity: unknown;
+  output_sensitivity: unknown;
+  min_group_size: number;
+}
+
+export interface ModbDynamicInvariantSpec {
+  name: string;
+  description: string;
+  bucket: string;
+  rule: unknown;
+}
+
+export interface ModbPolicyOverview {
+  default_clearance: string;
+  default_bucket_sensitivity: string;
+  bucket_sensitivities: Record<string, string>;
+  scope_sensitivities: Record<string, string>;
+  release_policies: Record<string, ModbReleasePolicy>;
+  clearances: ModbClearanceRecord[];
+  dynamic_views: ModbDynamicViewSpec[];
+  dynamic_releases: ModbDynamicReleaseSpec[];
+  dynamic_invariants: ModbDynamicInvariantSpec[];
+}
+
+export interface ModbCapabilityDiff {
+  widens_access: boolean;
+  narrows_only: boolean;
+  declassifies: boolean;
+  risk_level: string;
+  affected_targets: string[];
+  newly_exposed_fields: string[];
+  max_sensitivity_before: unknown;
+  max_sensitivity_after: unknown;
+  existing_violations: number;
+  summary: string;
+}
+
+export interface ModbGovProposal {
+  id: string;
+  proposer: string;
+  proposer_grant_id?: string | null;
+  kind: unknown;
+  diff: ModbCapabilityDiff;
+  status: unknown;
+  submitted_at: string;
+  reviewed_by?: string | null;
+  review_note?: string | null;
+  reviewed_at?: string | null;
+}
+
+export interface ModbFeedSubscription {
+  id: string;
+  principal: string;
+  grant_id?: string | null;
+  buckets: string[];
+  include_internal: boolean;
+  pin_id: string;
+  cursor_txid: number;
+  bootstrapped: boolean;
+  created_at: string;
+  last_acked_at?: string | null;
+  events_delivered: number;
+}
+
+export interface ModbFeedEvent {
+  bucket: string;
+  op: unknown;
+  key_hex: string;
+  key_text?: string | null;
+  old_value_hex?: string | null;
+  new_value_hex?: string | null;
+  old_value_text?: string | null;
+  new_value_text?: string | null;
+}
+
+export interface ModbFeedBatch {
+  feed_id: string;
+  from_txid: number;
+  to_txid: number;
+  clearance: unknown;
+  events: ModbFeedEvent[];
+  truncated: boolean;
+  filtered_buckets: string[];
+  pages_read: number;
+  subtrees_skipped: number;
+}
+
+export interface ModbFeedConsumeResult {
+  batch: ModbFeedBatch;
+  subscription: ModbFeedSubscription;
+}
+
+export interface ModbGovernedExport {
+  clearance: string;
+  max_sensitivity_exported: string;
+  exported_buckets: string[];
+  redacted_buckets: string[];
+  snapshot: { sha256?: string; bucket_count?: number; entry_count?: number } | null;
+}
+
 export interface MemorySearchHit {
   memory: MemoryEntry;
   score: number;
