@@ -156,9 +156,17 @@ verify_fast,
 verify_and_checkpoint,
 compact,
 audit_tail,
+audit_query,
 export_snapshot,
+ReplayBaselineStatus(..),
+ReplayProposalView(..),
+list_replay_calls,
+get_replay_baseline_status,
+pin_replay_baseline,
 simulate_replay,
 list_replay_proposals,
+proposal_to_view,
+list_replay_proposal_views,
 accept_replay_proposal,
 discard_replay_proposal
 use Json
@@ -5541,16 +5549,188 @@ fn compact(db: DbHandle) : Result(ModbVerifySummary, MotetError)
     (next_ldb, _g) = try ensure_bot_root_grant_on(cur_ldb, b.name, now)
     cur_ldb = next_ldb
   end
-  (_cp_ldb, _cp) = try Ledger.record_verify_checkpoint(cur_ldb, now).map_error(ledger_err)
+  (bl_ldb, _bl) = try Replay.pin_baseline(cur_ldb, now).map_error(replay_err)
+  (_cp_ldb, _cp) = try Ledger.record_verify_checkpoint(bl_ldb, now).map_error(ledger_err)
   try db.files.rename(tmp_path, db.path).map_error(fn(e)
     StorageFailed(message: "compact swap failed: #{e}")
   end)
   verify_all(db)
 end
 
+## Lightweight status of the CoW replay baseline pin and replayable call count.
+struct ReplayBaselineStatus
+  pinned?: Bool
+  pin_id: Option(Text)
+  schema_version: Int
+  txid: Int
+  pinned_at: Option(Text)
+  call_count: Int
+  can_pin?: Bool
+end
+
+## Lightweight proposal view omitting full `proposed_state` / `proposed_delta` hex blobs for HTTP UI.
+struct ReplayProposalView
+  id: Text
+  description: Text
+  filter: ReplayFilter
+  base_live_txid: Int
+  base_audit_seq: Int
+  base_call_seq: Int
+  target_schema_version: Int
+  created_by: Text
+  created_at: Time
+  status: Replay.ProposalStatus
+  summary: Replay.ReplaySummary
+  outcomes: List(Replay.CallOutcome)
+  bucket_diffs: List(Replay.BucketRowDiff)
+  stale?: Bool
+  uses_delta?: Bool
+end
+
 fn audit_tail(db: DbHandle, limit: Int) : Result(List(AuditEntry), MotetError)
   cap = if limit > 0 and limit <= 200: limit else: 50
   with_db_read(db, fn(ldb) Ledger.audit_tail(ldb, cap).map_error(ledger_err) end)
+end
+
+fn audit_query(
+  db: DbHandle,
+  principal_opt: Option(Text),
+  action_opt: Option(Text),
+  limit: Int
+) : Result(List(AuditEntry), MotetError)
+  cap = if limit > 0 and limit <= 200: limit else: 50
+  p_opt = case principal_opt
+    Some(p) if not p.trim.empty?: Some(p.trim)
+    Some(_) | None: None
+  end
+  a_opt = case action_opt
+    Some(a) if not a.trim.empty?: Some(a.trim)
+    Some(_) | None: None
+  end
+  with_db_read(
+    db,
+    fn(ldb)
+      entries = case (p_opt, a_opt)
+        (Some(who), _):
+          all_p = try Ledger.audit_by_principal(ldb, who).map_error(ledger_err)
+          case a_opt
+            Some(act): all_p.filter(fn(e) e.action == act end)
+            None: all_p
+          end
+        (None, Some(act)): try Ledger.audit_by_action(ldb, act).map_error(ledger_err)
+        (None, None): try Ledger.audit_tail(ldb, cap).map_error(ledger_err)
+      end
+      if cap > 0 and entries.size > cap
+        Ok(entries.drop(entries.size - cap))
+      else
+        Ok(entries)
+      end
+    end
+  )
+end
+
+fn list_replay_calls(db: DbHandle, limit: Int, principal_opt: Option(Text)) : Result(
+  List(Replay.CallRecord),
+  MotetError
+)
+  cap = if limit > 0 and limit <= 200: limit else: 50
+  p_opt = case principal_opt
+    Some(p) if not p.trim.empty?: Some(p.trim)
+    Some(_) | None: None
+  end
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      case p_opt
+        Some(who):
+          all_p = try Replay.calls_by_principal(st, who).map_error(replay_err)
+          if cap > 0 and all_p.size > cap
+            Ok(all_p.drop(all_p.size - cap))
+          else
+            Ok(all_p)
+          end
+        None: Replay.list_calls_tail(st, cap).map_error(replay_err)
+      end
+    end
+  )
+end
+
+fn get_replay_baseline_status(db: DbHandle) : Result(ReplayBaselineStatus, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      bl_opt = try Replay.get_baseline(st).map_error(replay_err)
+      calls = try Replay.call_count(st).map_error(replay_err)
+      case bl_opt
+        Some(bl): Ok(
+          ReplayBaselineStatus(
+            pinned?: true,
+            pin_id: Some(bl.pin_id),
+            schema_version: bl.schema_version,
+            txid: bl.txid,
+            pinned_at: Some(bl.pinned_at.to_text),
+            call_count: calls,
+            can_pin?: false
+          )
+        )
+        None: Ok(
+          ReplayBaselineStatus(
+            pinned?: false,
+            pin_id: None,
+            schema_version: Ledger.schema_version(ldb),
+            txid: Ledger.txid(ldb),
+            pinned_at: None,
+            call_count: calls,
+            can_pin?: calls == 0
+          )
+        )
+      end
+    end
+  )
+end
+
+fn pin_replay_baseline(db: DbHandle) : Result(ReplayBaselineStatus, MotetError)
+  now = db.clock.now
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      bl_opt = try Replay.get_baseline(st).map_error(replay_err)
+      calls = try Replay.call_count(st).map_error(replay_err)
+      case bl_opt
+        Some(bl): Ok(
+          ReplayBaselineStatus(
+            pinned?: true,
+            pin_id: Some(bl.pin_id),
+            schema_version: bl.schema_version,
+            txid: bl.txid,
+            pinned_at: Some(bl.pinned_at.to_text),
+            call_count: calls,
+            can_pin?: false
+          )
+        )
+        None:
+          (_next_ldb, bl) = try Replay.pin_baseline(ldb, now).map_error(replay_err)
+          Ok(
+            ReplayBaselineStatus(
+              pinned?: true,
+              pin_id: Some(bl.pin_id),
+              schema_version: bl.schema_version,
+              txid: bl.txid,
+              pinned_at: Some(bl.pinned_at.to_text),
+              call_count: calls,
+              can_pin?: false
+            )
+          )
+      end
+    end
+  )
 end
 
 fn export_snapshot(db: DbHandle, now: Time) : Result(PortableSnapshot, MotetError)
@@ -5567,21 +5747,94 @@ fn simulate_replay(
   created_by: Text,
   now: Time
 ) : Result(ReplayProposal, MotetError)
-  Replay.simulate_replay_locked(
+  Ledger.locked(
     db.files,
     db.path,
     motet_schema(),
-    motet_replay_catalog(),
-    filter,
-    id,
-    description,
-    created_by,
-    now
-  ).map_error(replay_err)
+    now,
+    ledger_err,
+    fn(ldb0)
+      st0 = Ledger.store(ldb0)
+      bl_opt = try Replay.get_baseline(st0).map_error(replay_err)
+      calls = try Replay.call_count(st0).map_error(replay_err)
+      bot_cnt = try Table.count(st0, bots_table()).map_error(table_err)
+      var ldb = ldb0
+      if bl_opt == None and bot_cnt > 0
+        if calls == 0
+          (ldb1, _bl) = try Replay.pin_baseline(ldb, now).map_error(replay_err)
+          ldb = ldb1
+        else
+          first_calls = try Replay.list_calls(st0).map_error(replay_err)
+          first_act = case first_calls.first
+            Some(c): c.action
+            None: ""
+          end
+          if first_act != "seed_defaults" and first_act != "import_snapshot"
+            return Error(
+              Conflict(
+                message: "Replay log has no baseline snapshot (database was imported/compacted without a baseline pin). Run `motet compact` to establish a safe CoW baseline before replaying."
+              )
+            )
+          end
+        end
+      end
+      (_next, prop) = try Replay.simulate_replay(
+        ldb,
+        motet_replay_catalog(),
+        filter,
+        id,
+        description,
+        created_by,
+        now
+      ).map_error(replay_err)
+      Ok(prop)
+    end
+  )
+end
+
+fn proposal_to_view(prop: ReplayProposal, cur_audit: Int, cur_calls: Int) : ReplayProposalView
+  is_pending = case prop.status
+    Replay.Pending: true
+    Replay.Accepted(commit_txid: _, accepted_by: _, accepted_at: _) | Replay.Discarded(
+      discarded_by: _,
+      discarded_at: _
+    ): false
+  end
+  is_stale = is_pending and (prop.base_audit_seq != cur_audit or prop.base_call_seq != cur_calls)
+  ReplayProposalView(
+    id: prop.id,
+    description: prop.description,
+    filter: prop.filter,
+    base_live_txid: prop.base_live_txid,
+    base_audit_seq: prop.base_audit_seq,
+    base_call_seq: prop.base_call_seq,
+    target_schema_version: prop.target_schema_version,
+    created_by: prop.created_by,
+    created_at: prop.created_at,
+    status: prop.status,
+    summary: prop.summary,
+    outcomes: prop.outcomes,
+    bucket_diffs: prop.bucket_diffs,
+    stale?: is_stale,
+    uses_delta?: prop.proposed_delta is Some(_)
+  )
 end
 
 fn list_replay_proposals(db: DbHandle) : Result(List(ReplayProposal), MotetError)
   Replay.list_proposals_locked(db.files.read_only, db.path, motet_schema()).map_error(replay_err)
+end
+
+fn list_replay_proposal_views(db: DbHandle) : Result(List(ReplayProposalView), MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      cur_audit = Ledger.audit_count(ldb)
+      cur_calls = try Replay.call_count(st).map_error(replay_err)
+      props = try Replay.list_proposals(st).map_error(replay_err)
+      Ok(props.map(fn(p) proposal_to_view(p, cur_audit, cur_calls) end))
+    end
+  )
 end
 
 fn accept_replay_proposal(db: DbHandle, id: Text, principal: Text, reason: Text, now: Time) : Result(
@@ -5771,4 +6024,30 @@ test "Modb Store enforces invariants, supports lossless selective-undo Replay, G
   assert routine_slot_claimed(db, 1, "2026-11-25") == Ok(true)
   assert search_events(db, "Compactable milestone", 5) is Ok(comp_hits) and comp_hits.size == 1
   assert verify_fast(db) is Ok(vf2) and vf2.ok?
+
+  # 6. Post-compaction CoW ReplayBaseline pins compacted state and supports delta selective-undo
+  assert get_replay_baseline_status(db) is Ok(bl) and
+    bl.pinned? and
+    not bl.can_pin? and
+    bl.call_count == 0
+  assert save_memory(db, "researcher", "work_log", "Post-compact noisy log", "bot:post", t0.to_text) is
+    Ok(_)
+  assert simulate_replay(
+    db,
+    "undo-post-compact",
+    "Undo post-compact bot write without wiping compacted rows",
+    Replay.ExcludePrincipal(principal: "bot:post"),
+    "operator",
+    t0
+  ) is
+    Ok(dp)
+  assert dp.proposed_delta is Some(dlist) and not dlist.empty?
+  assert proposal_to_view(dp, dp.base_audit_seq, dp.base_call_seq).uses_delta?
+  assert accept_replay_proposal(db, "undo-post-compact", "operator", "clean post-compact", t0) is
+    Ok(_)
+  assert search_events(db, "Compactable milestone", 5) is Ok(comp_hits2) and comp_hits2.size == 1
+  assert list_bots(db) is Ok(b_final) and b_final.size == b_before.size
+  assert list_routines(db) is Ok(r_final) and r_final.size == r_before.size
+  assert routine_slot_claimed(db, 1, "2026-11-25") == Ok(true)
+  assert search_memories(db, Some("researcher"), "Post-compact") == Ok([])
 end

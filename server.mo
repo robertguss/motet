@@ -202,13 +202,17 @@ api
   get "/v1/events/stream" get_events_stream
 
   get "/v1/modb/verify" get_modb_verify
+  post "/v1/modb/verify/checkpoint" post_modb_verify_checkpoint
   get "/v1/modb/audit" get_modb_audit
+  get "/v1/modb/calls" get_modb_calls
   get "/v1/modb/export" get_modb_export
   get "/v1/modb/describe" get_modb_describe
   post "/v1/modb/query" post_modb_query
   get "/v1/modb/grants" get_modb_grants
   post "/v1/modb/grants/:id/revoke" post_modb_revoke_grant
   get "/v1/modb/claims" get_modb_claims
+  get "/v1/modb/replay/baseline" get_modb_replay_baseline
+  post "/v1/modb/replay/baseline" post_modb_replay_baseline
   get "/v1/modb/replay/proposals" get_modb_replay_proposals
   post "/v1/modb/replay/simulate" post_modb_replay_simulate
   post "/v1/modb/replay/proposals/:id/accept" post_modb_replay_accept
@@ -1664,20 +1668,47 @@ fn get_modb_verify(_op: Operator, files: Files, clock: Clock, full: Option(Bool)
   end
 end
 
-fn get_modb_audit(_op: Operator, files: Files, clock: Clock, limit: Option(Int)) : Result(
-  List(Ledger.AuditEntry),
+fn post_modb_verify_checkpoint(_op: Operator, files: Files, clock: Clock) : Result(
+  ModbVerifySummary,
   MotetError
 )
   db = try ensure_ready(files, clock)
-  Store.audit_tail(db, limit or 50)
+  Store.verify_and_checkpoint(db)
 end
 
-fn get_modb_export(_op: Operator, files: Files, clock: Clock) : Result(
-  Export.PortableSnapshot,
-  MotetError
-)
+fn get_modb_audit(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  principal: Option(Text),
+  action: Option(Text),
+  limit: Option(Int)
+) : Result(List(Ledger.AuditEntry), MotetError)
   db = try ensure_ready(files, clock)
-  Store.export_snapshot(db, clock.now)
+  Store.audit_query(db, principal, action, limit or 50)
+end
+
+fn get_modb_calls(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  limit: Option(Int),
+  principal: Option(Text)
+) : Result(List(Replay.CallRecord), MotetError)
+  db = try ensure_ready(files, clock)
+  Store.list_replay_calls(db, limit or 50, principal)
+end
+
+fn get_modb_export(_op: Operator, files: Files, clock: Clock) : Result(Api.Response, MotetError)
+  db = try ensure_ready(files, clock)
+  snap = try Store.export_snapshot(db, clock.now)
+  Ok(
+    Api.response(
+      200,
+      [("Content-Type", "application/json")],
+      Export.encode_snapshot_json(snap).bytes
+    )
+  )
 end
 
 fn get_modb_describe(op: Operator, files: Files, clock: Clock, grant_id: Option(Text)) : Result(
@@ -1726,16 +1757,32 @@ fn get_modb_claims(_op: Operator, files: Files, clock: Clock) : Result(
   Store.list_active_claims(db, clock.now)
 end
 
-fn get_modb_replay_proposals(_op: Operator, files: Files, clock: Clock) : Result(
-  List(Replay.ReplayProposal),
+fn get_modb_replay_baseline(_op: Operator, files: Files, clock: Clock) : Result(
+  Store.ReplayBaselineStatus,
   MotetError
 )
   db = try ensure_ready(files, clock)
-  Store.list_replay_proposals(db)
+  Store.get_replay_baseline_status(db)
+end
+
+fn post_modb_replay_baseline(_op: Operator, files: Files, clock: Clock) : Result(
+  Store.ReplayBaselineStatus,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.pin_replay_baseline(db)
+end
+
+fn get_modb_replay_proposals(_op: Operator, files: Files, clock: Clock) : Result(
+  List(Store.ReplayProposalView),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_replay_proposal_views(db)
 end
 
 fn post_modb_replay_simulate(op: Operator, files: Files, clock: Clock, body: ReplaySimulateRequest) : Result(
-  Replay.ReplayProposal,
+  Store.ReplayProposalView,
   MotetError
 )
   db = try ensure_ready(files, clock)
@@ -1743,32 +1790,46 @@ fn post_modb_replay_simulate(op: Operator, files: Files, clock: Clock, body: Rep
   filter = case body.exclude_principal
     Some(p) if not p.trim.empty?: Replay.ExcludePrincipal(principal: p.trim)
     Some(_) | None:
-      case body.exclude_seqs
-        Some(seqs) if not seqs.empty?: Replay.ExcludeSeqs(seqs: seqs)
+      case body.exclude_grant
+        Some(g) if not g.trim.empty?: Replay.ExcludeGrant(grant_id: g.trim)
         Some(_) | None:
-          case body.stop_before_seq
-            Some(s): Replay.StopBeforeSeq(seq: s)
-            None: Replay.ReplayAll
+          case body.exclude_seqs
+            Some(seqs) if not seqs.empty?: Replay.ExcludeSeqs(seqs: seqs)
+            Some(_) | None:
+              case body.stop_before_seq
+                Some(s): Replay.StopBeforeSeq(seq: s)
+                None: Replay.ReplayAll
+              end
           end
       end
   end
-  Store.simulate_replay(db, body.id.trim, body.description.trim, filter, op.subject, clock.now)
+  prop = try Store.simulate_replay(
+    db,
+    body.id.trim,
+    body.description.trim,
+    filter,
+    op.subject,
+    clock.now
+  )
+  Ok(Store.proposal_to_view(prop, prop.base_audit_seq, prop.base_call_seq))
 end
 
 fn post_modb_replay_accept(op: Operator, files: Files, clock: Clock, id: Text) : Result(
-  Replay.ReplayProposal,
+  Store.ReplayProposalView,
   MotetError
 )
   db = try ensure_ready(files, clock)
-  Store.accept_replay_proposal(db, id, op.subject, "accepted via API", clock.now)
+  prop = try Store.accept_replay_proposal(db, id, op.subject, "accepted via API", clock.now)
+  Ok(Store.proposal_to_view(prop, prop.base_audit_seq, prop.base_call_seq))
 end
 
 fn post_modb_replay_discard(op: Operator, files: Files, clock: Clock, id: Text) : Result(
-  Replay.ReplayProposal,
+  Store.ReplayProposalView,
   MotetError
 )
   db = try ensure_ready(files, clock)
-  Store.discard_replay_proposal(db, id, op.subject, clock.now)
+  prop = try Store.discard_replay_proposal(db, id, op.subject, clock.now)
+  Ok(Store.proposal_to_view(prop, prop.base_audit_seq, prop.base_call_seq))
 end
 
 ## Receives an external webhook payload with HMAC-SHA256 verification (when configured),
@@ -2407,4 +2468,160 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     srng
   )
   assert mcp_ver.status == 200 and mcp_ver.text.contains?("\"ok?\":true")
+
+  # 11. Filtered Audit, Checkpointed Verify, Baseline, Calls Log, and HTTP Replay Studio lifecycle
+  cp_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/verify/checkpoint").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert cp_resp.status == 200 and
+    Json.decode[ModbVerifySummary](cp_resp.text) is Ok(cpr) and
+    cpr.ok?
+
+  af_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/audit").with_bearer("secret-op").with_query("principal", "operator").with_query(
+      "action",
+      "clone_bot"
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert af_resp.status == 200 and af_resp.text.contains?("clone_bot")
+
+  af_act_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/audit").with_bearer("secret-op").with_query("action", "save_memory"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert af_act_resp.status == 200 and af_act_resp.text.contains?("Hearth Arvo")
+
+  bl_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/replay/baseline").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert bl_resp.status == 200 and bl_resp.text.contains?("\"pinned?\":false")
+
+  bad_mem_save = ApiTest.send(
+    Server,
+    Api.post("/v1/memory").with_bearer("secret-op").with_json(
+      SaveMemoryRequest(
+        scope: "work",
+        kind: "work_log",
+        content: "Temporary mistake to replay-undo",
+        provenance: Some("bot:rogue-worker")
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert bad_mem_save.status == 200
+
+  calls_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/calls").with_bearer("secret-op").with_query("limit", "5"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert calls_resp.status == 200 and
+    Json.decode[List(Replay.CallRecord)](calls_resp.text) is Ok(crecs) and
+    not crecs.empty?
+  target_seq = (crecs.last or stop "last call").seq
+
+  sim_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/replay/simulate").with_bearer("secret-op").with_json(
+      ReplaySimulateRequest(
+        id: "http-undo-mem",
+        description: "Undo mistaken memory save",
+        exclude_principal: None,
+        exclude_grant: None,
+        exclude_seqs: Some([target_seq]),
+        stop_before_seq: None
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert sim_resp.status == 200 and
+    Json.decode[Store.ReplayProposalView](sim_resp.text) is Ok(spv) and
+    spv.summary.excluded == 1 and
+    not spv.stale?
+
+  props_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/replay/proposals").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert props_resp.status == 200 and props_resp.text.contains?("http-undo-mem")
+
+  acc_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/replay/proposals/http-undo-mem/accept").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert acc_resp.status == 200 and acc_resp.text.contains?("accepted")
+
+  mem_after = ApiTest.send(
+    Server,
+    Api.get("/v1/memory").with_bearer("secret-op").with_query("q", "Temporary mistake"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mem_after.status == 200 and mem_after.text == "[]"
+
+  sim_disc = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/replay/simulate").with_bearer("secret-op").with_json(
+      ReplaySimulateRequest(
+        id: "http-discard-me",
+        description: "Dry run to discard",
+        exclude_principal: None,
+        exclude_grant: None,
+        exclude_seqs: None,
+        stop_before_seq: None
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert sim_disc.status == 200
+  disc_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/replay/proposals/http-discard-me/discard").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert disc_resp.status == 200 and disc_resp.text.contains?("discarded")
 end

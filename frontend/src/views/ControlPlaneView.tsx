@@ -828,9 +828,10 @@ export const AnalyticsSystemView: React.FC<{
   health: HealthSummary | null;
   settings: AppSettings | null;
   rules: PolicyRule[];
+  onOpenAuditReplay?: () => void;
   onRefresh: () => Promise<void>;
   toast: (m: string) => void;
-}> = ({ analytics, health, settings, rules, onRefresh, toast }) => {
+}> = ({ analytics, health, settings, rules, onOpenAuditReplay, onRefresh, toast }) => {
   const [tz, setTz] = useState(settings?.timezone || 'America/Los_Angeles');
   const [qStart, setQStart] = useState(settings?.quiet_hours_start || '22:00');
   const [qEnd, setQEnd] = useState(settings?.quiet_hours_end || '07:00');
@@ -1005,6 +1006,11 @@ export const AnalyticsSystemView: React.FC<{
             )}
           </div>
           <div className="flex items-center gap-2">
+            {onOpenAuditReplay && (
+              <Button variant="ghost" size="sm" onClick={onOpenAuditReplay}>
+                Audit &amp; Replay Studio
+              </Button>
+            )}
             <Button variant="ghost" size="sm" onClick={() => loadModb(true)} disabled={verifyingModb}>
               {verifyingModb ? 'Verifying…' : 'Verify Integrity'}
             </Button>

@@ -3,6 +3,10 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import App from './App';
 
 function mockFetch() {
+  let simRun = false;
+  let acceptedRun = false;
+  let grantRevoked = false;
+
   return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     const url = String(input);
     const json = (data: unknown) =>
@@ -112,6 +116,20 @@ function mockFetch() {
         summary_markdown: '# Motet Weekly Self-Audit\n\n- **Total routines:** 4',
       });
     }
+    if (url.includes('/v1/modb/verify/checkpoint')) {
+      return json({
+        'ok?': true,
+        txid: 43,
+        page_count: 19,
+        bucket_count: 20,
+        schema_version: 1,
+        audit_entries: 41,
+        last_audit_hash: 'abcdef1234567890',
+        invariants_checked: 4,
+        call_count: 30,
+        'secrets_ok?': true,
+      });
+    }
     if (url.includes('/v1/modb/verify')) {
       return json({
         'ok?': true,
@@ -132,21 +150,211 @@ function mockFetch() {
           seq: 41,
           txid: 42,
           schema_version: 1,
-          principal: 'operator',
-          action: 'seed_defaults',
-          reason: 'seed default bots',
+          principal: 'bot:researcher',
+          action: 'save_memory',
+          reason: 'save noisy work log',
           at: '2026-11-25T19:00:00Z',
-          summary: 'ok',
-          prev_hash: '0000',
-          entry_hash: 'abcdef1234567890',
+          summary: "execute 'save_memory' (v1)",
+          payload: { scope: 'researcher', kind: 'work_log', content: 'Bad log' },
+          prev_hash: '0000000000000000',
+          entry_hash: 'abcdef1234567890fedcba',
         },
       ]);
     }
+    if (url.includes('/v1/modb/calls')) {
+      return json([
+        {
+          seq: 30,
+          audit_seq: 41,
+          schema_version: 1,
+          principal: 'bot:researcher',
+          grant_id: 'bot:researcher',
+          grant_chain: ['system:motet', 'bot:researcher'],
+          world_id: null,
+          action: 'save_memory',
+          args: { scope: 'researcher', content: 'Bad log' },
+          reason: 'save noisy work log',
+          at: '2026-11-25T19:00:00Z',
+          outcome: { orig_ok: { reply: { id: 9 } } },
+        },
+      ]);
+    }
+    if (url.includes('/v1/modb/replay/baseline')) {
+      return json({
+        'pinned?': true,
+        pin_id: '_modb_replay_baseline',
+        schema_version: 1,
+        txid: 10,
+        pinned_at: '2026-11-25T10:00:00Z',
+        call_count: 30,
+        'can_pin?': false,
+      });
+    }
+    if (url.includes('/v1/modb/replay/simulate')) {
+      simRun = true;
+      return json({
+        id: 'replay-1',
+        description: 'Selective undo simulation',
+        filter: { exclude_principal: { principal: 'bot:researcher' } },
+        base_live_txid: 42,
+        base_audit_seq: 41,
+        base_call_seq: 30,
+        target_schema_version: 1,
+        created_by: 'local',
+        created_at: '2026-11-25T19:05:00Z',
+        status: 'pending',
+        summary: {
+          total_calls: 1,
+          excluded: 1,
+          unchanged: 0,
+          reply_changed: 0,
+          now_refused: 0,
+          now_invariant_blocked: 0,
+          still_refused: 0,
+          now_accepted: 0,
+          migrations_run: [],
+        },
+        outcomes: [{ excluded: { seq: 30, action: 'save_memory', principal: 'bot:researcher' } }],
+        bucket_diffs: [{ bucket: 'memories', added: 0, removed: 1, modified: 0 }],
+        'stale?': false,
+        'uses_delta?': true,
+      });
+    }
+    if (url.includes('/v1/modb/replay/proposals/replay-1/accept')) {
+      acceptedRun = true;
+      return json({
+        id: 'replay-1',
+        description: 'Selective undo simulation',
+        filter: { exclude_principal: { principal: 'bot:researcher' } },
+        base_live_txid: 42,
+        base_audit_seq: 41,
+        base_call_seq: 30,
+        target_schema_version: 1,
+        created_by: 'local',
+        created_at: '2026-11-25T19:05:00Z',
+        status: { accepted: { commit_txid: 44, accepted_by: 'local', accepted_at: '2026-11-25T19:06:00Z' } },
+        summary: {
+          total_calls: 1,
+          excluded: 1,
+          unchanged: 0,
+          reply_changed: 0,
+          now_refused: 0,
+          now_invariant_blocked: 0,
+          still_refused: 0,
+          now_accepted: 0,
+          migrations_run: [],
+        },
+        outcomes: [{ excluded: { seq: 30, action: 'save_memory', principal: 'bot:researcher' } }],
+        bucket_diffs: [{ bucket: 'memories', added: 0, removed: 1, modified: 0 }],
+        'stale?': false,
+        'uses_delta?': true,
+      });
+    }
+    if (url.includes('/v1/modb/replay/proposals')) {
+      if (!simRun) return json([]);
+      return json([
+        {
+          id: 'replay-1',
+          description: 'Selective undo simulation',
+          filter: { exclude_principal: { principal: 'bot:researcher' } },
+          base_live_txid: 42,
+          base_audit_seq: 41,
+          base_call_seq: 30,
+          target_schema_version: 1,
+          created_by: 'local',
+          created_at: '2026-11-25T19:05:00Z',
+          status: acceptedRun
+            ? { accepted: { commit_txid: 44, accepted_by: 'local', accepted_at: '2026-11-25T19:06:00Z' } }
+            : 'pending',
+          summary: {
+            total_calls: 1,
+            excluded: 1,
+            unchanged: 0,
+            reply_changed: 0,
+            now_refused: 0,
+            now_invariant_blocked: 0,
+            still_refused: 0,
+            now_accepted: 0,
+            migrations_run: [],
+          },
+          outcomes: [{ excluded: { seq: 30, action: 'save_memory', principal: 'bot:researcher' } }],
+          bucket_diffs: [{ bucket: 'memories', added: 0, removed: 1, modified: 0 }],
+          'stale?': false,
+          'uses_delta?': true,
+        },
+      ]);
+    }
+    if (url.includes('/v1/modb/grants/bot%3Aresearcher/revoke')) {
+      grantRevoked = true;
+      return json({
+        id: 'bot:researcher',
+        parent_id: null,
+        principal: 'bot:researcher',
+        allowed_actions: ['read', 'write_local'],
+        allowed_views: ['bots', 'memories'],
+        allowed_releases: ['bot_activity_summary'],
+        max_calls: 10000,
+        used_calls: 1,
+        expires_at: '2027-11-25T00:00:00Z',
+        revoked: true,
+        chain: ['system:motet', 'bot:researcher'],
+      });
+    }
     if (url.includes('/v1/modb/grants')) {
-      return json([]);
+      return json([
+        {
+          id: 'bot:researcher',
+          parent_id: null,
+          principal: 'bot:researcher',
+          allowed_actions: ['read', 'write_local'],
+          allowed_views: ['bots', 'memories'],
+          allowed_releases: ['bot_activity_summary'],
+          max_calls: 10000,
+          used_calls: 1,
+          expires_at: '2027-11-25T00:00:00Z',
+          revoked: grantRevoked,
+          chain: ['system:motet', 'bot:researcher'],
+        },
+      ]);
     }
     if (url.includes('/v1/modb/claims')) {
       return json([]);
+    }
+    if (url.includes('/v1/modb/describe')) {
+      return json({
+        txid: 42,
+        schema_version: 1,
+        audit_count: 41,
+        require_reason: true,
+        principal: 'local',
+        role: 'operator',
+        allowed_views: [
+          {
+            name: 'bots',
+            description: 'Active and paused bot configurations',
+            narrows: null,
+            fields: [
+              { name: 'name', field_type: 'text', description: 'Unique bot slug' },
+              { name: 'role', field_type: 'text', description: 'Role title' },
+            ],
+          },
+        ],
+        allowed_releases: [],
+        allowed_actions: [],
+        invariants: [{ name: 'bots_valid', description: 'Valid bots' }],
+        read_limits: { max_rows_scanned: 10000, max_ops: 100000, max_result_rows: 500 },
+      });
+    }
+    if (url.includes('/v1/modb/query')) {
+      return json({
+        view: 'bots',
+        txid: 42,
+        rows_scanned: 2,
+        ops_used: 3,
+        result_count: 2,
+        answer_hash: '1122334455667788',
+        rows: [{ name: 'chief', role: 'Chief of Staff' }],
+      });
     }
     if (url.includes('/v1/analytics')) {
       return json({
@@ -271,6 +479,69 @@ describe('Motet Control Plane Dashboard', () => {
     await waitFor(() => {
       expect(screen.getByText('Dreaming History & Rollback')).toBeInTheDocument();
       expect(screen.getByText('Rollback')).toBeInTheDocument();
+    });
+  });
+
+  it('navigates to Audit & Replay Studio, inspects audit payload, runs offline replay simulation, accepts proposal, revokes grant, and runs sandboxed read query', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('5 bots · 1 inbox')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Audit & Replay'));
+    await waitFor(() => {
+      expect(screen.getByText('Audit Ledger & Replay Studio')).toBeInTheDocument();
+      expect(screen.getByText('save_memory')).toBeInTheDocument();
+    });
+
+    // Click audit entry to inspect payload and pivot into Replay Studio
+    fireEvent.click(screen.getByText('save_memory'));
+    await waitFor(() => {
+      expect(screen.getByText('Audit Entry #41 · save_memory')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText(/Exclude bot:researcher in Replay Studio/));
+
+    // Verify Replay Studio call log + run offline simulation + confirm atomic acceptance
+    await waitFor(() => {
+      expect(screen.getByText('Persisted Replay Calls (1)')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Simulate Offline Replay'));
+    await waitFor(() => {
+      expect(screen.getByText('Accept Atomically')).toBeInTheDocument();
+      expect(screen.getByText('O(diff) delta')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Accept Atomically'));
+    await waitFor(() => {
+      expect(screen.getByText('Adopt Replay Proposal: replay-1')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Confirm Atomic Replace'));
+    await waitFor(() => {
+      expect(screen.getByText('accepted @tx#44')).toBeInTheDocument();
+    });
+
+    // Grants & Claims tab
+    fireEvent.click(screen.getByRole('button', { name: 'Grants & Claims' }));
+    await waitFor(() => {
+      expect(screen.getByText('Attenuated Bot Grants (1)')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Revoke'));
+    await waitFor(() => {
+      expect(screen.getByText('Confirm Revoke (Cascading)')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Confirm Revoke (Cascading)'));
+    await waitFor(() => {
+      expect(screen.getByText('revoked')).toBeInTheDocument();
+    });
+
+    // Views & Read Explorer tab
+    fireEvent.click(screen.getByText('Views & Read Explorer'));
+    await waitFor(() => {
+      expect(screen.getByText('Zero-Approval Sandboxed ReadProgram Explorer')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Run Query'));
+    await waitFor(() => {
+      expect(screen.getByText('2 rows returned')).toBeInTheDocument();
     });
   });
 });

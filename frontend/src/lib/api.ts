@@ -312,6 +312,7 @@ export interface ModbAuditEntry {
   reason: string;
   at: string;
   summary: string;
+  payload?: unknown;
   prev_hash: string;
   entry_hash: string;
 }
@@ -321,10 +322,13 @@ export interface ModbGrant {
   parent_id?: string | null;
   principal: string;
   allowed_actions: string[];
+  allowed_views?: string[] | null;
+  allowed_releases?: string[] | null;
   max_calls: number;
   used_calls: number;
   expires_at: string;
   revoked: boolean;
+  chain?: string[];
 }
 
 export interface ModbClaim {
@@ -334,6 +338,102 @@ export interface ModbClaim {
   reason: string;
   acquired_at: string;
   expires_at: string;
+}
+
+export interface ModbCallRecord {
+  seq: number;
+  audit_seq?: number | null;
+  schema_version: number;
+  principal: string;
+  grant_id?: string | null;
+  grant_chain: string[];
+  world_id?: string | null;
+  action: string;
+  args: unknown;
+  reason: string;
+  at: string;
+  outcome: unknown;
+}
+
+export interface ModbReplayBaselineStatus {
+  'pinned?': boolean;
+  pin_id?: string | null;
+  schema_version: number;
+  txid: number;
+  pinned_at?: string | null;
+  call_count: number;
+  'can_pin?': boolean;
+}
+
+export interface ModbBucketRowDiff {
+  bucket: string;
+  added: number;
+  removed: number;
+  modified: number;
+}
+
+export interface ModbReplaySummary {
+  total_calls: number;
+  excluded: number;
+  unchanged: number;
+  reply_changed: number;
+  now_refused: number;
+  now_invariant_blocked: number;
+  still_refused: number;
+  now_accepted: number;
+  migrations_run: number[];
+}
+
+export interface ModbReplayProposal {
+  id: string;
+  description: string;
+  filter: unknown;
+  base_live_txid: number;
+  base_audit_seq: number;
+  base_call_seq: number;
+  target_schema_version: number;
+  created_by: string;
+  created_at: string;
+  status: unknown;
+  summary: ModbReplaySummary;
+  outcomes: unknown[];
+  bucket_diffs: ModbBucketRowDiff[];
+  'stale?': boolean;
+  'uses_delta?': boolean;
+}
+
+export interface ModbDescribeManifest {
+  txid: number;
+  schema_version: number;
+  audit_count: number;
+  require_reason: boolean;
+  principal: string;
+  role: string;
+  allowed_views: Array<{
+    name: string;
+    description: string;
+    narrows?: string | null;
+    fields: Array<{ name: string; field_type: string; description: string }>;
+  }>;
+  allowed_releases: Array<{
+    name: string;
+    description: string;
+    min_group_size: number;
+    args_description: string;
+  }>;
+  allowed_actions: Array<{ name: string; description: string; args_hint: string }>;
+  invariants: Array<{ name: string; description: string }>;
+  read_limits: { max_rows_scanned: number; max_ops: number; max_result_rows: number };
+}
+
+export interface ModbReadResult {
+  view: string;
+  txid: number;
+  rows_scanned: number;
+  ops_used: number;
+  result_count: number;
+  answer_hash: string;
+  rows: unknown[];
 }
 
 export function getStoredToken(): string {

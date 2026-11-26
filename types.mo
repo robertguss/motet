@@ -625,6 +625,7 @@ struct ReplaySimulateRequest
   id: Text
   description: Text
   exclude_principal: Option(Text)
+  exclude_grant: Option(Text)
   exclude_seqs: Option(List(Int))
   stop_before_seq: Option(Int)
 end

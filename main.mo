@@ -4,9 +4,9 @@ module Main
 use Brain
 use Command
 use Http
-use Json
 use Llm{LlmMessage, build_http_request}
 use Mcp{parse_host_port}
+use Modb.Export
 use Skills
 use Store
 use Telegram
@@ -535,7 +535,7 @@ end
 fn cmd_export(db: Store.DbHandle, clock: Clock, console: Console) : Int
   case Store.export_snapshot(db, clock.now)
     Ok(snap):
-      console.print(Json.encode(snap))
+      console.print(Export.encode_snapshot_json(snap))
       0
     Error(err): print_err(console, err)
   end

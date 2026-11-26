@@ -15,6 +15,7 @@ import {
   Plug,
   Radio,
   RefreshCw,
+  ShieldCheck,
   Sun,
 } from 'lucide-react';
 import {
@@ -56,6 +57,7 @@ import {
   SessionsView,
   VaultSecretsView,
 } from './views/ControlPlaneView';
+import { AuditReplayView } from './views/AuditReplayView';
 
 export type NavView =
   | 'chat'
@@ -70,7 +72,8 @@ export type NavView =
   | 'channels'
   | 'memory'
   | 'sessions'
-  | 'analytics';
+  | 'analytics'
+  | 'audit_replay';
 
 interface NavGroup {
   label: string;
@@ -109,6 +112,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: 'memory', label: 'Memory & Dreaming', icon: Brain },
       { id: 'sessions', label: 'Sessions', icon: History },
       { id: 'analytics', label: 'Analytics & System', icon: Activity },
+      { id: 'audit_replay', label: 'Audit & Replay', icon: ShieldCheck },
     ],
   },
 ];
@@ -379,9 +383,13 @@ export default function App() {
                     health={health}
                     settings={settings}
                     rules={rules}
+                    onOpenAuditReplay={() => setView('audit_replay')}
                     onRefresh={refreshAll}
                     toast={toast}
                   />
+                )}
+                {view === 'audit_replay' && (
+                  <AuditReplayView onRefresh={refreshAll} toast={toast} />
                 )}
               </div>
             </div>
