@@ -23,6 +23,7 @@ import {
   SessionEvent,
   SessionSummary,
 } from '../lib/api';
+import { streamPostSse } from '../lib/sse';
 import { Badge, Button, Card, Field, inputCls, MarkdownView } from '../components/ui';
 
 interface ChatStudioProps {
@@ -58,6 +59,17 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
   const [secVal, setSecVal] = useState('');
   const [secScope, setSecScope] = useState('llm');
   const [draftEdits, setDraftEdits] = useState<Record<number, string>>({});
+  const [fastStream, setFastStream] = useState(false);
+  const [streamingPrompt, setStreamingPrompt] = useState<string | null>(null);
+  const [streamingReply, setStreamingReply] = useState('');
+  const streamAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => {
+      streamAbortRef.current?.abort();
+      streamAbortRef.current = null;
+    };
+  }, [activeBot]);
   const [denyReasons, setDenyReasons] = useState<Record<number, string>>({});
   const [alwaysAllowMap, setAlwaysAllowMap] = useState<Record<number, boolean>>({});
   const [resolvingId, setResolvingId] = useState<number | null>(null);
@@ -158,8 +170,70 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
   async function handleSend(e: React.FormEvent) {
     e.preventDefault();
     const text = prompt.trim();
-    if (!text || !bot) return;
+    if (!text || !bot || streamingPrompt !== null) return;
     setPrompt('');
+
+    if (fastStream) {
+      const ac = new AbortController();
+      streamAbortRef.current = ac;
+      let targetSid = sessionId || '';
+      setStreamingPrompt(text);
+      setStreamingReply('');
+      try {
+        const finalText = await streamPostSse(
+          `/v1/bots/${encodeURIComponent(bot.name)}/stream`,
+          {
+            prompt: text,
+            session_id: sessionId || null,
+          },
+          {
+            signal: ac.signal,
+            onStart: (meta) => {
+              if (typeof meta.session_id === 'string' && meta.session_id) {
+                targetSid = meta.session_id;
+                setSessionId(meta.session_id);
+              }
+            },
+            onToken: (_delta, full) => {
+              setStreamingReply(full);
+            },
+          }
+        );
+        const commitSid = targetSid || `${bot.name}-main`;
+        await api(`/v1/sessions/${encodeURIComponent(commitSid)}/stream-commit`, {
+          method: 'POST',
+          body: JSON.stringify({
+            prompt: text,
+            reply: finalText,
+            bot_name: bot.name,
+          }),
+        });
+        const delta = await api<SessionEvent[]>(
+          `/v1/sessions/${encodeURIComponent(commitSid)}/events?after_seq=${lastSeqRef.current}`
+        );
+        if (delta.length) {
+          setEvents((prev) => {
+            const seen = new Set(prev.map((ev) => ev.seq));
+            const merged = [...prev, ...delta.filter((d) => !seen.has(d.seq))];
+            lastSeqRef.current = merged[merged.length - 1]?.seq ?? lastSeqRef.current;
+            return merged;
+          });
+        }
+        await onRefresh();
+      } catch (err) {
+        if (!ac.signal.aborted) {
+          toast((err as Error).message);
+        }
+      } finally {
+        if (streamAbortRef.current === ac) {
+          streamAbortRef.current = null;
+        }
+        setStreamingPrompt(null);
+        setStreamingReply('');
+      }
+      return;
+    }
+
     try {
       const run = await api<BotRun>(`/v1/bots/${encodeURIComponent(bot.name)}/runs`, {
         method: 'POST',
@@ -293,7 +367,33 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
             </button>
           ))}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <div className="inline-flex rounded-lg border border-[var(--border)] bg-[var(--card)] p-0.5 text-xs">
+            <button
+              type="button"
+              onClick={() => setFastStream(false)}
+              className={`px-2 py-1 rounded-md font-semibold border-none cursor-pointer transition ${
+                !fastStream
+                  ? 'bg-[var(--accent)] text-white'
+                  : 'bg-transparent text-[var(--fg-muted)] hover:text-[var(--fg)]'
+              }`}
+              title="Run background agent turns with tool execution & Needs-You approvals"
+            >
+              Agent Tools
+            </button>
+            <button
+              type="button"
+              onClick={() => setFastStream(true)}
+              className={`px-2 py-1 rounded-md font-semibold border-none cursor-pointer transition ${
+                fastStream
+                  ? 'bg-[var(--accent)] text-white'
+                  : 'bg-transparent text-[var(--fg-muted)] hover:text-[var(--fg)]'
+              }`}
+              title="Stream pure-text tokens live via SseRelay off worker threads"
+            >
+              Fast Stream
+            </button>
+          </div>
           <select
             className="rounded-lg border border-[var(--border)] bg-[var(--card)] px-2.5 py-1 text-xs text-[var(--fg)] max-w-[200px]"
             value={sessionId}
@@ -461,6 +561,32 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
                 </div>
               );
             })}
+
+            {/* Live Token-by-Token Fast Stream Preview */}
+            {streamingPrompt !== null && (
+              <>
+                <div className="self-end max-w-[85%] rounded-2xl rounded-br-sm bg-[var(--accent)] text-white px-4 py-2.5 text-sm whitespace-pre-wrap break-words">
+                  {streamingPrompt}
+                </div>
+                <div className="self-start max-w-[90%] rounded-2xl rounded-bl-sm border border-[var(--accent)] bg-[var(--card)] px-4 py-3 flex flex-col gap-2">
+                  <div className="flex items-center justify-between gap-3 text-xs text-[var(--fg-muted)]">
+                    <span className="inline-flex items-center gap-1.5 font-semibold text-[var(--accent-hover)]">
+                      <Sparkles className="w-3.5 h-3.5 animate-pulse" />
+                      Streaming tokens…
+                    </span>
+                    <Button
+                      variant="bad"
+                      size="sm"
+                      onClick={() => streamAbortRef.current?.abort()}
+                    >
+                      <Square className="w-3 h-3" />
+                      <span>Stop</span>
+                    </Button>
+                  </div>
+                  <MarkdownView content={streamingReply || '…'} />
+                </div>
+              </>
+            )}
 
             {/* Single Live Progress Draft Block with Mid-Run Steering */}
             {isRunning && activeRun && (
@@ -653,9 +779,9 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
                 }
               }}
             />
-            <Button type="submit" disabled={!prompt.trim() || !!isRunning}>
+            <Button type="submit" disabled={!prompt.trim() || !!isRunning || streamingPrompt !== null}>
               <Send className="w-4 h-4" />
-              <span>Send</span>
+              <span>{fastStream ? 'Stream' : 'Send'}</span>
             </Button>
           </form>
         </div>

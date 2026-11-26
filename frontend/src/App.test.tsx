@@ -641,6 +641,12 @@ function mockFetch() {
         ],
       });
     }
+    if (url.includes('/v1/events/stream')) {
+      return new Response('event: health\ndata: {"status":"ok"}\n\n', {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }
     return json([]);
   });
 }

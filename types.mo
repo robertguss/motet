@@ -94,7 +94,9 @@ trust_from_text,
 decision_to_text,
 decision_from_text,
 approval_status_to_text,
-approval_status_from_text
+approval_status_from_text,
+StreamBotRequest(..),
+StreamCommitRequest(..)
 use Json
 
 enum ProviderKind
@@ -917,4 +919,17 @@ fn approval_status_from_text(s: Text) : ApprovalStatus
   else
     Pending
   end
+end
+
+## Request body for `POST /v1/bots/:name/stream` token-by-token SSE streaming.
+struct StreamBotRequest
+  prompt: Text
+  session_id: Option(Text)
+end
+
+## Request body for `POST /v1/sessions/:id/stream-commit` persisting streamed turns.
+struct StreamCommitRequest
+  prompt: Text
+  reply: Text
+  bot_name: Text
 end

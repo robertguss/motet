@@ -12,6 +12,8 @@ EmbedTask(..),
 EmbedProvider(..),
 EmbedConfig(..),
 build_http_request,
+resolve_gemini_stream_url,
+build_stream_relay,
 chat_turn,
 chat_turn_with_key,
 resolve_embed_config,
@@ -19,6 +21,7 @@ build_embed_request,
 build_batch_embed_request,
 embed_text,
 embed_batch
+use Api
 use Http
 use Json
 use Mcp{parse_host_port}
@@ -465,6 +468,125 @@ fn parse_gemini_response(doc: Json) : Result(LlmResponse, MotetError)
       cached_input_tokens: cached_toks
     )
   )
+end
+
+## Resolves Gemini's `streamGenerateContent?alt=sse` endpoint URL cleanly.
+fn resolve_gemini_stream_url(endpoint: Text, model: Text) : Text
+  trimmed = endpoint.trim
+  if trimmed.contains?(":streamGenerateContent")
+    if trimmed.contains?("alt=sse")
+      trimmed
+    else if trimmed.contains?("?")
+      "#{trimmed}&alt=sse"
+    else
+      "#{trimmed}?alt=sse"
+    end
+  else if trimmed.contains?(":generateContent")
+    base_ep = trimmed.replace(":generateContent", ":streamGenerateContent")
+    if base_ep.contains?("alt=sse")
+      base_ep
+    else if base_ep.contains?("?")
+      "#{base_ep}&alt=sse"
+    else
+      "#{base_ep}?alt=sse"
+    end
+  else
+    clean = case trimmed.drop_suffix("/")
+      Some(s): s
+      None: trimmed
+    end
+    base = if clean.empty?
+      "https://generativelanguage.googleapis.com/v1beta/models"
+    else
+      clean
+    end
+    "#{base}/#{model.trim}:streamGenerateContent?alt=sse"
+  end
+end
+
+fn with_stream_flag(payload: Json) : Json
+  case payload
+    Json.Object(m): Json.Object(m.set("stream", Json.Boolean(true)))
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): payload
+  end
+end
+
+## Builds an outbound `Api.SseRelay` directive for pure-text token-by-token streaming
+## off the Mo worker pool (`openai_sse`, `anthropic_sse`, or `raw` Gemini `alt=sse`).
+fn build_stream_relay(
+  bot: BotConfig,
+  api_key: Text,
+  tiers: PromptTiers,
+  messages: List(LlmMessage)
+) : Result(Api.SseRelay, MotetError)
+  clean_key = api_key.trim
+  if not bot.api_key_env.trim.empty? and clean_key.empty? and bot.model_tier != "local"
+    return Error(
+      UpstreamFailed(
+        message: "missing API key '#{bot.api_key_env}' in Vault or Env for bot #{bot.name}"
+      )
+    )
+  end
+  case bot.provider
+    OpenAiCompat:
+      payload = with_stream_flag(build_openai_payload(bot, tiers, messages, []))
+      var hdrs = [("content-type", "application/json")]
+      if not clean_key.empty?
+        hdrs = hdrs.append(("authorization", "Bearer #{clean_key}"))
+      end
+      Ok(
+        Api.SseRelay(
+          method: "POST",
+          url: bot.endpoint,
+          headers: hdrs,
+          body: Json.encode(payload),
+          mode: "openai_sse",
+          idle_timeout_ms: 90000,
+          token_event: Some("ai.token"),
+          done_event: Some("ai.done"),
+          done_data: Some("{\"done\":true}"),
+          error_event: Some("ai.error")
+        )
+      )
+    Anthropic:
+      payload = with_stream_flag(build_anthropic_payload(bot, tiers, messages, []))
+      hdrs = [
+        ("content-type", "application/json"),
+        ("x-api-key", clean_key),
+        ("anthropic-version", "2023-06-01")
+      ]
+      Ok(
+        Api.SseRelay(
+          method: "POST",
+          url: bot.endpoint,
+          headers: hdrs,
+          body: Json.encode(payload),
+          mode: "anthropic_sse",
+          idle_timeout_ms: 90000,
+          token_event: Some("ai.token"),
+          done_event: Some("ai.done"),
+          done_data: Some("{\"done\":true}"),
+          error_event: Some("ai.error")
+        )
+      )
+    Gemini:
+      payload = build_gemini_payload(tiers, messages, [])
+      hdrs = [("content-type", "application/json"), ("x-goog-api-key", clean_key)]
+      Ok(
+        Api.SseRelay(
+          method: "POST",
+          url: resolve_gemini_stream_url(bot.endpoint, bot.model),
+          headers: hdrs,
+          body: Json.encode(payload),
+          mode: "raw",
+          idle_timeout_ms: 90000,
+          token_event: None,
+          done_event: Some("ai.done"),
+          done_data: Some("{\"done\":true}"),
+          error_event: Some("ai.error")
+        )
+      )
+  end
 end
 
 fn build_http_request(
@@ -1049,4 +1171,85 @@ test "Gemini and OpenAI neural embedding adapters resolve priority, normalize MR
   assert embed_batch(net, clock, cfg4_oai, ["first", "second"], EmbedDocument) is Ok(obv)
   assert ((obv.first or []).first or 0.0) > 0.999
   assert ((obv.get(1) or []).get(1) or 0.0) > 0.999
+end
+
+test "build_stream_relay produces valid OpenAI, Anthropic, and Gemini SSE relay specs"
+  tiers = PromptTiers(stable: "S", context: "C", volatile: "V")
+  msgs = [UserMsg(content: "Hello stream")]
+
+  oai_bot = BotConfig(
+    name: "scout",
+    role: "Research",
+    persona: "Scout",
+    is_primary?: false,
+    model_tier: "grok",
+    provider: OpenAiCompat,
+    endpoint: "https://api.x.ai/v1/chat/completions",
+    api_key_env: "XAI_API_KEY",
+    model: "grok-4",
+    workspace: ".",
+    allowed_programs: [],
+    allowed_hosts: ["api.x.ai:443"],
+    connectors: [],
+    read_only_connectors: [],
+    daily_budget_usd: 5.0,
+    max_steps: 8,
+    active?: true
+  )
+  assert build_stream_relay(oai_bot, "sk-xai", tiers, msgs) is Ok(roai)
+  assert roai.method == "POST" and
+    roai.mode == "openai_sse" and
+    roai.token_event == Some("ai.token") and
+    roai.done_event == Some("ai.done") and
+    roai.body.contains?("\"stream\":true")
+
+  ant_bot = BotConfig(
+    name: "chief",
+    role: "Chief",
+    persona: "Chief",
+    is_primary?: true,
+    model_tier: "claude",
+    provider: Anthropic,
+    endpoint: "https://api.anthropic.com/v1/messages",
+    api_key_env: "ANTHROPIC_API_KEY",
+    model: "claude-sonnet-4-5",
+    workspace: ".",
+    allowed_programs: [],
+    allowed_hosts: ["api.anthropic.com:443"],
+    connectors: [],
+    read_only_connectors: [],
+    daily_budget_usd: 10.0,
+    max_steps: 8,
+    active?: true
+  )
+  assert build_stream_relay(ant_bot, "sk-ant", tiers, msgs) is Ok(rant)
+  assert rant.mode == "anthropic_sse" and
+    rant.body.contains?("\"stream\":true") and
+    rant.headers.any?(fn(h) h.0 == "x-api-key" and h.1 == "sk-ant" end)
+
+  gem_bot = BotConfig(
+    name: "fin",
+    role: "Finance",
+    persona: "Finance",
+    is_primary?: false,
+    model_tier: "gemini",
+    provider: Gemini,
+    endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
+    api_key_env: "GEMINI_API_KEY",
+    model: "gemini-2.5-flash",
+    workspace: ".",
+    allowed_programs: [],
+    allowed_hosts: ["generativelanguage.googleapis.com:443"],
+    connectors: [],
+    read_only_connectors: [],
+    daily_budget_usd: 3.0,
+    max_steps: 8,
+    active?: true
+  )
+  assert build_stream_relay(gem_bot, "gem-k", tiers, msgs) is Ok(rgem)
+  assert rgem.mode == "raw" and
+    rgem.url == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse" and
+    rgem.token_event == None and
+    rgem.headers.any?(fn(h) h.0 == "x-goog-api-key" and h.1 == "gem-k" end)
+  assert build_stream_relay(gem_bot, "   ", tiers, msgs) is Error(_)
 end

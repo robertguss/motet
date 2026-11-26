@@ -40,6 +40,7 @@ import {
   VaultSecretMeta,
   WebhookConfig,
 } from './lib/api';
+import { subscribeSse } from './lib/sse';
 import { Badge, Button } from './components/ui';
 import { ChatStudioView } from './views/ChatStudioView';
 import { BotsView, InboxView } from './views/InboxAndBotsView';
@@ -127,6 +128,7 @@ export default function App() {
   );
   const [activeBot, setActiveBot] = useState<string>('chief');
   const [toastMsg, setToastMsg] = useState<string>('');
+  const [sseConnected, setSseConnected] = useState(false);
 
   const [health, setHealth] = useState<HealthSummary | null>(null);
   const [bots, setBots] = useState<BotConfig[]>([]);
@@ -225,8 +227,19 @@ export default function App() {
     const id = window.setInterval(() => {
       if (document.hidden) return;
       refreshAll();
-    }, 30000);
-    return () => window.clearInterval(id);
+    }, 60000);
+    const unsubSse = subscribeSse('/v1/events/stream', {
+      onStatus: (connected) => setSseConnected(connected),
+      onEvent: (ev) => {
+        if (ev.event !== 'health') {
+          void refreshAll();
+        }
+      },
+    });
+    return () => {
+      window.clearInterval(id);
+      unsubSse();
+    };
   }, [refreshAll, toast]);
 
   const pendingCount = inbox.filter((i) => i.status === 'pending').length;
@@ -249,6 +262,9 @@ export default function App() {
               : 'offline / auth required'}
           </Badge>
           {health?.queued_runs ? <Badge tone="accent">{health.queued_runs} running</Badge> : null}
+          <Badge tone={sseConnected ? 'ok' : 'warn'}>
+            {sseConnected ? 'Live' : 'Reconnecting'}
+          </Badge>
         </div>
         <div className="flex items-center gap-2">
           <Button variant="ghost" size="sm" onClick={refreshAll} title="Refresh state">

@@ -39,7 +39,6 @@ use Types{
   AnalyticsSummary,
   AppSettings,
   ApprovalItem,
-  ApprovalResolution,
   ArtifactItem,
   AskRequest,
   BotConfig,
@@ -98,9 +97,10 @@ use Types{
   TelegramConfig,
   TelegramTestResult,
   TickSummary,
+  StreamBotRequest,
+  StreamCommitRequest,
   ToggleRequest,
   TrustLevel,
-  TurnReply,
   VaultFileReadResponse,
   VaultFileWriteRequest,
   VaultSearchResponse,
@@ -154,6 +154,7 @@ api
   get "/v1/bots/:name/canonical" get_bot_canonical
   post "/v1/bots/:name/ask" post_ask_bot
   post "/v1/bots/:name/runs" post_enqueue_run
+  post "/v1/bots/:name/stream" post_stream_bot
 
   get "/v1/runs" get_runs
   get "/v1/runs/:id" get_run_by_id
@@ -163,6 +164,7 @@ api
   get "/v1/sessions/search" get_search_sessions
   get "/v1/sessions/search/scored" get_search_sessions_scored
   get "/v1/sessions/:id/events" get_session_events
+  post "/v1/sessions/:id/stream-commit" post_session_stream_commit
 
   get "/v1/inbox" get_inbox
   post "/v1/inbox/dismiss-all" post_dismiss_all_inbox
@@ -272,6 +274,7 @@ api
   get "/v1/modb/feeds" get_modb_feeds
   post "/v1/modb/feeds" post_modb_feeds
   get "/v1/modb/feeds/:id/poll" get_modb_feed_poll
+  get "/v1/modb/feeds/:id/stream" get_modb_feed_stream
   post "/v1/modb/feeds/:id/ack" post_modb_feed_ack
   post "/v1/modb/feeds/:id/consume" post_modb_feed_consume
   post "/v1/modb/feeds/:id/resync" post_modb_feed_resync
@@ -312,6 +315,56 @@ fn ensure_ready(files: Files, clock: Clock) : Result(Store.DbHandle, MotetError)
     try Store.ensure_seeded(db, clock.now.to_text)
   end
   Ok(db)
+end
+
+fn req_last_event_id(req: Api.Request) : Option(Text)
+  case req.header("Last-Event-ID")
+    Some(v): Some(v)
+    None: req.header("last-event-id")
+  end
+end
+
+fn publish_motet_events(
+  res: Api.Response,
+  events: List((Text, Text)),
+  buckets: List(Text),
+  action: Text,
+  payload: Json
+) : Api.Response
+  var out = res
+  for (topic, ev_name) in events
+    out = Api.with_sse_publish_json(out, topic, ev_name, payload)
+  end
+  sig = Feeds.commit_signal_json(0, buckets, action)
+  var pub_wild? = false
+  for b in buckets
+    clean = b.trim
+    if not clean.empty?
+      out = Api.with_sse_publish_json(out, Feeds.bucket_topic(clean), "feed.delta", sig)
+      if clean != Feeds.feeds_bucket and clean != "_modb_pins"
+        pub_wild? = true
+      end
+    end
+  end
+  if pub_wild?
+    out = Api.with_sse_publish_json(out, "bucket:*", "feed.delta", sig)
+  end
+  out
+end
+
+fn json_motet_sse(
+  val: T,
+  events: List((Text, Text)),
+  buckets: List(Text),
+  action: Text
+) : Api.Response where T: Json
+  publish_motet_events(
+    Api.json_response(200, val),
+    events,
+    buckets,
+    action,
+    Json.Object({"action": action.to_json})
+  )
 end
 
 ## Background worker job: drains queued async BotRuns every second inside `mo serve`.
@@ -633,14 +686,23 @@ fn post_ask_bot(
   clock: Clock,
   name: Text,
   body: AskRequest
-) : Result(TurnReply, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  if body.use_canonical or false
+  turn_res = if body.use_canonical or false
     Brain.run_turn_canonical(rt, db, name, body.session_id, Owner, false, body.message)
   else
     Brain.run_turn(rt, db, name, body.session_id, Owner, false, body.message)
   end
+  rep = try turn_res
+  Ok(
+    json_motet_sse(
+      rep,
+      [("motet", "session.updated"), ("sessions", "event.appended"), ("inbox", "inbox.updated")],
+      ["events", "sessions", "approvals"],
+      "ask_bot"
+    )
+  )
 end
 
 ## Enqueues a non-blocking async BotRun (drained by `motet.runs` job or `motet watch`).
@@ -651,7 +713,7 @@ fn post_enqueue_run(
   srng: SecureRandom,
   name: Text,
   body: EnqueueRunRequest
-) : Result(BotRun, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
   bot = try (try Store.get_bot(db, name)).or_fail(ItemNotFound(message: "unknown bot: #{name}"))
   return Error(BadInput(message: "bot #{bot.name} is inactive")) if not bot.active?
@@ -672,7 +734,81 @@ fn post_enqueue_run(
       end
   end
   run_id = "run-#{bot.name}-#{srng.bytes(6).to_hex}"
-  Store.enqueue_run(db, run_id, bot.name, session_id, Owner, false, body.message.trim, now_text)
+  run = try Store.enqueue_run(
+    db,
+    run_id,
+    bot.name,
+    session_id,
+    Owner,
+    false,
+    body.message.trim,
+    now_text
+  )
+  Ok(
+    json_motet_sse(
+      run,
+      [("motet", "run.queued"), ("runs", "run.queued"), ("sessions", "session.updated")],
+      ["bot_runs", "sessions"],
+      "enqueue_run"
+    )
+  )
+end
+
+## Starts an off-worker outbound SSE relay (`SseRelay`) for token-by-token bot responses.
+fn post_stream_bot(
+  _op: Operator,
+  files: Files,
+  env: Env,
+  clock: Clock,
+  srng: SecureRandom,
+  name: Text,
+  body: StreamBotRequest
+) : Result(Api.Response, MotetError)
+  db = try ensure_ready(files, clock)
+  bot = try (try Store.get_bot(db, name)).or_fail(ItemNotFound(message: "unknown bot: #{name}"))
+  return Error(BadInput(message: "bot #{bot.name} is inactive")) if not bot.active?
+  clean_prompt = body.prompt.trim
+  return Error(BadInput(message: "prompt cannot be empty")) if clean_prompt.empty?
+  now_text = clock.now.to_text
+  session_id = case body.session_id
+    Some(sid) if not sid.trim.empty?:
+      clean_sid = sid.trim
+      case try Store.get_session(db, clean_sid)
+        Some(_): clean_sid
+        None:
+          _s = try Store.create_session(db, clean_sid, bot.name, clean_prompt, Owner, now_text)
+          clean_sid
+      end
+    Some(_) | None:
+      canon = try Store.get_or_create_canonical_session(db, bot.name, now_text)
+      canon.id
+  end
+  prior = try Brain.load_prior_messages(db, session_id)
+  tiers = try Brain.build_prompt_tiers(db, files.read_only, bot, Owner, now_text)
+  api_key = (try Store.resolve_secret(db, env, bot.api_key_env)) or ""
+  relay = try Llm.build_stream_relay(
+    bot,
+    api_key,
+    tiers,
+    prior.append(Llm.UserMsg(content: clean_prompt))
+  )
+  stream_id = "stream-#{bot.name}-#{srng.bytes(4).to_hex}"
+  start_meta = Json.Object({
+    "session_id": session_id.to_json,
+    "bot_name": bot.name.to_json,
+    "provider": bot.provider.to_json,
+    "model": bot.model.to_json,
+    "stream_id": stream_id.to_json
+  })
+  Ok(
+    publish_motet_events(
+      Api.sse_relay_stream([(Some("ai.start"), Json.encode(start_meta))], relay),
+      [("motet", "ai.stream_started"), ("sessions", "session.touched")],
+      [],
+      "stream_bot",
+      start_meta
+    )
+  )
 end
 
 ## Lists recent async bot runs (optionally filtered by bot name).
@@ -695,7 +831,7 @@ end
 
 ## Sends a live steering instruction (`steer`, `followup`, or `interrupt`) to an active BotRun.
 fn post_steer_run(_op: Operator, files: Files, clock: Clock, id: Text, body: SteerRunRequest) : Result(
-  BotRun,
+  Api.Response,
   MotetError
 )
   db = try ensure_ready(files, clock)
@@ -703,7 +839,8 @@ fn post_steer_run(_op: Operator, files: Files, clock: Clock, id: Text, body: Ste
   if mode != "steer" and mode != "followup" and mode != "interrupt" and mode != "cancel"
     return Error(BadInput(message: "steer mode must be steer, followup, or interrupt"))
   end
-  Store.append_run_steer(db, id, mode, body.message or "", clock.now.to_text)
+  run = try Store.append_run_steer(db, id, mode, body.message or "", clock.now.to_text)
+  Ok(json_motet_sse(run, [("motet", "run.steered"), ("runs", "run.steered")], ["bot_runs"], "steer_run"))
 end
 
 ## Lists recent conversation sessions, optionally filtered by bot name (canonical chats first).
@@ -760,6 +897,65 @@ fn get_session_events(
   end
 end
 
+## Persists completed user prompt + assistant streamed reply into session event history and notifies SSE listeners.
+fn post_session_stream_commit(
+  _op: Operator,
+  files: Files,
+  network: Network,
+  env: Env,
+  clock: Clock,
+  id: Text,
+  body: StreamCommitRequest
+) : Result(Api.Response, MotetError)
+  db = try ensure_ready(files, clock)
+  clean_id = id.trim
+  clean_prompt = body.prompt.trim
+  return Error(BadInput(message: "prompt cannot be empty")) if clean_prompt.empty?
+  _sess = try (try Store.get_session(db, clean_id)).or_fail(
+    ItemNotFound(message: "unknown session: #{clean_id}")
+  )
+  now_text = clock.now.to_text
+  ev_u = try Store.append_event(
+    db,
+    clean_id,
+    "message",
+    "user",
+    clean_prompt,
+    None,
+    None,
+    0.0,
+    now_text
+  )
+  Store.sync_event_neural_embedding(db, network, env, ev_u)
+  ev_a = try Store.append_event(
+    db,
+    clean_id,
+    "message",
+    "assistant",
+    body.reply,
+    None,
+    None,
+    0.0,
+    now_text
+  )
+  Store.sync_event_neural_embedding(db, network, env, ev_a)
+  res_obj = Json.Object({
+    "session_id": clean_id.to_json,
+    "bot_name": body.bot_name.to_json,
+    "user_event": ev_u.to_json,
+    "assistant_event": ev_a.to_json
+  })
+  Ok(
+    publish_motet_events(
+      Api.json_response(200, res_obj),
+      [("motet", "session.updated"), ("sessions", "event.appended")],
+      ["events"],
+      "stream_commit",
+      res_obj
+    )
+  )
+end
+
 ## Lists Needs-You approval inbox items (defaults to pending items when `pending=true`).
 fn get_inbox(_op: Operator, files: Files, clock: Clock, pending: Option(Bool)) : Result(
   List(ApprovalItem),
@@ -771,12 +967,19 @@ end
 
 ## Dismisses all pending Needs-You approvals in bulk without executing them.
 fn post_dismiss_all_inbox(_op: Operator, files: Files, clock: Clock) : Result(
-  BulkActionResult,
+  Api.Response,
   MotetError
 )
   db = try ensure_ready(files, clock)
   count = try Store.dismiss_all_pending_approvals(db)
-  Ok(BulkActionResult(affected: count))
+  Ok(
+    json_motet_sse(
+      BulkActionResult(affected: count),
+      [("motet", "inbox.updated"), ("inbox", "inbox.dismissed")],
+      ["approvals"],
+      "dismiss_all_inbox"
+    )
+  )
 end
 
 ## Resolves a Needs-You item with optional edited draft args, denial reason, Always-Allow rule, and auto-resume.
@@ -789,10 +992,18 @@ fn post_resolve_approval(
   clock: Clock,
   id: Int,
   body: ResolveApprovalRequest
-) : Result(ApprovalResolution, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  Brain.resolve_approval_with_options(rt, db, id, body)
+  res = try Brain.resolve_approval_with_options(rt, db, id, body)
+  Ok(
+    json_motet_sse(
+      res,
+      [("motet", "inbox.resolved"), ("inbox", "inbox.resolved"), ("sessions", "session.updated")],
+      ["approvals", "events"],
+      "resolve_approval"
+    )
+  )
 end
 
 ## Approves a Needs-You item, executes its paused tool action, and auto-resumes the bot turn.
@@ -804,7 +1015,7 @@ fn post_approve(
   env: Env,
   clock: Clock,
   id: Int
-) : Result(ApprovalItem, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
   res = try Brain.resolve_approval_with_options(
@@ -819,7 +1030,14 @@ fn post_approve(
       always_allow: Some(false)
     )
   )
-  Ok(res.approval)
+  Ok(
+    json_motet_sse(
+      res.approval,
+      [("motet", "inbox.resolved"), ("inbox", "inbox.approved"), ("sessions", "session.updated")],
+      ["approvals", "events"],
+      "approve_inbox"
+    )
+  )
 end
 
 ## Denies a Needs-You item without executing the paused tool action.
@@ -831,10 +1049,18 @@ fn post_deny(
   env: Env,
   clock: Clock,
   id: Int
-) : Result(ApprovalItem, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  Brain.resolve_approval(rt, db, id, false)
+  ap = try Brain.resolve_approval(rt, db, id, false)
+  Ok(
+    json_motet_sse(
+      ap,
+      [("motet", "inbox.resolved"), ("inbox", "inbox.denied")],
+      ["approvals"],
+      "deny_inbox"
+    )
+  )
 end
 
 ## Lists write-only AES-256-GCM Vault secret metadata (NEVER returns secret values).
@@ -991,7 +1217,7 @@ fn post_memory(
   env: Env,
   clock: Clock,
   body: SaveMemoryRequest
-) : Result(MemoryEntry, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
   return Error(BadInput(message: "memory content cannot be empty")) if body.content.trim.empty?
   scope = if body.scope.trim.empty?: "shared" else: body.scope.trim
@@ -1005,7 +1231,7 @@ fn post_memory(
     clock.now.to_text
   )
   Store.sync_memory_neural_embedding(db, network, env, saved)
-  Ok(saved)
+  Ok(json_motet_sse(saved, [("motet", "memory.saved")], ["memories"], "save_memory"))
 end
 
 ## Deletes a persistent memory entry by id.
@@ -1791,15 +2017,22 @@ fn get_budget(_op: Operator, files: Files, clock: Clock) : Result(
   Store.daily_budget_snapshots(db, Store.utc_day_prefix(clock.now.to_text))
 end
 
-## Streams a Server-Sent Events snapshot of health and pending Needs-You approvals.
-fn get_events_stream(_op: Operator, files: Files, env: Env, clock: Clock) : Result(
+## Streams Server-Sent Events across all workers (`SseBroker`) with initial health + Needs-You snapshot.
+fn get_events_stream(_op: Operator, files: Files, env: Env, clock: Clock, req: Api.Request) : Result(
   Api.Response,
   MotetError
 )
   db = try ensure_ready(files, clock)
   h = try Store.health_summary(db, env)
   inbox = try Store.list_approvals(db, true)
-  Ok(Api.sse_response([(Some("health"), Json.encode(h)), (Some("inbox"), Json.encode(inbox))]))
+  Ok(
+    Api.sse_stream_with(
+      ["motet", "inbox", "runs", "sessions", "governance"],
+      req_last_event_id(req),
+      Some(2000),
+      [(Some("health"), Json.encode(h)), (Some("inbox"), Json.encode(inbox))]
+    )
+  )
 end
 
 ## Layer 3/4 MoDB verification, audit, export, views, grants, claims, and selective-undo replay endpoints.
@@ -2419,7 +2652,7 @@ fn get_modb_proposals(_op: Operator, files: Files, clock: Clock, status: Option(
 end
 
 fn post_modb_proposals(op: Operator, files: Files, clock: Clock, body: SubmitGovProposalRequest) : Result(
-  Proposals.GovernanceProposal,
+  Api.Response,
   MotetError
 )
   db = try ensure_ready(files, clock)
@@ -2433,7 +2666,15 @@ fn post_modb_proposals(op: Operator, files: Files, clock: Clock, body: SubmitGov
     Some(r): r
     None: body.description or "submit governance proposal"
   end
-  Store.submit_gov_proposal(db, body.id, kind, proposer, gid_opt, rsn, clock.now)
+  p = try Store.submit_gov_proposal(db, body.id, kind, proposer, gid_opt, rsn, clock.now)
+  Ok(
+    json_motet_sse(
+      p,
+      [("motet", "proposal.submitted"), ("governance", "proposal.submitted")],
+      [Proposals.proposals_bucket],
+      "submit_proposal"
+    )
+  )
 end
 
 fn post_modb_proposal_approve(
@@ -2442,11 +2683,19 @@ fn post_modb_proposal_approve(
   clock: Clock,
   id: Text,
   req: Api.Request
-) : Result(Proposals.GovernanceProposal, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
   j = try parse_optional_json(req)
   note = j.text_at("note") or (j.text_at("reason") or "approved via API")
-  Store.approve_gov_proposal(db, id, op.subject, note, clock.now)
+  p = try Store.approve_gov_proposal(db, id, op.subject, note, clock.now)
+  Ok(
+    json_motet_sse(
+      p,
+      [("motet", "proposal.approved"), ("governance", "proposal.approved")],
+      [Proposals.proposals_bucket, Policy.clearances_bucket],
+      "approve_proposal"
+    )
+  )
 end
 
 fn post_modb_proposal_reject(
@@ -2455,11 +2704,19 @@ fn post_modb_proposal_reject(
   clock: Clock,
   id: Text,
   req: Api.Request
-) : Result(Proposals.GovernanceProposal, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
   j = try parse_optional_json(req)
   note = j.text_at("note") or (j.text_at("reason") or "rejected via API")
-  Store.reject_gov_proposal(db, id, op.subject, note, clock.now)
+  p = try Store.reject_gov_proposal(db, id, op.subject, note, clock.now)
+  Ok(
+    json_motet_sse(
+      p,
+      [("motet", "proposal.rejected"), ("governance", "proposal.rejected")],
+      [Proposals.proposals_bucket],
+      "reject_proposal"
+    )
+  )
 end
 
 fn post_modb_proposal_withdraw(
@@ -2468,12 +2725,20 @@ fn post_modb_proposal_withdraw(
   clock: Clock,
   id: Text,
   req: Api.Request
-) : Result(Proposals.GovernanceProposal, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
   j = try parse_optional_json(req)
   principal = j.text_at("principal") or op.subject
   reason = j.text_at("reason") or "withdrawn via API"
-  Store.withdraw_gov_proposal(db, id, principal, true, reason, clock.now)
+  p = try Store.withdraw_gov_proposal(db, id, principal, true, reason, clock.now)
+  Ok(
+    json_motet_sse(
+      p,
+      [("motet", "proposal.withdrawn"), ("governance", "proposal.withdrawn")],
+      [Proposals.proposals_bucket],
+      "withdraw_proposal"
+    )
+  )
 end
 
 fn get_modb_feeds(_op: Operator, files: Files, clock: Clock) : Result(
@@ -2485,7 +2750,7 @@ fn get_modb_feeds(_op: Operator, files: Files, clock: Clock) : Result(
 end
 
 fn post_modb_feeds(op: Operator, files: Files, clock: Clock, body: SubscribeFeedRequest) : Result(
-  Feeds.FeedSubscription,
+  Api.Response,
   MotetError
 )
   db = try ensure_ready(files, clock)
@@ -2501,7 +2766,19 @@ fn post_modb_feeds(op: Operator, files: Files, clock: Clock, body: SubscribeFeed
     include_internal: body.include_internal or false,
     from_beginning: body.from_beginning or false
   )
-  Store.subscribe_feed(db, spec, body.reason or "subscribe feed via API", clock.now)
+  sub = try Store.subscribe_feed(db, spec, body.reason or "subscribe feed via API", clock.now)
+  Ok(
+    json_motet_sse(
+      sub,
+      [
+        ("motet", "feed.subscribed"),
+        ("governance", "feed.subscribed"),
+        (Feeds.feed_topic(sub.id), "feed.subscribed")
+      ],
+      [Feeds.feeds_bucket],
+      "feed_subscribe"
+    )
+  )
 end
 
 fn get_modb_feed_poll(
@@ -2516,15 +2793,49 @@ fn get_modb_feed_poll(
   Store.poll_feed(db, id, admin or false, limit or 100, clock.now)
 end
 
+fn get_modb_feed_stream(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  req: Api.Request,
+  id: Text,
+  limit: Option(Int),
+  admin: Option(Bool)
+) : Result(Api.Response, MotetError)
+  db = try ensure_ready(files, clock)
+  clean_id = id.trim
+  all_feeds = try Store.list_feeds(db)
+  sub_opt = all_feeds.find(fn(f) f.id == clean_id end)
+  sub = try sub_opt.or_fail(ItemNotFound(message: "unknown feed: #{clean_id}"))
+  batch = try Store.poll_feed(db, sub.id, admin or false, limit or 100, clock.now)
+  topics = Feeds.feed_subscribe_topics(sub)
+  Ok(
+    Api.sse_stream_with(
+      topics,
+      req_last_event_id(req),
+      Some(2000),
+      [(Some("feed.snapshot"), Json.encode(batch))]
+    )
+  )
+end
+
 fn post_modb_feed_ack(
   _op: Operator,
   files: Files,
   clock: Clock,
   id: Text,
   body: AckFeedRequest
-) : Result(Feeds.FeedSubscription, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
-  Store.ack_feed(db, id, body.up_to_txid, body.delivered_count or 0, clock.now)
+  sub = try Store.ack_feed(db, id, body.up_to_txid, body.delivered_count or 0, clock.now)
+  Ok(
+    json_motet_sse(
+      sub,
+      [("motet", "feed.acked"), ("governance", "feed.acked"), (Feeds.feed_topic(id), "feed.acked")],
+      [Feeds.feeds_bucket],
+      "feed_ack"
+    )
+  )
 end
 
 fn post_modb_feed_consume(
@@ -2535,7 +2846,7 @@ fn post_modb_feed_consume(
   limit: Option(Int),
   admin: Option(Bool),
   req: Api.Request
-) : Result(Store.FeedConsumeResult, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
   j = try parse_optional_json(req)
   lim = case j.int_at("limit")
@@ -2546,7 +2857,19 @@ fn post_modb_feed_consume(
     Some(v): v
     None: admin or false
   end
-  Store.consume_feed(db, id, is_adm, lim, clock.now)
+  res = try Store.consume_feed(db, id, is_adm, lim, clock.now)
+  Ok(
+    json_motet_sse(
+      res,
+      [
+        ("motet", "feed.consumed"),
+        ("governance", "feed.consumed"),
+        (Feeds.feed_topic(id), "feed.consumed")
+      ],
+      [Feeds.feeds_bucket],
+      "feed_consume"
+    )
+  )
 end
 
 fn post_modb_feed_resync(
@@ -2567,7 +2890,7 @@ fn post_modb_feed_resync(
 end
 
 fn delete_modb_feed(op: Operator, files: Files, clock: Clock, id: Text, reason: Option(Text)) : Result(
-  Json,
+  Api.Response,
   MotetError
 )
   db = try ensure_ready(files, clock)
@@ -2578,7 +2901,19 @@ fn delete_modb_feed(op: Operator, files: Files, clock: Clock, id: Text, reason: 
     reason or "unsubscribe feed via API",
     clock.now
   )
-  Ok(Json.Object({"id": id.to_json, "status": "unsubscribed".to_json}))
+  out = Json.Object({"id": id.to_json, "status": "unsubscribed".to_json})
+  Ok(
+    json_motet_sse(
+      out,
+      [
+        ("motet", "feed.unsubscribed"),
+        ("governance", "feed.unsubscribed"),
+        (Feeds.feed_topic(id), "feed.unsubscribed")
+      ],
+      [Feeds.feeds_bucket],
+      "feed_unsubscribe"
+    )
+  )
 end
 
 fn get_modb_taint_sessions(_op: Operator, files: Files, clock: Clock) : Result(
@@ -2590,7 +2925,7 @@ fn get_modb_taint_sessions(_op: Operator, files: Files, clock: Clock) : Result(
 end
 
 fn post_modb_taint_clear(op: Operator, files: Files, clock: Clock, id: Text, req: Api.Request) : Result(
-  Taint.TaintSession,
+  Api.Response,
   MotetError
 )
   db = try ensure_ready(files, clock)
@@ -2609,7 +2944,15 @@ fn post_modb_taint_clear(op: Operator, files: Files, clock: Clock, id: Text, req
     Some(r) if not r.trim.empty?: r.trim
     Some(_) | None: "operator cleared taint via API"
   end
-  Store.clear_taint_session(db, id.trim, who, rsn)
+  sess = try Store.clear_taint_session(db, id.trim, who, rsn)
+  Ok(
+    json_motet_sse(
+      sess,
+      [("motet", "taint.cleared"), ("governance", "taint.cleared")],
+      [Taint.taint_sessions_bucket],
+      "clear_taint"
+    )
+  )
 end
 
 fn get_modb_erasures(_op: Operator, files: Files, clock: Clock) : Result(
@@ -2621,11 +2964,19 @@ fn get_modb_erasures(_op: Operator, files: Files, clock: Clock) : Result(
 end
 
 fn post_modb_erasures(_op: Operator, files: Files, clock: Clock, body: EraseSubjectRequest) : Result(
-  Erasure.ErasureReceipt,
+  Api.Response,
   MotetError
 )
   db = try ensure_ready(files, clock)
-  Store.erase_subject_data(db, body)
+  rec = try Store.erase_subject_data(db, body)
+  Ok(
+    json_motet_sse(
+      rec,
+      [("motet", "erasure.recorded"), ("governance", "erasure.recorded")],
+      ["_modb_erasure_receipts", "memories", "events"],
+      "erase_subject"
+    )
+  )
 end
 
 ## Receives an external webhook payload with HMAC-SHA256 verification (when configured),
@@ -2638,7 +2989,7 @@ fn post_webhook(
   srng: SecureRandom,
   req: Api.Request,
   source: Text
-) : Result(WebhookReceipt, MotetError)
+) : Result(Api.Response, MotetError)
   db = try ensure_ready(files, clock)
   cfg_opt = try Store.get_webhook_config(db, source)
   target_bot = case cfg_opt
@@ -2697,13 +3048,19 @@ fn post_webhook(
     Some(_) | None: None
   end
 
+  receipt = WebhookReceipt(
+    source: source,
+    session_id: sid,
+    routed_bot: target_bot,
+    event_id: ev.id,
+    run_id: run_id_opt
+  )
   Ok(
-    WebhookReceipt(
-      source: source,
-      session_id: sid,
-      routed_bot: target_bot,
-      event_id: ev.id,
-      run_id: run_id_opt
+    json_motet_sse(
+      receipt,
+      [("motet", "webhook.received"), ("runs", "run.queued"), ("sessions", "session.updated")],
+      ["sessions", "events", "bot_runs"],
+      "webhook"
     )
   )
 end
@@ -3593,13 +3950,17 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   # 7. SSE stream + OAuth callback error handling
   sse = ApiTest.send(
     Server,
-    Api.get("/v1/events/stream").with_bearer("secret-op"),
+    Api.get("/v1/events/stream").with_bearer("secret-op").with_header("Last-Event-ID", "5"),
     files,
     env,
     clock,
     srng
   )
-  assert sse.status == 200 and sse.header("content-type") == Some("text/event-stream")
+  assert sse.status == 200 and
+    (sse.header("content-type") or "").starts_with?("text/event-stream") and
+    Api.sse_subscribe_topics(sse) == ["motet", "inbox", "runs", "sessions", "governance"] and
+    sse.text.contains?("event: health") and
+    sse.text.contains?("event: inbox")
 
   bad_cb = ApiTest.send(
     Server,
@@ -4828,4 +5189,81 @@ test "HTTP and MCP serve hybrid/BM25/semantic search, Vault Gemini reindex, and 
     srng
   )
   assert mcp_er.status == 200 and mcp_er.text.contains?("srv-gdpr-1")
+
+  # Milestone 14: Multi-worker SSE push streams & SseRelay token streaming
+  stream_no_key = ApiTest.send(
+    Server,
+    Api.post("/v1/bots/chief/stream").with_bearer("secret-op").with_json(
+      StreamBotRequest(prompt: "Hello stream", session_id: None)
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert stream_no_key.status == 502
+
+  stream_env = Env.of({"MOTET_API_TOKEN": "secret-op", "ANTHROPIC_API_KEY": "sk-ant-test"})
+  stream_ok = ApiTest.send(
+    Server,
+    Api.post("/v1/bots/chief/stream").with_bearer("secret-op").with_json(
+      StreamBotRequest(prompt: "Hello stream", session_id: None)
+    ),
+    files,
+    stream_env,
+    clock,
+    srng
+  )
+  assert stream_ok.status == 200 and stream_ok.text.contains?("event: ai.start")
+  assert Api.sse_relay_spec(stream_ok) is Some(r_spec)
+  assert r_spec.mode == "anthropic_sse" and r_spec.token_event == Some("ai.token")
+
+  sc_res = ApiTest.send(
+    Server,
+    Api.post("/v1/sessions/chief-main/stream-commit").with_bearer("secret-op").with_json(
+      StreamCommitRequest(prompt: "Hello stream", reply: "Hi streamed!", bot_name: "chief")
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert sc_res.status == 200 and sc_res.text.contains?("Hi streamed!")
+  sc_pubs = Api.sse_published_events(sc_res)
+  assert sc_pubs.any?(fn(p) p.topic == "motet" and p.event == Some("session.updated") end)
+  assert sc_pubs.any?(fn(p) p.topic == "sessions" and p.event == Some("event.appended") end)
+  assert sc_pubs.any?(fn(p) p.topic == "bucket:events" and p.event == Some("feed.delta") end)
+
+  fsub_sse = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/feeds").with_bearer("secret-op").with_json(
+      SubscribeFeedRequest(
+        id: "srv-sse-events",
+        principal: None,
+        grant_id: None,
+        buckets: Some(["events"]),
+        include_internal: None,
+        from_beginning: Some(false),
+        reason: Some("m14 feed sse test")
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert fsub_sse.status == 200
+  fsub_pubs = Api.sse_published_events(fsub_sse)
+  assert fsub_pubs.any?(fn(p) p.topic == "feed:srv-sse-events" and p.event == Some("feed.subscribed") end)
+
+  f_stream = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/feeds/srv-sse-events/stream").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert f_stream.status == 200 and f_stream.text.contains?("event: feed.snapshot")
+  assert Api.sse_subscribe_topics(f_stream) == ["bucket:events", "feed:srv-sse-events"]
 end

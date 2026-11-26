@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -52,6 +52,7 @@ import {
   ModbWorldTelemetry,
   ModbWorldsOverview,
 } from '../lib/api';
+import { subscribeSse } from '../lib/sse';
 import {
   Badge,
   Button,
@@ -338,6 +339,16 @@ export const AuditReplayView: React.FC<{
   const [feedSubFromBeg, setFeedSubFromBeg] = useState(false);
   const [subscribingFeed, setSubscribingFeed] = useState(false);
   const [feedBatch, setFeedBatch] = useState<ModbFeedBatch | null>(null);
+  const [streamingFeedId, setStreamingFeedId] = useState<string | null>(null);
+  const [feedStreamEvents, setFeedStreamEvents] = useState<Array<{ id: string | null; event: string; data: string }>>([]);
+  const feedStreamUnsubRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      feedStreamUnsubRef.current?.();
+      feedStreamUnsubRef.current = null;
+    };
+  }, []);
 
   // Lethal Trifecta Taint & Erasure state (Milestone 13)
   const [taintSessions, setTaintSessions] = useState<ModbTaintSession[]>([]);
@@ -1026,6 +1037,53 @@ export const AuditReplayView: React.FC<{
     } catch (err) {
       toast((err as Error).message);
     }
+  }
+
+  function handleToggleFeedStream(id: string, isAdmin: boolean) {
+    if (streamingFeedId === id) {
+      feedStreamUnsubRef.current?.();
+      feedStreamUnsubRef.current = null;
+      setStreamingFeedId(null);
+      toast(`Stopped live SSE stream for ${id}`);
+      return;
+    }
+    feedStreamUnsubRef.current?.();
+    feedStreamUnsubRef.current = null;
+    setStreamingFeedId(id);
+    setFeedStreamEvents([]);
+    const path = `/v1/modb/feeds/${encodeURIComponent(id)}/stream?limit=100&admin=${
+      isAdmin ? 'true' : 'false'
+    }`;
+    const unsub = subscribeSse(path, {
+      onEvent: (ev) => {
+        if (ev.event === 'feed.snapshot') {
+          try {
+            const snap = JSON.parse(ev.data) as ModbFeedBatch;
+            setFeedBatch(snap);
+          } catch {
+            // ignore malformed snapshot
+          }
+          return;
+        }
+        setFeedStreamEvents((prev) => [
+          ...prev.slice(-19),
+          { id: ev.id, event: ev.event, data: ev.data },
+        ]);
+        void api<ModbFeedBatch>(
+          `/v1/modb/feeds/${encodeURIComponent(id)}/poll?limit=100&admin=${
+            isAdmin ? 'true' : 'false'
+          }`
+        )
+          .then((b) => setFeedBatch(b))
+          .catch(() => {});
+        void onRefresh?.();
+      },
+      onError: (err) => {
+        toast(`Feed SSE stream notice (${id}): ${err.message}`);
+      },
+    });
+    feedStreamUnsubRef.current = unsub;
+    toast(`Streaming live SSE deltas for feed ${id}`);
   }
 
   async function handleUnsubscribeFeed(id: string) {
@@ -2783,6 +2841,13 @@ export const AuditReplayView: React.FC<{
                         </Button>
                         <Button
                           size="sm"
+                          variant={streamingFeedId === f.id ? 'warn' : 'ghost'}
+                          onClick={() => handleToggleFeedStream(f.id, isAdminFeed)}
+                        >
+                          {streamingFeedId === f.id ? 'Stop Stream' : 'Stream Live'}
+                        </Button>
+                        <Button
+                          size="sm"
                           variant="primary"
                           onClick={() => handlePollOrConsumeFeed(f.id, true, isAdminFeed)}
                         >
@@ -2810,6 +2875,9 @@ export const AuditReplayView: React.FC<{
                     tx #{feedBatch.from_txid} → #{feedBatch.to_txid}
                   </Badge>
                   <Badge tone="ok">{feedBatch.events.length} events</Badge>
+                  {streamingFeedId === feedBatch.feed_id && (
+                    <Badge tone="accent">LIVE SSE ({feedStreamEvents.length} pushed)</Badge>
+                  )}
                   <Badge tone="neutral">
                     pages={feedBatch.pages_read} · skipped_subtrees={feedBatch.subtrees_skipped}
                   </Badge>
