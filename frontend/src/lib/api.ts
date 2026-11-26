@@ -459,8 +459,36 @@ export interface ModbLandingMetrics {
   total_reads_skipped: number;
 }
 
+export interface ModbWorldTelemetry {
+  key_level_reads_skipped: number;
+  bucket_level_reads_skipped: number;
+  child_worlds_landed: number;
+  fairness_tickets_issued: number;
+  fairness_deferrals: number;
+  starved_worlds_rescued: number;
+}
+
+export interface ModbPriorityTicket {
+  world_id: string;
+  principal: string;
+  buckets: string[];
+  granted_at: string;
+  expires_at: string;
+}
+
+export interface ModbWorldLink {
+  child_world_id: string;
+  parent_world_id: string;
+  parent_step_watermark: number;
+  'merged_into_parent?'?: boolean;
+  merged_into_parent?: boolean;
+}
+
 export interface ModbWorldsOverview {
   metrics: ModbLandingMetrics;
+  telemetry?: ModbWorldTelemetry;
+  active_tickets?: ModbPriorityTicket[];
+  links?: ModbWorldLink[];
   worlds: ModbWorldRecord[];
 }
 
@@ -473,6 +501,20 @@ export interface ModbWorldLandResult {
   replies: unknown[];
   grant_chain: string[];
 }
+
+export interface ModbChildLandResult {
+  child_world_id: string;
+  parent_world_id: string;
+  calls_merged: number;
+  reads_verified: number;
+  reads_skipped: number;
+  replies: unknown[];
+  grant_chain: string[];
+}
+
+export type ModbLandOutcome =
+  | { landed_ok: { result: ModbWorldLandResult } }
+  | { deferred_by_fairness: { ticket: ModbPriorityTicket; retry_after: string } };
 
 export interface ModbDreamingWorldPreview {
   world_id: string;

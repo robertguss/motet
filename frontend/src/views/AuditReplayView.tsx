@@ -27,6 +27,8 @@ import {
   ModbDescribeManifest,
   ModbGrant,
   ModbLandingMetrics,
+  ModbLandOutcome,
+  ModbPriorityTicket,
   ModbReadLogEntry,
   ModbReadResult,
   ModbReleaseResult,
@@ -34,7 +36,10 @@ import {
   ModbReplayProposal,
   ModbVerifySummary,
   ModbWorldLandResult,
+  ModbChildLandResult,
+  ModbWorldLink,
   ModbWorldRecord,
+  ModbWorldTelemetry,
   ModbWorldsOverview,
 } from '../lib/api';
 import {
@@ -67,6 +72,15 @@ const EMPTY_LANDING_METRICS: ModbLandingMetrics = {
   needless_send_backs: 0,
   total_reads_verified: 0,
   total_reads_skipped: 0,
+};
+
+const EMPTY_WORLD_TELEMETRY: ModbWorldTelemetry = {
+  key_level_reads_skipped: 0,
+  bucket_level_reads_skipped: 0,
+  child_worlds_landed: 0,
+  fairness_tickets_issued: 0,
+  fairness_deferrals: 0,
+  starved_worlds_rescued: 0,
 };
 
 function enumTag(v: unknown): string {
@@ -229,11 +243,18 @@ export const AuditReplayView: React.FC<{
   const [proposals, setProposals] = useState<ModbReplayProposal[]>([]);
   const [worldsOverview, setWorldsOverview] = useState<ModbWorldsOverview>({
     metrics: EMPTY_LANDING_METRICS,
+    telemetry: EMPTY_WORLD_TELEMETRY,
+    active_tickets: [],
+    links: [],
     worlds: [],
   });
   const [worldDiffs, setWorldDiffs] = useState<Record<string, ModbBucketRowDiff[]>>({});
   const [landingWorldId, setLandingWorldId] = useState<string | null>(null);
   const [droppingWorldId, setDroppingWorldId] = useState<string | null>(null);
+  const [forkParentWorld, setForkParentWorld] = useState<ModbWorldRecord | null>(null);
+  const [forkChildId, setForkChildId] = useState('');
+  const [forkGrantId, setForkGrantId] = useState('');
+  const [forkingChild, setForkingChild] = useState(false);
   const [grants, setGrants] = useState<ModbGrant[]>([]);
   const [claims, setClaims] = useState<ModbClaim[]>([]);
   const [manifest, setManifest] = useState<ModbDescribeManifest | null>(null);
@@ -313,6 +334,9 @@ export const AuditReplayView: React.FC<{
         apiOptional<ModbDescribeManifest | null>('/v1/modb/describe', null),
         apiOptional<ModbWorldsOverview>('/v1/modb/worlds', {
           metrics: EMPTY_LANDING_METRICS,
+          telemetry: EMPTY_WORLD_TELEMETRY,
+          active_tickets: [],
+          links: [],
           worlds: [],
         }),
         apiOptional<ModbReadLogEntry[]>('/v1/modb/reads', []),
@@ -672,6 +696,96 @@ export const AuditReplayView: React.FC<{
       toast((err as Error).message);
     } finally {
       setDroppingWorldId(null);
+    }
+  }
+
+  async function handleLandWorldFair(worldId: string) {
+    setLandingWorldId(worldId);
+    try {
+      const out = await api<ModbLandOutcome>(
+        `/v1/modb/worlds/${encodeURIComponent(worldId)}/land-fair`,
+        { method: 'POST', body: JSON.stringify({ reason: 'Fair land via Worlds Inspector' }) }
+      );
+      if ('landed_ok' in out) {
+        const res = out.landed_ok.result;
+        toast(
+          `Landed ${res.world_id} @tx#${res.commit_txid} (${res.reads_skipped} reads skipped, ${res.reads_verified} checked)`
+        );
+      } else if ('deferred_by_fairness' in out) {
+        const t = out.deferred_by_fairness.ticket;
+        toast(`Deferred by fairness ticket for ${t.world_id} (retry after ${out.deferred_by_fairness.retry_after})`);
+      }
+      await loadAll();
+      await onRefresh();
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setLandingWorldId(null);
+    }
+  }
+
+  async function handleLandChildWorld(worldId: string) {
+    setLandingWorldId(worldId);
+    try {
+      const res = await api<ModbChildLandResult>(
+        `/v1/modb/worlds/${encodeURIComponent(worldId)}/land-child`,
+        { method: 'POST', body: JSON.stringify({ reason: 'Merged child world via Inspector' }) }
+      );
+      toast(
+        `Merged child ${res.child_world_id} into ${res.parent_world_id} (${res.calls_merged} call(s), ${res.reads_skipped} reads skipped)`
+      );
+      await loadAll();
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setLandingWorldId(null);
+    }
+  }
+
+  async function handleClaimPriority(worldId: string) {
+    try {
+      const ticket = await api<ModbPriorityTicket>(
+        `/v1/modb/worlds/${encodeURIComponent(worldId)}/priority`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            buckets: ['memories', 'sessions', 'events'],
+            min_stale_threshold: 1,
+            hold_seconds: 15,
+          }),
+        }
+      );
+      toast(`Priority ticket granted for ${ticket.world_id} on [${ticket.buckets.join(', ')}]`);
+      await loadAll();
+    } catch (err) {
+      toast((err as Error).message);
+    }
+  }
+
+  async function handleForkChildSubmit() {
+    if (!forkParentWorld) return;
+    setForkingChild(true);
+    try {
+      const child = await api<ModbWorldRecord>(
+        `/v1/modb/worlds/${encodeURIComponent(forkParentWorld.id)}/children`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            id: forkChildId.trim() || undefined,
+            grant_id: forkGrantId.trim() || undefined,
+            ttl_seconds: 1800,
+          }),
+        }
+      );
+      toast(`Forked child world ${child.id} from ${forkParentWorld.id}`);
+      setForkParentWorld(null);
+      setForkChildId('');
+      setForkGrantId('');
+      await loadAll();
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setForkingChild(false);
     }
   }
 
@@ -1389,160 +1503,277 @@ export const AuditReplayView: React.FC<{
       )}
 
       {/* TAB 2B: SPECULATIVE WORLDS */}
-      {subTab === 'worlds' && (
-        <div className="flex flex-col gap-4">
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+      {subTab === 'worlds' && (() => {
+        const tel = worldsOverview.telemetry ?? EMPTY_WORLD_TELEMETRY;
+        const activeTickets = worldsOverview.active_tickets ?? [];
+        const links = worldsOverview.links ?? [];
+        const linkByChild = new Map<string, ModbWorldLink>();
+        links.forEach((l) => linkByChild.set(l.child_world_id, l));
+        const ticketByWorld = new Map<string, ModbPriorityTicket>();
+        activeTickets.forEach((t) => ticketByWorld.set(t.world_id, t));
+        return (
+          <div className="flex flex-col gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+              <Card>
+                <span className="text-xs text-[var(--fg-muted)]">Landed Worlds</span>
+                <strong className="text-base font-mono">{worldsOverview.metrics.total_landed}</strong>
+                <span className="text-xs text-[var(--fg-subtle)]">Atomic CoW commit landings</span>
+              </Card>
+              <Card>
+                <span className="text-xs text-[var(--fg-muted)]">O(1) CoW Reads Skipped</span>
+                <strong className="text-base font-mono text-[var(--ok)]">
+                  {worldsOverview.metrics.total_reads_skipped}
+                </strong>
+                <span className="text-xs text-[var(--fg-subtle)]">Total read re-runs skipped</span>
+              </Card>
+              <Card>
+                <span className="text-xs text-[var(--fg-muted)]">Reads Re-Verified</span>
+                <strong className="text-base font-mono">
+                  {worldsOverview.metrics.total_reads_verified}
+                </strong>
+                <span className="text-xs text-[var(--fg-subtle)]">Checked via diff/re-run</span>
+              </Card>
+              <Card>
+                <span className="text-xs text-[var(--fg-muted)]">Stale Read Rejections</span>
+                <strong className="text-base font-mono">
+                  {worldsOverview.metrics.stale_read_rejections}
+                </strong>
+                <span className="text-xs text-[var(--fg-subtle)]">Concurrent write conflicts</span>
+              </Card>
+              <Card>
+                <span className="text-xs text-[var(--fg-muted)]">Needless Send-Backs</span>
+                <strong className="text-base font-mono">
+                  {worldsOverview.metrics.needless_send_backs}
+                </strong>
+                <span className="text-xs text-[var(--fg-subtle)]">Coarse read contention metric</span>
+              </Card>
+            </div>
+
             <Card>
-              <span className="text-xs text-[var(--fg-muted)]">Landed Worlds</span>
-              <strong className="text-base font-mono">{worldsOverview.metrics.total_landed}</strong>
-              <span className="text-xs text-[var(--fg-subtle)]">Atomic CoW commit landings</span>
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <strong className="text-sm">Milestone 10 Telemetry &amp; Fairness</strong>
+                <span className="text-xs text-[var(--fg-muted)]">
+                  Key/range O(diff) validation, Nested Child Worlds, and starvation PriorityTickets
+                </span>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 text-xs">
+                <div className="p-2.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-0.5">
+                  <span className="text-[var(--fg-muted)]">Key/Range O(diff) Skips</span>
+                  <strong className="text-sm font-mono text-[var(--ok)]">
+                    {tel.key_level_reads_skipped}
+                  </strong>
+                </div>
+                <div className="p-2.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-0.5">
+                  <span className="text-[var(--fg-muted)]">Bucket-Level Skips</span>
+                  <strong className="text-sm font-mono">{tel.bucket_level_reads_skipped}</strong>
+                </div>
+                <div className="p-2.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-0.5">
+                  <span className="text-[var(--fg-muted)]">Child Worlds Merged</span>
+                  <strong className="text-sm font-mono text-[var(--accent)]">
+                    {tel.child_worlds_landed}
+                  </strong>
+                </div>
+                <div className="p-2.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-0.5">
+                  <span className="text-[var(--fg-muted)]">Fairness Tickets</span>
+                  <strong className="text-sm font-mono">{tel.fairness_tickets_issued}</strong>
+                </div>
+                <div className="p-2.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-0.5">
+                  <span className="text-[var(--fg-muted)]">Fairness Deferrals</span>
+                  <strong className="text-sm font-mono">{tel.fairness_deferrals}</strong>
+                </div>
+                <div className="p-2.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-0.5">
+                  <span className="text-[var(--fg-muted)]">Starved Rescued</span>
+                  <strong className="text-sm font-mono text-[var(--ok)]">
+                    {tel.starved_worlds_rescued}
+                  </strong>
+                </div>
+              </div>
+              {activeTickets.length > 0 && (
+                <div className="flex gap-1.5 flex-wrap items-center text-xs">
+                  <span className="text-[var(--fg-muted)]">Active Tickets:</span>
+                  {activeTickets.map((t) => (
+                    <Badge key={t.world_id} tone="warn">
+                      {t.world_id} ({t.principal}) · [{t.buckets.join(', ')}]
+                    </Badge>
+                  ))}
+                </div>
+              )}
             </Card>
+
             <Card>
-              <span className="text-xs text-[var(--fg-muted)]">O(1) CoW Reads Skipped</span>
-              <strong className="text-base font-mono text-[var(--ok)]">
-                {worldsOverview.metrics.total_reads_skipped}
-              </strong>
-              <span className="text-xs text-[var(--fg-subtle)]">Unchanged bucket root hashes</span>
-            </Card>
-            <Card>
-              <span className="text-xs text-[var(--fg-muted)]">Reads Re-Verified</span>
-              <strong className="text-base font-mono">
-                {worldsOverview.metrics.total_reads_verified}
-              </strong>
-              <span className="text-xs text-[var(--fg-subtle)]">Re-run on bucket change</span>
-            </Card>
-            <Card>
-              <span className="text-xs text-[var(--fg-muted)]">Stale Read Rejections</span>
-              <strong className="text-base font-mono">
-                {worldsOverview.metrics.stale_read_rejections}
-              </strong>
-              <span className="text-xs text-[var(--fg-subtle)]">Concurrent write conflicts</span>
-            </Card>
-            <Card>
-              <span className="text-xs text-[var(--fg-muted)]">Needless Send-Backs</span>
-              <strong className="text-base font-mono">
-                {worldsOverview.metrics.needless_send_backs}
-              </strong>
-              <span className="text-xs text-[var(--fg-subtle)]">Coarse read contention metric</span>
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <strong className="text-sm">
+                  Speculative CoW Worlds ({worldsOverview.worlds.length})
+                </strong>
+                <span className="text-xs text-[var(--fg-muted)]">
+                  Isolated read+write sandboxes, nested Child Worlds, and fairness-aware OCC landing
+                </span>
+              </div>
+              {worldsOverview.worlds.length === 0 ? (
+                <EmptyState
+                  title="No speculative CoW Worlds yet"
+                  description="Use Preview in World under Memory & Dreaming, or run world workflows via MCP/API."
+                />
+              ) : (
+                <div className="flex flex-col gap-2.5">
+                  {worldsOverview.worlds.map((w: ModbWorldRecord) => {
+                    const st = enumTag(w.status);
+                    const stPayload = enumPayload(w.status);
+                    const lnk = linkByChild.get(w.id);
+                    const isChild = !!lnk;
+                    const isMerged = !!(
+                      lnk &&
+                      (lnk['merged_into_parent?'] || lnk.merged_into_parent)
+                    );
+                    const hasTicket = ticketByWorld.has(w.id);
+                    const stLabel =
+                      st === 'landed'
+                        ? isChild && Number(stPayload.commit_txid ?? 0) === 0
+                          ? 'merged into parent'
+                          : `landed @tx#${String(stPayload.commit_txid ?? '?')}`
+                        : st === 'rejected'
+                        ? `rejected: ${String(stPayload.reason ?? '')}`
+                        : st;
+                    const tone =
+                      st === 'landed'
+                        ? 'ok'
+                        : st === 'open'
+                        ? 'warn'
+                        : st === 'rejected'
+                        ? 'bad'
+                        : 'neutral';
+                    const readCount = w.steps.filter((s) => enumTag(s) === 'read_step').length;
+                    const callCount = w.steps.filter((s) => enumTag(s) === 'call_step').length;
+                    const diffs = worldDiffs[w.id];
+                    return (
+                      <div
+                        key={w.id}
+                        className={`p-3 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-2 text-xs ${
+                          isChild ? 'ml-5 border-l-2 border-l-[var(--accent)]' : ''
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <strong className="font-mono text-sm">{w.id}</strong>
+                            <Badge tone={tone}>{stLabel}</Badge>
+                            {isChild && lnk && (
+                              <Badge tone="accent">
+                                ↳ child of {lnk.parent_world_id} (wm={lnk.parent_step_watermark})
+                                {isMerged ? ' · merged' : ''}
+                              </Badge>
+                            )}
+                            {hasTicket && <Badge tone="warn">priority ticket</Badge>}
+                            <Badge tone="neutral">base tx #{w.base_txid}</Badge>
+                            <Badge tone="info">
+                              {readCount} reads · {callCount} calls
+                            </Badge>
+                          </div>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            {st === 'open' && (
+                              <>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() => inspectWorldDiff(w.id)}
+                                >
+                                  Inspect Diff
+                                </Button>
+                                {isChild ? (
+                                  <Button
+                                    size="sm"
+                                    variant="ok"
+                                    disabled={landingWorldId === w.id}
+                                    onClick={() => handleLandChildWorld(w.id)}
+                                  >
+                                    {landingWorldId === w.id ? 'Merging…' : 'Merge into Parent'}
+                                  </Button>
+                                ) : (
+                                  <>
+                                    <Button
+                                      size="sm"
+                                      variant="ok"
+                                      disabled={landingWorldId === w.id}
+                                      onClick={() => handleLandWorld(w.id)}
+                                    >
+                                      {landingWorldId === w.id ? 'Landing…' : 'Land Atomically'}
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      disabled={landingWorldId === w.id}
+                                      onClick={() => handleLandWorldFair(w.id)}
+                                    >
+                                      Land Fair
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      onClick={() => {
+                                        setForkParentWorld(w);
+                                        setForkChildId(`${w.id}-child-1`);
+                                        setForkGrantId(w.grant_id);
+                                      }}
+                                    >
+                                      Fork Child
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      onClick={() => handleClaimPriority(w.id)}
+                                    >
+                                      Priority Ticket
+                                    </Button>
+                                  </>
+                                )}
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  disabled={droppingWorldId === w.id}
+                                  onClick={() => handleDropWorld(w.id)}
+                                >
+                                  Drop
+                                </Button>
+                              </>
+                            )}
+                            {st === 'landed' && (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => jumpToReplayExcludeWorld(w.id)}
+                              >
+                                <RotateCcw className="w-3.5 h-3.5" />
+                                <span>Exclude World in Replay →</span>
+                              </Button>
+                            )}
+                          </div>
+                        </div>
+                        <div className="font-mono text-[var(--fg-muted)] flex gap-x-4 gap-y-1 flex-wrap">
+                          <span>principal: {w.principal}</span>
+                          <span>grant: {w.grant_id}</span>
+                          <span>created: {w.created_at}</span>
+                        </div>
+                        {diffs && (
+                          <div className="flex gap-1.5 flex-wrap">
+                            {diffs.length === 0 ? (
+                              <Badge tone="neutral">No bucket changes</Badge>
+                            ) : (
+                              diffs.map((d) => (
+                                <Badge key={d.bucket} tone="accent">
+                                  {d.bucket}: +{d.added} / ~{d.modified} / -{d.removed}
+                                </Badge>
+                              ))
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </Card>
           </div>
-
-          <Card>
-            <div className="flex items-center justify-between gap-2 flex-wrap">
-              <strong className="text-sm">
-                Speculative CoW Worlds ({worldsOverview.worlds.length})
-              </strong>
-              <span className="text-xs text-[var(--fg-muted)]">
-                Isolated read+write sandboxes with structural diff and atomic OCC landing
-              </span>
-            </div>
-            {worldsOverview.worlds.length === 0 ? (
-              <EmptyState
-                title="No speculative CoW Worlds yet"
-                description="Use Preview in World under Memory & Dreaming, or run world workflows via MCP/API."
-              />
-            ) : (
-              <div className="flex flex-col gap-2.5">
-                {worldsOverview.worlds.map((w: ModbWorldRecord) => {
-                  const st = enumTag(w.status);
-                  const stPayload = enumPayload(w.status);
-                  const stLabel =
-                    st === 'landed'
-                      ? `landed @tx#${String(stPayload.commit_txid ?? '?')}`
-                      : st === 'rejected'
-                      ? `rejected: ${String(stPayload.reason ?? '')}`
-                      : st;
-                  const tone =
-                    st === 'landed'
-                      ? 'ok'
-                      : st === 'open'
-                      ? 'warn'
-                      : st === 'rejected'
-                      ? 'bad'
-                      : 'neutral';
-                  const readCount = w.steps.filter((s) => enumTag(s) === 'read_step').length;
-                  const callCount = w.steps.filter((s) => enumTag(s) === 'call_step').length;
-                  const diffs = worldDiffs[w.id];
-                  return (
-                    <div
-                      key={w.id}
-                      className="p-3 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-2 text-xs"
-                    >
-                      <div className="flex items-center justify-between gap-2 flex-wrap">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <strong className="font-mono text-sm">{w.id}</strong>
-                          <Badge tone={tone}>{stLabel}</Badge>
-                          <Badge tone="neutral">base tx #{w.base_txid}</Badge>
-                          <Badge tone="info">
-                            {readCount} reads · {callCount} calls
-                          </Badge>
-                        </div>
-                        <div className="flex items-center gap-1.5 flex-wrap">
-                          {st === 'open' && (
-                            <>
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                onClick={() => inspectWorldDiff(w.id)}
-                              >
-                                Inspect Diff
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="ok"
-                                disabled={landingWorldId === w.id}
-                                onClick={() => handleLandWorld(w.id)}
-                              >
-                                {landingWorldId === w.id ? 'Landing…' : 'Land Atomically'}
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                disabled={droppingWorldId === w.id}
-                                onClick={() => handleDropWorld(w.id)}
-                              >
-                                Drop
-                              </Button>
-                            </>
-                          )}
-                          {st === 'landed' && (
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              onClick={() => jumpToReplayExcludeWorld(w.id)}
-                            >
-                              <RotateCcw className="w-3.5 h-3.5" />
-                              <span>Exclude World in Replay →</span>
-                            </Button>
-                          )}
-                        </div>
-                      </div>
-                      <div className="font-mono text-[var(--fg-muted)] flex gap-x-4 gap-y-1 flex-wrap">
-                        <span>principal: {w.principal}</span>
-                        <span>grant: {w.grant_id}</span>
-                        <span>created: {w.created_at}</span>
-                      </div>
-                      {diffs && (
-                        <div className="flex gap-1.5 flex-wrap">
-                          {diffs.length === 0 ? (
-                            <Badge tone="neutral">No bucket changes</Badge>
-                          ) : (
-                            diffs.map((d) => (
-                              <Badge key={d.bucket} tone="accent">
-                                {d.bucket}: +{d.added} / ~{d.modified} / -{d.removed}
-                              </Badge>
-                            ))
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </Card>
-        </div>
-      )}
+        );
+      })()}
 
       {/* TAB 3: GRANTS & CLAIMS */}
       {subTab === 'grants' && (
@@ -1942,6 +2173,54 @@ export const AuditReplayView: React.FC<{
                 className={inputCls}
                 value={revokeReason}
                 onChange={(e) => setRevokeReason(e.target.value)}
+              />
+            </Field>
+          </div>
+        )}
+      </Modal>
+
+      {/* Modal: Fork Nested Child World */}
+      <Modal
+        open={!!forkParentWorld}
+        title={forkParentWorld ? `Fork Child World from ${forkParentWorld.id}` : 'Fork Child World'}
+        onClose={() => setForkParentWorld(null)}
+        footer={
+          forkParentWorld && (
+            <>
+              <Button variant="ghost" onClick={() => setForkParentWorld(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                disabled={forkingChild}
+                onClick={handleForkChildSubmit}
+              >
+                {forkingChild ? 'Forking…' : 'Create Child World'}
+              </Button>
+            </>
+          )
+        }
+      >
+        {forkParentWorld && (
+          <div className="flex flex-col gap-3 text-xs">
+            <p className="m-0 text-[var(--fg-muted)]">
+              Forks a Nested Child World at parent step watermark with non-widening grant attenuation
+              and bounded TTL.
+            </p>
+            <Field label="Child World ID (optional)">
+              <input
+                className={inputCls}
+                value={forkChildId}
+                onChange={(e) => setForkChildId(e.target.value)}
+                placeholder={`${forkParentWorld.id}-child-1`}
+              />
+            </Field>
+            <Field label="Attenuated Grant ID (must equal or descend from parent grant)">
+              <input
+                className={inputCls}
+                value={forkGrantId}
+                onChange={(e) => setForkGrantId(e.target.value)}
+                placeholder={forkParentWorld.grant_id}
               />
             </Field>
           </div>

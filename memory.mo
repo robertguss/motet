@@ -19,7 +19,7 @@ rollback_dreaming,
 has_dreamed_today,
 generate_weekly_audit
 use Json
-use Modb.World{BucketDiffSummary}
+use Modb.World{BucketDiffSummary, LandOutcome}
 use Skills
 use Store
 use Types{DreamingDigest, MemoryEntry, MotetError, TrustLevel, WeeklyAuditReport}
@@ -350,12 +350,18 @@ end
 ## World and landed atomically onto the main line (verifying read currency & invariants).
 fn run_dreaming(db: Store.DbHandle, now_text: Text) : Result(DreamingDigest, MotetError)
   prev = try preview_dreaming_world(db, now_text)
-  landed = try Store.land_world(
+  outcome = try Store.land_world_fair(
     db,
     prev.world_id,
     "atomic overnight dreaming consolidation",
     db.clock.now
   )
+  landed = case outcome
+    LandedOk(result: res): res
+    DeferredByFairness(ticket: t, retry_after: _): return Error(
+      Conflict(message: "dreaming world '#{prev.world_id}' deferred by fairness ticket for '#{t.world_id}'")
+    )
+  end
   last_rep = try landed.replies.last.or_fail(
     StorageFailed(message: "dreaming world '#{prev.world_id}' produced no digest reply")
   )

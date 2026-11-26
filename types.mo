@@ -71,6 +71,8 @@ OpenWorldRequest(..),
 WorldQueryRequest(..),
 WorldCallRequest(..),
 WorldLandRequest(..),
+OpenChildWorldRequest(..),
+WorldPriorityRequest(..),
 provider_to_text,
 provider_from_text,
 effect_to_text,
@@ -659,6 +661,18 @@ end
 
 struct WorldLandRequest
   reason: Option(Text)
+end
+
+struct OpenChildWorldRequest
+  id: Option(Text)
+  grant_id: Option(Text)
+  ttl_seconds: Option(Int)
+end
+
+struct WorldPriorityRequest
+  buckets: List(Text)
+  min_stale_threshold: Option(Int)
+  hold_seconds: Option(Int)
 end
 
 fn provider_to_text(p: ProviderKind) : Text

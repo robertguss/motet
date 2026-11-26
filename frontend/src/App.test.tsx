@@ -394,6 +394,21 @@ function mockFetch() {
         grant_chain: ['system:motet', 'system:dreaming'],
       });
     }
+    if (url.includes('/v1/modb/worlds/dream-landed-0/land-fair')) {
+      return json({
+        landed_ok: {
+          result: {
+            world_id: 'dream-landed-0',
+            commit_txid: 46,
+            calls_replayed: 1,
+            reads_verified: 1,
+            reads_skipped: 1,
+            replies: [{}],
+            grant_chain: ['system:motet', 'system:dreaming'],
+          },
+        },
+      });
+    }
     if (url.includes('/v1/modb/worlds/dream-preview-1/diff')) {
       return json([{ bucket: 'memories', added: 1, removed: 1, modified: 0 }]);
     }
@@ -409,6 +424,23 @@ function mockFetch() {
           total_reads_verified: 0,
           total_reads_skipped: worldLanded ? 4 : 2,
         },
+        telemetry: {
+          key_level_reads_skipped: 3,
+          bucket_level_reads_skipped: 2,
+          child_worlds_landed: 1,
+          fairness_tickets_issued: 1,
+          fairness_deferrals: 2,
+          starved_worlds_rescued: 1,
+        },
+        active_tickets: [],
+        links: [
+          {
+            child_world_id: 'dream-child-1',
+            parent_world_id: 'dream-landed-0',
+            parent_step_watermark: 1,
+            'merged_into_parent?': true,
+          },
+        ],
         worlds: [
           {
             id: 'dream-landed-0',
@@ -419,6 +451,17 @@ function mockFetch() {
             steps: [{ read_step: { query: 'list_active_memories' } }, { call_step: { action: 'dream_consolidate' } }],
             status: { landed: { commit_txid: 41 } },
             created_at: '2026-11-25T18:00:00Z',
+            expires_at: '2026-11-25T19:00:00Z',
+          },
+          {
+            id: 'dream-child-1',
+            grant_id: 'system:dreaming',
+            principal: 'system:dreaming',
+            base_txid: 40,
+            base_pin_id: 'child:dream-landed-0:dream-child-1',
+            steps: [{ call_step: { action: 'save_memory' } }],
+            status: { landed: { commit_txid: 0 } },
+            created_at: '2026-11-25T18:02:00Z',
             expires_at: '2026-11-25T19:00:00Z',
           },
           ...(dreamLanded
@@ -663,11 +706,14 @@ describe('Motet Control Plane Dashboard', () => {
       expect(screen.getByText('cohort=3 (min k=2)')).toBeInTheDocument();
     });
 
-    // Speculative Worlds tab + Exclude World in Replay Studio
+    // Speculative Worlds tab + M10 Telemetry/Child hierarchy + Exclude World in Replay Studio
     fireEvent.click(screen.getByText('Speculative Worlds'));
     await waitFor(() => {
       expect(screen.getByText('O(1) CoW Reads Skipped')).toBeInTheDocument();
+      expect(screen.getByText('Key/Range O(diff) Skips')).toBeInTheDocument();
       expect(screen.getByText('dream-landed-0')).toBeInTheDocument();
+      expect(screen.getByText('dream-child-1')).toBeInTheDocument();
+      expect(screen.getByText(/child of dream-landed-0/)).toBeInTheDocument();
     });
     fireEvent.click(screen.getAllByText('Exclude World in Replay →')[0]);
     await waitFor(() => {

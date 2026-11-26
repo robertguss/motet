@@ -159,10 +159,16 @@ list_worlds_overview,
 get_world,
 ensure_world_grant,
 open_world,
+open_child_world,
+list_child_worlds,
 world_query,
 world_call,
 world_diff,
 land_world,
+land_world_fair,
+land_child_world,
+claim_world_priority,
+world_telemetry,
 drop_world,
 verify_all,
 verify_fast,
@@ -203,7 +209,18 @@ use Modb.Views{
   ViewDef,
   ViewField
 }
-use Modb.World{BucketDiffSummary, LandResult, LandingMetrics, WorldError, WorldRecord}
+use Modb.World{
+  BucketDiffSummary,
+  ChildLandResult,
+  LandOutcome,
+  LandResult,
+  LandingMetrics,
+  PriorityTicket,
+  WorldError,
+  WorldLink,
+  WorldRecord,
+  WorldTelemetry
+}
 use Types{
   AnalyticsSummary,
   AppSettings,
@@ -3036,7 +3053,30 @@ fn world_query_rules(tx: WriteTx, _args: Json) : Result(Json, Text)
   Ok(rows.map(fn(p) p.1 end).to_json)
 end
 
+fn extract_int_id(args: Json) : Result(Int, Text)
+  case Json.from_json[Int](args)
+    Ok(n): Ok(n)
+    Error(_):
+      case args.int_at("id")
+        Some(n): Ok(n)
+        None: Error("memory integer id required")
+      end
+  end
+end
+
+fn extract_text_name(args: Json) : Result(Text, Text)
+  raw = case Json.from_json[Text](args)
+    Ok(s): s
+    Error(_): args.text_at("name") or ""
+  end
+  clean = raw.trim
+  return Error("bot name required") if clean.empty?
+  Ok(clean)
+end
+
 fn motet_world_catalog() : World.Catalog
+  mems = memories_table()
+  bots = bots_table()
   World.catalog().with_scoped_query("list_active_memories", ["memories"], world_query_active_memories)
     .with_scoped_query(
       "list_recent_owner_messages",
@@ -3046,6 +3086,44 @@ fn motet_world_catalog() : World.Catalog
       "list_rules",
       ["policy_rules"],
       world_query_rules
+    ).with_key_scoped_query(
+      "get_memory",
+      "memories",
+      fn(args)
+        mid = try extract_int_id(args)
+        Ok(Table.encode_int_key(mid))
+      end,
+      fn(tx, args)
+        mid = try extract_int_id(args)
+        row = try (try wrap_t(Table.tx_get(tx, mems, mid))).or_fail("memory ##{mid} not found")
+        Ok(mem_row_to_entry(row).to_json)
+      end
+    ).with_range_scoped_query(
+      "scan_memories_range",
+      "memories",
+      fn(args)
+        lo = args.int_at("start_id").map(Table.encode_int_key)
+        hi = args.int_at("end_id").map(Table.encode_int_key)
+        Ok((lo, hi))
+      end,
+      fn(tx, args)
+        raw_lim = args.int_at("limit") or 100
+        cap = if raw_lim > 0 and raw_lim <= 500: raw_lim else: 100
+        rows = try wrap_t(Table.tx_scan(tx, mems, args.int_at("start_id"), args.int_at("end_id"), cap))
+        Ok(rows.map(fn(p) mem_row_to_entry(p.1) end).to_json)
+      end
+    ).with_key_scoped_query(
+      "get_bot",
+      "bots",
+      fn(args)
+        nm = try extract_text_name(args)
+        Ok(Table.encode_text_key(nm))
+      end,
+      fn(tx, args)
+        nm = try extract_text_name(args)
+        row = try (try wrap_t(Table.tx_get(tx, bots, nm))).or_fail("bot '#{nm}' not found")
+        Ok(row.to_json)
+      end
     ).with_action("save_memory", action_save_memory).with_action(
       "update_memory_content",
       action_update_memory_content
@@ -5764,22 +5842,46 @@ fn list_read_log(db: DbHandle, limit: Int) : Result(List(ReadLogEntry), MotetErr
   )
 end
 
-## Speculative CoW Worlds (metrics, list, open, scoped query, call, diff, land, drop).
+## Speculative CoW Worlds (metrics, telemetry, list, child worlds, fairness tickets, diff, land).
 struct WorldsOverview
   metrics: LandingMetrics
+  telemetry: WorldTelemetry
+  active_tickets: List(PriorityTicket)
+  links: List(WorldLink)
   worlds: List(WorldRecord)
 end
 
 fn list_worlds_overview(db: DbHandle) : Result(WorldsOverview, MotetError)
+  now = db.clock.now
   with_db_read(
     db,
     fn(ldb)
       st = Ledger.store(ldb)
       m = try World.metrics(st).map_error(world_err)
+      tel = try World.telemetry(st).map_error(world_err)
+      tickets = try World.list_priority_tickets(st, now).map_error(world_err)
       ws = try World.list_worlds(st).map_error(world_err)
-      Ok(WorldsOverview(metrics: m, worlds: ws))
+      var links = []
+      for w in ws
+        if (try World.get_world_link(st, w.id).map_error(world_err)) is Some(lnk)
+          links = links.append(lnk)
+        end
+      end
+      Ok(
+        WorldsOverview(
+          metrics: m,
+          telemetry: tel,
+          active_tickets: tickets,
+          links: links,
+          worlds: ws
+        )
+      )
     end
   )
+end
+
+fn world_telemetry(db: DbHandle) : Result(WorldTelemetry, MotetError)
+  with_db_read(db, fn(ldb) World.telemetry(Ledger.store(ldb)).map_error(world_err) end)
 end
 
 fn get_world(db: DbHandle, world_id: Text) : Result(Option(WorldRecord), MotetError)
@@ -5808,6 +5910,35 @@ fn open_world(db: DbHandle, world_id: Text, grant_id: Text, ttl_seconds: Int, no
       (_next, w) = try World.open_world(ldb1, world_id, grant_id, now, exp).map_error(world_err)
       Ok(w)
     end
+  )
+end
+
+fn open_child_world(
+  db: DbHandle,
+  parent_world_id: Text,
+  child_world_id: Text,
+  child_grant_id: Text,
+  ttl_seconds: Int,
+  now: Time
+) : Result(WorldRecord, MotetError)
+  ttl = if ttl_seconds > 0 and ttl_seconds <= 86400: ttl_seconds else: 1800
+  exp = now + ttl.seconds
+  World.open_child_world_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    parent_world_id,
+    child_world_id,
+    child_grant_id,
+    now,
+    exp
+  ).map_error(world_err)
+end
+
+fn list_child_worlds(db: DbHandle, parent_world_id: Text) : Result(List(WorldRecord), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) World.list_child_worlds(Ledger.store(ldb), parent_world_id).map_error(world_err) end
   )
 end
 
@@ -5870,6 +6001,61 @@ fn land_world(db: DbHandle, world_id: Text, reason: Text, now: Time) : Result(
     motet_schema(),
     motet_world_catalog(),
     world_id,
+    eff_reason,
+    now
+  ).map_error(world_err)
+end
+
+fn claim_world_priority(
+  db: DbHandle,
+  world_id: Text,
+  buckets: List(Text),
+  min_stale_threshold: Int,
+  hold_seconds: Int,
+  now: Time
+) : Result(PriorityTicket, MotetError)
+  return Error(BadInput(message: "buckets cannot be empty")) if buckets.empty?
+  return Error(BadInput(message: "hold_seconds must be > 0")) if hold_seconds <= 0
+  thresh = if min_stale_threshold > 0: min_stale_threshold else: 1
+  World.claim_priority_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    world_id,
+    buckets,
+    thresh,
+    hold_seconds,
+    now
+  ).map_error(world_err)
+end
+
+fn land_world_fair(db: DbHandle, world_id: Text, reason: Text, now: Time) : Result(
+  LandOutcome,
+  MotetError
+)
+  eff_reason = if reason.trim.empty?: "land world #{world_id}" else: reason.trim
+  World.land_world_fair_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    motet_world_catalog(),
+    world_id,
+    eff_reason,
+    now
+  ).map_error(world_err)
+end
+
+fn land_child_world(db: DbHandle, child_world_id: Text, reason: Text, now: Time) : Result(
+  ChildLandResult,
+  MotetError
+)
+  eff_reason = if reason.trim.empty?: "merge child world #{child_world_id}" else: reason.trim
+  World.land_child_world_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    motet_world_catalog(),
+    child_world_id,
     eff_reason,
     now
   ).map_error(world_err)
@@ -6566,6 +6752,132 @@ test "Modb Store enforces invariants, supports lossless selective-undo Replay, G
   assert world_diff(db, "w-store-1") is Ok(wdiffs) and not wdiffs.empty?
   assert land_world(db, "w-store-1", "land store test world", t0) is Ok(_)
   assert list_worlds_overview(db) is Ok(wov) and wov.metrics.total_landed >= 1
+
+  # 8. Milestone 10: Key/Range O(diff) World read skipping, Fairness Tickets, & Nested Child Worlds
+  assert save_memory(db, "shared", "fact", "M10 mem A", "user", t0.to_text) is Ok(m_a)
+  assert save_memory(db, "shared", "fact", "M10 mem B", "user", t0.to_text) is Ok(m_b)
+  assert save_memory(db, "shared", "fact", "M10 mem C", "user", t0.to_text) is Ok(_m_c)
+
+  assert open_world(db, "w-m10-range", "operator:worlds", 600, t0) is Ok(_)
+  assert world_query(db, "w-m10-range", "get_memory", Json.int(m_a.id), t0) is Ok(_)
+  assert world_query(
+    db,
+    "w-m10-range",
+    "scan_memories_range",
+    Json.Object({
+      "start_id": Json.int(m_a.id),
+      "end_id": Json.int(m_b.id + 1),
+      "limit": Json.int(10)
+    }),
+    t0
+  ) is
+    Ok(_)
+  assert world_call(
+    db,
+    "w-m10-range",
+    "save_memory",
+    Json.Object({
+      "scope": Json.String("shared"),
+      "kind": Json.String("fact"),
+      "content": Json.String("M10 range staged"),
+      "provenance": Json.String("operator"),
+      "origin": Json.String("owner"),
+      "session_kind": Json.String("direct"),
+      "staged": Json.Boolean(false),
+      "now_text": Json.String(t0.to_text)
+    }),
+    "range skip write",
+    t0
+  ) is
+    Ok(_)
+  # Saving m_d outside [m_a.id, m_b.id + 1) skips both get_memory(m_a) and scan_memories_range!
+  assert save_memory(db, "shared", "fact", "M10 mem D disjoint", "user", t0.to_text) is Ok(_)
+  assert land_world(db, "w-m10-range", "land range skip", t0) is Ok(r_range) and
+    r_range.reads_verified == 2 and
+    r_range.reads_skipped == 2
+
+  # Induce StaleRead on system:dreaming principal, issue PriorityTicket, defer competitor, rescue starved
+  assert open_world(db, "w-m10-induce", "system:dreaming", 600, t0) is Ok(_)
+  assert world_query(db, "w-m10-induce", "get_memory", Json.int(m_b.id), t0) is Ok(_)
+  assert update_memory_content(db, m_b.id, "M10 mem B edited concurrently") is Ok(_)
+  assert land_world(db, "w-m10-induce", "expect stale on m_b", t0) is Error(Conflict(message: _))
+
+  assert open_world(db, "w-m10-starved", "system:dreaming", 600, t0) is Ok(_)
+  assert world_call(
+    db,
+    "w-m10-starved",
+    "save_memory",
+    Json.Object({
+      "scope": Json.String("shared"),
+      "kind": Json.String("fact"),
+      "content": Json.String("M10 starved save"),
+      "provenance": Json.String("dreaming"),
+      "origin": Json.String("owner"),
+      "session_kind": Json.String("direct"),
+      "staged": Json.Boolean(false),
+      "now_text": Json.String(t0.to_text)
+    }),
+    "starved write",
+    t0
+  ) is
+    Ok(_)
+  assert open_world(db, "w-m10-comp", "operator:worlds", 600, t0) is Ok(_)
+  assert world_call(
+    db,
+    "w-m10-comp",
+    "save_memory",
+    Json.Object({
+      "scope": Json.String("shared"),
+      "kind": Json.String("fact"),
+      "content": Json.String("M10 comp save"),
+      "provenance": Json.String("operator"),
+      "origin": Json.String("owner"),
+      "session_kind": Json.String("direct"),
+      "staged": Json.Boolean(false),
+      "now_text": Json.String(t0.to_text)
+    }),
+    "comp write",
+    t0
+  ) is
+    Ok(_)
+  assert claim_world_priority(db, "w-m10-starved", ["memories"], 1, 15, t0) is Ok(_)
+  assert land_world_fair(db, "w-m10-comp", "comp yields", t0) is
+    Ok(World.DeferredByFairness(ticket: _, retry_after: _))
+  assert land_world_fair(db, "w-m10-starved", "starved lands", t0) is Ok(World.LandedOk(result: _))
+  assert land_world_fair(db, "w-m10-comp", "comp retries", t0) is Ok(World.LandedOk(result: _))
+
+  # Nested Child World: widening grant rejected (PolicyDenied), valid child merges & parent lands
+  assert open_world(db, "w-m10-parent", "operator:worlds", 600, t0) is Ok(_)
+  assert open_child_world(db, "w-m10-parent", "w-bad-kid", "system:dreaming", 300, t0) is
+    Error(PolicyDenied(message: _))
+  assert open_child_world(db, "w-m10-parent", "w-m10-kid", "operator:worlds", 300, t0) is Ok(_)
+  assert list_child_worlds(db, "w-m10-parent") is Ok(kids) and kids.size == 1
+  assert world_call(
+    db,
+    "w-m10-kid",
+    "save_memory",
+    Json.Object({
+      "scope": Json.String("shared"),
+      "kind": Json.String("fact"),
+      "content": Json.String("M10 child world memory"),
+      "provenance": Json.String("operator"),
+      "origin": Json.String("owner"),
+      "session_kind": Json.String("direct"),
+      "staged": Json.Boolean(false),
+      "now_text": Json.String(t0.to_text)
+    }),
+    "child world write",
+    t0
+  ) is
+    Ok(_)
+  assert land_child_world(db, "w-m10-kid", "merge child", t0) is Ok(lc_res) and
+    lc_res.calls_merged == 1
+  assert land_world_fair(db, "w-m10-parent", "land parent", t0) is Ok(World.LandedOk(result: _))
+  assert list_worlds_overview(db) is Ok(wov2)
+  assert wov2.telemetry.key_level_reads_skipped >= 2
+  assert wov2.telemetry.starved_worlds_rescued >= 1
+  assert wov2.telemetry.child_worlds_landed >= 1
+  assert wov2.links.any?(fn(l) l.child_world_id == "w-m10-kid" and l.merged_into_parent? end)
 
   assert backup_to_file(db, "motet-online-backup.modb", true) is Ok(bak_rep)
   assert bak_rep.include_internal and bak_rep.free_page_count == 0

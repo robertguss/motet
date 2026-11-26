@@ -21,7 +21,7 @@ use Modb.Grants
 use Modb.Ledger
 use Modb.Replay
 use Modb.Views
-use Modb.World{BucketDiffSummary, LandResult, WorldRecord}
+use Modb.World{BucketDiffSummary, ChildLandResult, LandOutcome, LandResult, PriorityTicket, WorldRecord}
 use Oauth
 use Scheduler
 use Skills
@@ -56,6 +56,7 @@ use Types{
   MemoryEntry,
   ModbVerifySummary,
   MotetError,
+  OpenChildWorldRequest,
   OpenWorldRequest,
   PolicyRule,
   ProviderKind,
@@ -92,6 +93,7 @@ use Types{
   WeeklyAuditReport,
   WorldCallRequest,
   WorldLandRequest,
+  WorldPriorityRequest,
   WorldQueryRequest
 }
 use Vault
@@ -224,6 +226,11 @@ api
   post "/v1/modb/worlds/:id/call" post_modb_world_call
   post "/v1/modb/worlds/:id/land" post_modb_world_land
   post "/v1/modb/worlds/:id/drop" post_modb_world_drop
+  get "/v1/modb/worlds/:id/children" get_modb_world_children
+  post "/v1/modb/worlds/:id/children" post_modb_world_children
+  post "/v1/modb/worlds/:id/land-child" post_modb_world_land_child
+  post "/v1/modb/worlds/:id/priority" post_modb_world_priority
+  post "/v1/modb/worlds/:id/land-fair" post_modb_world_land_fair
   get "/v1/modb/grants" get_modb_grants
   post "/v1/modb/grants/:id/revoke" post_modb_revoke_grant
   get "/v1/modb/claims" get_modb_claims
@@ -1900,6 +1907,105 @@ fn post_modb_world_drop(_op: Operator, files: Files, clock: Clock, id: Text) : R
   Ok(Json.Object({"id": id.to_json, "status": "dropped".to_json}))
 end
 
+fn get_modb_world_children(_op: Operator, files: Files, clock: Clock, id: Text) : Result(
+  List(WorldRecord),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_child_worlds(db, id)
+end
+
+fn post_modb_world_children(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  req: Api.Request
+) : Result(WorldRecord, MotetError)
+  db = try ensure_ready(files, clock)
+  raw = (req.text or "").trim
+  body = if raw.empty?
+    OpenChildWorldRequest(id: None, grant_id: None, ttl_seconds: None)
+  else
+    try Json.decode[OpenChildWorldRequest](raw).map_error(fn(e)
+      BadInput(message: "invalid open child world payload: #{e}")
+    end)
+  end
+  cid = case body.id
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None:
+      kids = try Store.list_child_worlds(db, id)
+      "#{id}-child-#{kids.size + 1}"
+  end
+  gid = case body.grant_id
+    Some(g) if not g.trim.empty?: g.trim
+    Some(_) | None:
+      pw = try (try Store.get_world(db, id)).or_fail(
+        ItemNotFound(message: "parent world '#{id}' not found")
+      )
+      pw.grant_id
+  end
+  Store.open_child_world(db, id, cid, gid, body.ttl_seconds or 1800, clock.now)
+end
+
+fn post_modb_world_land_child(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  req: Api.Request
+) : Result(ChildLandResult, MotetError)
+  db = try ensure_ready(files, clock)
+  raw = (req.text or "").trim
+  reason = if raw.empty?
+    "merge child world #{id} via API"
+  else
+    wl = try Json.decode[WorldLandRequest](raw).map_error(fn(e)
+      BadInput(message: "invalid land child world payload: #{e}")
+    end)
+    wl.reason or "merge child world #{id} via API"
+  end
+  Store.land_child_world(db, id, reason, clock.now)
+end
+
+fn post_modb_world_priority(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  body: WorldPriorityRequest
+) : Result(PriorityTicket, MotetError)
+  db = try ensure_ready(files, clock)
+  Store.claim_world_priority(
+    db,
+    id,
+    body.buckets,
+    body.min_stale_threshold or 1,
+    body.hold_seconds or 15,
+    clock.now
+  )
+end
+
+fn post_modb_world_land_fair(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  req: Api.Request
+) : Result(LandOutcome, MotetError)
+  db = try ensure_ready(files, clock)
+  raw = (req.text or "").trim
+  reason = if raw.empty?
+    "land world #{id} fairly via API"
+  else
+    wl = try Json.decode[WorldLandRequest](raw).map_error(fn(e)
+      BadInput(message: "invalid land-fair world payload: #{e}")
+    end)
+    wl.reason or "land world #{id} fairly via API"
+  end
+  Store.land_world_fair(db, id, reason, clock.now)
+end
+
 fn get_modb_grants(_op: Operator, files: Files, clock: Clock) : Result(
   List(Grants.Grant),
   MotetError
@@ -2210,14 +2316,25 @@ fn post_mcp(
       Json.Object({
         "name": Json.String("motet_worlds"),
         "description": Json.String(
-          "Inspect speculative CoW Worlds and LandingMetrics, or diff/land/drop a specific World"
+          "Inspect speculative CoW Worlds, Telemetry, and Child Worlds, or open/query/call/diff/land/land_fair/drop/fork/merge/claim_priority on Worlds"
         ),
         "inputSchema": Json.Object({
           "type": Json.String("object"),
           "properties": Json.Object({
             "action": Json.Object({"type": Json.String("string")}),
             "world_id": Json.Object({"type": Json.String("string")}),
+            "parent_world_id": Json.Object({"type": Json.String("string")}),
             "grant_id": Json.Object({"type": Json.String("string")}),
+            "ttl_seconds": Json.Object({"type": Json.String("integer")}),
+            "query": Json.Object({"type": Json.String("string")}),
+            "call_action": Json.Object({"type": Json.String("string")}),
+            "args": Json.Object({"type": Json.String("object")}),
+            "buckets": Json.Object({
+              "type": Json.String("array"),
+              "items": Json.Object({"type": Json.String("string")})
+            }),
+            "min_stale_threshold": Json.Object({"type": Json.String("integer")}),
+            "hold_seconds": Json.Object({"type": Json.String("integer")}),
             "reason": Json.Object({"type": Json.String("string")})
           })
         })
@@ -2286,6 +2403,69 @@ fn post_mcp(
     if tname == "motet_worlds"
       act = (args.text_at("action") or "list").trim
       wid = (args.text_at("world_id") or "").trim
+      if act == "open"
+        eff_id = if not wid.empty?
+          wid
+        else
+          ov = try Store.list_worlds_overview(db)
+          slug = clock.now.to_text.replace(":", "-").replace(".", "-")
+          "mcp-world-#{ov.worlds.size + 1}-#{slug}"
+        end
+        gid = case args.text_at("grant_id")
+          Some(g) if not g.trim.empty?: g.trim
+          Some(_) | None: "operator:worlds"
+        end
+        w = try Store.open_world(db, eff_id, gid, args.int_at("ttl_seconds") or 3600, clock.now)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(w), w.to_json)))
+      end
+      if act == "open_child"
+        pwid = (args.text_at("parent_world_id") or "").trim
+        return Error(BadInput(message: "parent_world_id required")) if pwid.empty?
+        cid = if not wid.empty?
+          wid
+        else
+          kids = try Store.list_child_worlds(db, pwid)
+          "#{pwid}-child-#{kids.size + 1}"
+        end
+        gid = case args.text_at("grant_id")
+          Some(g) if not g.trim.empty?: g.trim
+          Some(_) | None:
+            pw = try (try Store.get_world(db, pwid)).or_fail(
+              ItemNotFound(message: "parent world '#{pwid}' not found")
+            )
+            pw.grant_id
+        end
+        cw = try Store.open_child_world(
+          db,
+          pwid,
+          cid,
+          gid,
+          args.int_at("ttl_seconds") or 1800,
+          clock.now
+        )
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(cw), cw.to_json)))
+      end
+      if act == "list_children"
+        pwid = (args.text_at("parent_world_id") or wid).trim
+        return Error(BadInput(message: "parent_world_id required")) if pwid.empty?
+        kids = try Store.list_child_worlds(db, pwid)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(kids), kids.to_json)))
+      end
+      if act == "query" and not wid.empty?
+        qname = (args.text_at("query") or "").trim
+        return Error(BadInput(message: "query required")) if qname.empty?
+        qargs = args.path("args") or Json.Object({})
+        ans = try Store.world_query(db, wid, qname, qargs, clock.now)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(ans), ans)))
+      end
+      if act == "call" and not wid.empty?
+        aname = (args.text_at("call_action") or "").trim
+        return Error(BadInput(message: "call_action required")) if aname.empty?
+        cargs = args.path("args") or Json.Object({})
+        rsn = args.text_at("reason") or "world call via MCP"
+        rep = try Store.world_call(db, wid, aname, cargs, rsn, clock.now)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(rep), rep)))
+      end
       if act == "diff" and not wid.empty?
         diffs = try Store.world_diff(db, wid)
         return Ok(mcp_ok(id, mcp_text_result(Json.encode(diffs), diffs.to_json)))
@@ -2294,6 +2474,33 @@ fn post_mcp(
         rsn = args.text_at("reason") or "landed via MCP"
         res = try Store.land_world(db, wid, rsn, clock.now)
         return Ok(mcp_ok(id, mcp_text_result(Json.encode(res), res.to_json)))
+      end
+      if act == "land_fair" and not wid.empty?
+        rsn = args.text_at("reason") or "landed fairly via MCP"
+        res = try Store.land_world_fair(db, wid, rsn, clock.now)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(res), res.to_json)))
+      end
+      if act == "land_child" and not wid.empty?
+        rsn = args.text_at("reason") or "merged child world via MCP"
+        res = try Store.land_child_world(db, wid, rsn, clock.now)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(res), res.to_json)))
+      end
+      if act == "claim_priority" and not wid.empty?
+        buckets = case args.path("buckets")
+          Some(bj): try Json.decode[List(Text)](bj.to_text).map_error(fn(e)
+            BadInput(message: "invalid buckets list: #{e}")
+          end)
+          None: ["memories"]
+        end
+        t = try Store.claim_world_priority(
+          db,
+          wid,
+          buckets,
+          args.int_at("min_stale_threshold") or 1,
+          args.int_at("hold_seconds") or 15,
+          clock.now
+        )
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(t), t.to_json)))
       end
       if act == "drop" and not wid.empty?
         _u = try Store.drop_world(db, wid)
@@ -3095,4 +3302,123 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
   assert sim_w.status == 200 and
     Json.decode[Store.ReplayProposalView](sim_w.text) is Ok(wspv) and
     wspv.summary.excluded >= 1
+
+  # Milestone 10: key-scoped query, Nested Child World REST + MCP, and fairness landing
+  w_p = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/worlds").with_bearer("secret-op").with_json(
+      OpenWorldRequest(id: Some("w-srv-parent"), grant_id: Some("operator:worlds"), ttl_seconds: Some(600))
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert w_p.status == 200
+  w_pq = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/worlds/w-srv-parent/query").with_bearer("secret-op").with_json(
+      WorldQueryRequest(query: "get_bot", args: Some(Json.String("chief")))
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert w_pq.status == 200 and w_pq.text.contains?("chief")
+
+  w_ch = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/worlds/w-srv-parent/children").with_bearer("secret-op").with_json(
+      OpenChildWorldRequest(id: Some("w-srv-child"), grant_id: None, ttl_seconds: Some(300))
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert w_ch.status == 200 and w_ch.text.contains?("w-srv-child")
+  w_chs = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/worlds/w-srv-parent/children").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert w_chs.status == 200 and w_chs.text.contains?("w-srv-child")
+
+  assert ApiTest.send(
+    Server,
+    Api.post("/v1/modb/worlds/w-srv-child/call").with_bearer("secret-op").with_json(
+      WorldCallRequest(
+        action: "save_memory",
+        args: Json.Object({
+          "scope": Json.String("shared"),
+          "kind": Json.String("fact"),
+          "content": Json.String("Server child world memory"),
+          "provenance": Json.String("operator"),
+          "origin": Json.String("owner"),
+          "session_kind": Json.String("direct"),
+          "staged": Json.Boolean(false),
+          "now_text": Json.String(t0.to_text)
+        }),
+        reason: Some("server child write")
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  ).status ==
+    200
+
+  mcp_lc = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_json(
+      Json.Object({
+        "jsonrpc": "2.0".to_json,
+        "id": 94.to_json,
+        "method": "tools/call".to_json,
+        "params": Json.Object({
+          "name": "motet_worlds".to_json,
+          "arguments": Json.Object({
+            "action": "land_child".to_json,
+            "world_id": "w-srv-child".to_json,
+            "reason": "merge server child via MCP".to_json
+          })
+        })
+      })
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_lc.status == 200 and mcp_lc.text.contains?("calls_merged\\\":1")
+
+  w_pf = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/worlds/w-srv-parent/land-fair").with_bearer("secret-op").with_json(
+      WorldLandRequest(reason: Some("fair land parent"))
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert w_pf.status == 200 and w_pf.text.contains?("landed_ok")
+
+  w_ov2 = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/worlds").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert w_ov2.status == 200 and
+    Json.decode[Store.WorldsOverview](w_ov2.text) is Ok(ov2) and
+    ov2.telemetry.child_worlds_landed >= 1 and
+    ov2.links.any?(fn(l) l.child_world_id == "w-srv-child" and l.merged_into_parent? end)
 end
