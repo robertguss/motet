@@ -1,7 +1,7 @@
 ## Durable pure-Mo MoDB storage engine for Motet (`motet.modb` + isolated `motet-secrets.modb`):
 ## - Layer 1/2: Crash-safe CoW B+Tree (`Modb`) + typed tables & secondary indexes (`Modb.Table`)
-##              + batched single-transaction inverted keyword indexes (`event_tokens`, `memory_tokens`)
-## - Layer 3:   Tamper-evident SHA-256 hash-chained audit ledger, schema v1, commit invariants
+##              + transactional BM25+ full-text search indexes (`Modb.Fts`: `events`, `memories`)
+## - Layer 3:   Tamper-evident SHA-256 hash-chained audit ledger, schema v2, commit invariants
 ## - Layer 4:   Attenuated `Grants`, `Claims` leases, `Views` + `OnboardingManifest`,
 ##              lossless `Replay`, and canonical SHA-256 `Export`.
 ## - Security:  AES-256-GCM Vault ciphertexts, OAuth PKCE state, and Bearer access tokens live ONLY
@@ -194,6 +194,7 @@ use Modb{WriteTx}
 use Modb.Claims
 use Modb.Errors{ModbError}
 use Modb.Export{BackupReport, PortableSnapshot}
+use Modb.Fts{DocumentInput, FieldInput, FtsIndex, SearchOptions}
 use Modb.Grants{GrantSpec}
 use Modb.Ledger{AuditEntry, LedgerError, Schema, WriteMeta}
 use Modb.Replay{ReplayCatalog, ReplayFilter, ReplayProposal}
@@ -626,6 +627,24 @@ fn table_err(e: TableError) : MotetError
   StorageFailed(message: e.to_text)
 end
 
+fn fts_err(e: Fts.FtsError) : MotetError
+  StorageFailed(message: "fts error: #{e.to_text}")
+end
+
+fn fts_to_table_err(e: Fts.FtsError) : TableError
+  case e
+    Fts.Storage(me): Table.Storage(me)
+    Fts.TableFailure(te): te
+    Fts.InvalidConfig(reason: r) | Fts.InvalidDocument(reason: r): Table.Storage(
+      Errors.InvalidArgument(reason: r)
+    )
+  end
+end
+
+fn wrap_fts(res: Result(T, Fts.FtsError)) : Result(T, Text)
+  res.map_error(fn(e) e.to_text end)
+end
+
 fn ledger_err(e: LedgerError) : MotetError
   case e
     InvariantViolation(name: n, detail: d): BadInput(message: "invariant '#{n}': #{d}")
@@ -965,51 +984,73 @@ fn tokenize(text: Text) : List(Text)
   cleaned.words.unique
 end
 
-fn token_index_key(tok: Text, id: Int) : Bytes
-  Table.encode_composite_key(Table.encode_text_key(tok), Table.encode_int_key(id))
+fn events_fts_index() : FtsIndex
+  Fts.index("events")
 end
 
-fn token_prefix(tok: Text) : Bytes
-  Table.encode_composite_key(Table.encode_text_key(tok), Bytes.empty)
+fn memories_fts_index() : FtsIndex
+  Fts.index("memories")
 end
 
-fn tx_index_tokens(tx: WriteTx, bucket: Text, tokens: List(Text), id: Int) : Result(
-  WriteTx,
-  TableError
-)
+fn event_fts_doc(ev: SessionEvent) : DocumentInput
+  DocumentInput(
+    doc_id: "#{ev.id}",
+    scope: ev.session_id,
+    fields: [
+      FieldInput(name: "content", text: ev.content, weight: 2),
+      FieldInput(name: "tool_name", text: ev.tool_name or "", weight: 2),
+      FieldInput(name: "kind", text: ev.kind, weight: 1)
+    ]
+  )
+end
+
+fn memory_fts_doc(m: MemoryRow) : DocumentInput
+  DocumentInput(
+    doc_id: "#{m.id}",
+    scope: m.scope,
+    fields: [
+      FieldInput(name: "content", text: m.content, weight: 3),
+      FieldInput(name: "kind", text: m.kind, weight: 2),
+      FieldInput(name: "scope", text: m.scope, weight: 1)
+    ]
+  )
+end
+
+fn delete_bucket_t(tx: WriteTx, bucket: Text) : Result(WriteTx, TableError)
+  Modb.tx_delete_bucket(tx, bucket).map_error(fn(e) Table.Storage(e) end)
+end
+
+fn migrate_v1_to_v2(tx: WriteTx) : Result(WriteTx, TableError)
   var cur = tx
-  for tok in tokens
-    cur = try Modb.tx_put(cur, bucket, token_index_key(tok, id), Bytes.empty).map_error(fn(e)
-      Table.Storage(e)
-    end)
+  for b in [
+    "event_tokens",
+    "memory_tokens",
+    "events_fts_postings",
+    "events_fts_docs",
+    "events_fts_df",
+    "events_fts_meta",
+    "memories_fts_postings",
+    "memories_fts_docs",
+    "memories_fts_df",
+    "memories_fts_meta"
+  ]
+    cur = try delete_bucket_t(cur, b)
+  end
+  ev_rows = try Table.tx_scan(cur, events_table(), None, None, 0)
+  for (_id, ev) in ev_rows
+    cur = try Fts.tx_index_document(cur, events_fts_index(), event_fts_doc(ev)).map_error(
+      fts_to_table_err
+    )
+  end
+  mem_rows = try Table.tx_scan(cur, memories_table(), None, None, 0)
+  for (_id, m) in mem_rows
+    if not m.staged and not m.archived?
+      cur = try Fts.tx_index_document(cur, memories_fts_index(), memory_fts_doc(m)).map_error(
+        fts_to_table_err
+      )
+    end
   end
   Ok(cur)
-end
-
-fn tx_delete_tokens(tx: WriteTx, bucket: Text, tokens: List(Text), id: Int) : Result(
-  WriteTx,
-  TableError
-)
-  var cur = tx
-  for tok in tokens
-    cur = try Modb.tx_delete(cur, bucket, token_index_key(tok, id)).map_error(fn(e)
-      Table.Storage(e)
-    end)
-  end
-  Ok(cur)
-end
-
-fn scan_token_ids_desc(store: Modb.Store, bucket: Text, tok: Text) : Result(List(Int), TableError)
-  pairs = try Modb.prefix_scan(store, bucket, token_prefix(tok), 0).map_error(fn(e)
-    Table.Storage(e)
-  end)
-  var ids = []
-  for (comp, _val) in pairs
-    (_ik, pk) = try Table.decode_composite_key(comp)
-    id = try Table.decode_int_key(pk)
-    ids = ids.append(id)
-  end
-  Ok(ids.reverse)
 end
 
 fn tx_next_id(tx: WriteTx, seq_name: Text) : Result((WriteTx, Int), TableError)
@@ -1036,10 +1077,12 @@ fn utc_day_prefix(ts: Text) : Text
   Text.from_chars(ts.chars.take(10))
 end
 
-## Schema v1 with commit-time invariants across Motet's persistent state.
+## Schema v2 with commit-time invariants and transactional BM25 FTS across Motet's state.
 fn motet_schema() : Schema
-  Ledger.schema(1).with_require_reason(true).with_migration(
+  Ledger.schema(2).with_require_reason(true).with_migration(
     Ledger.migration(1, "initialize motet v1 schema", fn(tx) Ok(tx) end)
+  ).with_migration(
+    Ledger.migration(2, "migrate keyword buckets to Modb.Fts BM25 indexes", migrate_v1_to_v2)
   ).with_invariant(
     Ledger.row_invariant(
       "bots_valid",
@@ -1713,9 +1756,7 @@ fn action_append_event(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
       try wrap_t(Table.put(t3, stbl, sess.id, updated_sess))
     None: t3
   end
-  tname = a.tool_name or ""
-  tokens = tokenize("#{a.kind} #{tname} #{a.content}").take(64)
-  t5 = try wrap_t(tx_index_tokens(t4, "event_tokens", tokens, ev_id))
+  t5 = try wrap_fts(Fts.tx_index_document(t4, events_fts_index(), event_fts_doc(ev)))
   Ok((t5, ev.to_json))
 end
 
@@ -1735,8 +1776,11 @@ fn action_save_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
     created_at: a.now_text
   )
   t2 = try wrap_t(Table.put(t1, memories_table(), id, row))
-  tokens = tokenize("#{a.scope} #{a.kind} #{a.content}").take(64)
-  t3 = try wrap_t(tx_index_tokens(t2, "memory_tokens", tokens, id))
+  t3 = if not row.staged and not row.archived?
+    try wrap_fts(Fts.tx_index_document(t2, memories_fts_index(), memory_fts_doc(row)))
+  else
+    t2
+  end
   Ok((t3, mem_row_to_entry(row).to_json))
 end
 
@@ -1763,7 +1807,12 @@ fn action_promote_staged_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json
     )
   end
   t1 = try wrap_t(Table.put(tx, tbl, a.id, next_row))
-  Ok((t1, mem_row_to_entry(next_row).to_json))
+  t2 = if not next_row.staged and not next_row.archived?
+    try wrap_fts(Fts.tx_index_document(t1, memories_fts_index(), memory_fts_doc(next_row)))
+  else
+    t1
+  end
+  Ok((t2, mem_row_to_entry(next_row).to_json))
 end
 
 fn action_update_memory_content(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
@@ -1773,8 +1822,6 @@ fn action_update_memory_content(tx: WriteTx, args: Json) : Result((WriteTx, Json
     "item_not_found: memory ##{a.id} not found"
   )
   clean = a.content.trim
-  old_toks = tokenize("#{cur.scope} #{cur.kind} #{cur.content}").take(64)
-  t1 = try wrap_t(tx_delete_tokens(tx, "memory_tokens", old_toks, a.id))
   updated = MemoryRow(
     id: cur.id,
     scope: cur.scope,
@@ -1787,10 +1834,13 @@ fn action_update_memory_content(tx: WriteTx, args: Json) : Result((WriteTx, Json
     archived?: cur.archived?,
     created_at: cur.created_at
   )
-  t2 = try wrap_t(Table.put(t1, tbl, a.id, updated))
-  new_toks = tokenize("#{cur.scope} #{cur.kind} #{clean}").take(64)
-  t3 = try wrap_t(tx_index_tokens(t2, "memory_tokens", new_toks, a.id))
-  Ok((t3, mem_row_to_entry(updated).to_json))
+  t1 = try wrap_t(Table.put(tx, tbl, a.id, updated))
+  t2 = if not updated.staged and not updated.archived?
+    try wrap_fts(Fts.tx_index_document(t1, memories_fts_index(), memory_fts_doc(updated)))
+  else
+    try wrap_fts(Fts.tx_remove_document(t1, memories_fts_index(), "#{a.id}"))
+  end
+  Ok((t2, mem_row_to_entry(updated).to_json))
 end
 
 fn set_memory_archived_tx(tx: WriteTx, id: Int, archived?: Bool) : Result((WriteTx, Json), Text)
@@ -1809,7 +1859,12 @@ fn set_memory_archived_tx(tx: WriteTx, id: Int, archived?: Bool) : Result((Write
         archived?: archived?,
         created_at: cur.created_at
       )
-      try wrap_t(Table.put(tx, tbl, id, updated))
+      t_row = try wrap_t(Table.put(tx, tbl, id, updated))
+      if archived? or updated.staged
+        try wrap_fts(Fts.tx_remove_document(t_row, memories_fts_index(), "#{id}"))
+      else
+        try wrap_fts(Fts.tx_index_document(t_row, memories_fts_index(), memory_fts_doc(updated)))
+      end
     None: tx
   end
   Ok((t1, Json.Object({"ok": Json.Boolean(true)})))
@@ -1829,10 +1884,9 @@ fn action_delete_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
   a = try Json.decode[IdArgs](Json.encode(args).bytes).map_error(json_arg_err)
   tbl = memories_table()
   t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
-    Some(m):
-      tokens = tokenize("#{m.scope} #{m.kind} #{m.content}").take(64)
-      t_tok = try wrap_t(tx_delete_tokens(tx, "memory_tokens", tokens, a.id))
-      try wrap_t(Table.delete(t_tok, tbl, a.id))
+    Some(_m):
+      t_fts = try wrap_fts(Fts.tx_remove_document(tx, memories_fts_index(), "#{a.id}"))
+      try wrap_t(Table.delete(t_fts, tbl, a.id))
     None: tx
   end
   Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
@@ -2539,9 +2593,7 @@ fn action_import_snapshot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Tex
     prev_seq = max_seqs.get(ev.session_id) or 0
     max_seqs = max_seqs.set(ev.session_id, max_int_val(prev_seq, ev.seq))
     cur_tx = try wrap_t(Table.put(cur_tx, events_table(), ev.id, ev))
-    tname = ev.tool_name or ""
-    tokens = tokenize("#{ev.kind} #{tname} #{ev.content}").take(64)
-    cur_tx = try wrap_t(tx_index_tokens(cur_tx, "event_tokens", tokens, ev.id))
+    cur_tx = try wrap_fts(Fts.tx_index_document(cur_tx, events_fts_index(), event_fts_doc(ev)))
   end
 
   for s in snap.sessions
@@ -2564,8 +2616,11 @@ fn action_import_snapshot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Tex
   for m in snap.memories
     max_mem_id = max_int_val(max_mem_id, m.id)
     cur_tx = try wrap_t(Table.put(cur_tx, memories_table(), m.id, m))
-    tokens = tokenize("#{m.scope} #{m.kind} #{m.content}").take(64)
-    cur_tx = try wrap_t(tx_index_tokens(cur_tx, "memory_tokens", tokens, m.id))
+    if not m.staged and not m.archived?
+      cur_tx = try wrap_fts(
+        Fts.tx_index_document(cur_tx, memories_fts_index(), memory_fts_doc(m))
+      )
+    end
   end
 
   var max_dream_id = 0
@@ -3139,9 +3194,39 @@ fn motet_world_catalog() : World.Catalog
     ).with_action("save_artifact", action_save_artifact)
 end
 
-## Execution wrappers for `motet.modb`.
+## Execution wrappers for `motet.modb` (auto-upgrading older committed schemas on cold reads).
+enum ReadAttemptError
+  ReadNeedsUpgrade(LedgerError)
+  ReadOtherError(MotetError)
+end
+
+fn read_attempt_err(e: LedgerError) : ReadAttemptError
+  case e
+    InvalidMigration(reason: _): ReadNeedsUpgrade(e)
+    InvariantViolation(name: _, detail: _) | InvalidMeta(reason: _) | TableFailure(_) | SchemaTooNew(
+      found: _,
+      supported: _
+    ) | AuditCorrupt(reason: _): ReadOtherError(ledger_err(e))
+  end
+end
+
 fn with_db_read(db: DbHandle, work: fn(Ledger.Db) : Result(R, MotetError)) : Result(R, MotetError)
-  Ledger.read_locked(db.files.read_only, db.path, motet_schema(), ledger_err, work)
+  attempt = Ledger.read_locked(
+    db.files.read_only,
+    db.path,
+    motet_schema(),
+    read_attempt_err,
+    fn(ldb) work(ldb).map_error(fn(me) ReadOtherError(me) end) end
+  )
+  case attempt
+    Ok(v): Ok(v)
+    Error(ReadOtherError(me)): Error(me)
+    Error(ReadNeedsUpgrade(_)):
+      _mig = try Ledger.init_locked(db.files, db.path, motet_schema(), db.clock.now).map_error(
+        ledger_err
+      )
+      Ledger.read_locked(db.files.read_only, db.path, motet_schema(), ledger_err, work)
+  end
 end
 
 fn exec_replay_on(ldb: Ledger.Db, principal: Text, action: Text, reason: Text, at: Time, args: Json) : Result(
@@ -4137,24 +4222,21 @@ fn list_events_after(db: DbHandle, session_id: Text, after_seq: Int, limit: Int)
 end
 
 fn search_events(db: DbHandle, query: Text, limit: Int) : Result(List(SessionEvent), MotetError)
-  terms = tokenize(query)
-  return Ok([]) if terms.empty?
+  return Ok([]) if Fts.tokenize(query, 64).empty?
   cap = if limit > 0 and limit <= 100: limit else: 20
-  first_term = terms.first or ""
-  rest = terms.drop(1)
+  opts = SearchOptions(limit: cap, prefix_last_term?: true, required_scope: None)
   with_db_read(
     db,
     fn(ldb)
       st = Ledger.store(ldb)
-      ids = try scan_token_ids_desc(st, "event_tokens", first_term).map_error(table_err)
+      fts_hits = try Fts.search(st, events_fts_index(), query, opts).map_error(fts_err)
       var hits = []
-      for eid in ids
-        break if hits.size >= cap
-        case try Table.get(st, events_table(), eid).map_error(table_err)
-          Some(ev):
-            doc = tokenize("#{ev.kind} #{ev.tool_name or ""} #{ev.content}")
-            if rest.all?(fn(t) doc.contains?(t) end)
-              hits = hits.append(ev)
+      for fhit in fts_hits
+        case fhit.doc_id.to_int
+          Some(eid):
+            case try Table.get(st, events_table(), eid).map_error(table_err)
+              Some(ev): hits = hits.append(ev)
+              None: Unit
             end
           None: Unit
         end
@@ -4351,31 +4433,30 @@ fn search_memories(db: DbHandle, scope_opt: Option(Text), query: Text) : Result(
   List(MemoryEntry),
   MotetError
 )
-  terms = tokenize(query)
-  return list_memories(db, scope_opt, 20) if terms.empty?
-  first_term = terms.first or ""
-  rest = terms.drop(1)
+  return list_memories(db, scope_opt, 20) if Fts.tokenize(query, 64).empty?
+  opts = SearchOptions(limit: 20, prefix_last_term?: true, required_scope: None)
+  allow_doc = fn(_doc_id, doc_scope)
+    case scope_opt
+      Some(s): doc_scope == s or doc_scope == "shared"
+      None: true
+    end
+  end
   with_db_read(
     db,
     fn(ldb)
       st = Ledger.store(ldb)
-      ids = try scan_token_ids_desc(st, "memory_tokens", first_term).map_error(table_err)
+      fts_hits = try Fts.search_filtered(st, memories_fts_index(), query, opts, allow_doc).map_error(
+        fts_err
+      )
       var hits = []
-      for mid in ids
-        break if hits.size >= 20
-        case try Table.get(st, memories_table(), mid).map_error(table_err)
-          Some(m) if not m.staged and not m.archived?:
-            scope_ok = case scope_opt
-              Some(s): m.scope == s or m.scope == "shared"
-              None: true
+      for fhit in fts_hits
+        case fhit.doc_id.to_int
+          Some(mid):
+            case try Table.get(st, memories_table(), mid).map_error(table_err)
+              Some(m) if not m.staged and not m.archived?: hits = hits.append(mem_row_to_entry(m))
+              Some(_) | None: Unit
             end
-            if scope_ok
-              doc = tokenize("#{m.scope} #{m.kind} #{m.content}")
-              if rest.all?(fn(t) doc.contains?(t) end)
-                hits = hits.append(mem_row_to_entry(m))
-              end
-            end
-          Some(_) | None: Unit
+          None: Unit
         end
       end
       Ok(hits)
@@ -6882,4 +6963,185 @@ test "Modb Store enforces invariants, supports lossless selective-undo Replay, G
   assert backup_to_file(db, "motet-online-backup.modb", true) is Ok(bak_rep)
   assert bak_rep.include_internal and bak_rep.free_page_count == 0
   assert backup_to_file(db, "motet-online-backup.modb", false) is Error(Conflict(message: _))
+end
+
+test "Modb.Fts BM25 ranking, prefix search, memory lifecycle, and v1->v2 migration"
+  files = Files.in_memory({})
+  t0 = Time.parse("2026-11-26T00:00:00Z") or stop "time"
+  now = t0.to_text
+  clock = Clock.fixed(t0)
+  db = open(files, clock)
+  assert seed_defaults(db, now) is Ok(Unit)
+
+  # 1. BM25 relevance ranking + scope filtering + trailing-token prefix search on memories
+  assert save_memory(
+    db,
+    "personal",
+    "fact",
+    "Long travel note mentioning kyoto once at the end after many unrelated planning words for hotels and dining",
+    "user",
+    now
+  ) is
+    Ok(_m_weak)
+  assert save_memory(
+    db,
+    "personal",
+    "fact",
+    "Shinkansen shinkansen Kyoto rail pass confirmation",
+    "user",
+    now
+  ) is
+    Ok(m_strong)
+  assert save_memory(
+    db,
+    "finance",
+    "fact",
+    "Shinkansen Kyoto expense budget line item",
+    "user",
+    now
+  ) is
+    Ok(_m_other_scope)
+
+  assert search_memories(db, Some("personal"), "shinkansen kyoto") is Ok(mhits)
+  assert mhits.size == 2 and (mhits.first or stop "mhits").id == m_strong.id
+  assert search_memories(db, Some("personal"), "shink") is Ok(phits) and
+    phits.size == 1 and
+    (phits.first or stop "phits").id == m_strong.id
+
+  # 2. Memory lifecycle FTS hygiene: staged -> promote -> update -> archive -> restore -> delete
+  assert save_memory_full(
+    db,
+    "shared",
+    "fact",
+    "Staged sapphire token",
+    "dreaming",
+    "routine",
+    "isolated",
+    true,
+    now
+  ) is
+    Ok(m_st)
+  assert search_memories(db, None, "sapphire") == Ok([])
+  assert promote_staged_memory(db, m_st.id) is Ok(_)
+  assert search_memories(db, None, "sapphire") is Ok(shits1) and shits1.size == 1
+  assert update_memory_content(db, m_st.id, "Promoted emerald token") is Ok(_)
+  assert search_memories(db, None, "sapphire") == Ok([])
+  assert search_memories(db, None, "emerald") is Ok(shits2) and shits2.size == 1
+  assert archive_memory(db, m_st.id) is Ok(Unit)
+  assert search_memories(db, None, "emerald") == Ok([])
+  assert restore_memory(db, m_st.id) is Ok(Unit)
+  assert search_memories(db, None, "emerald") is Ok(shits3) and shits3.size == 1
+  assert delete_memory(db, m_st.id) is Ok(Unit)
+  assert search_memories(db, None, "emerald") == Ok([])
+
+  # 3. Session events BM25 ranking + prefix search
+  assert get_or_create_canonical_session(db, "chief", now) is Ok(csess)
+  assert append_event(db, csess.id, "message", "user", "Check Mercury receipts soon", None, None, 0.0, now) is
+    Ok(_)
+  assert search_events(db, "mercur", 10) is Ok(ehits) and ehits.size == 1
+
+  # 4. Atomic v1 -> v2 schema upgrade + cold-read auto-migration (exact motet.exe.xyz upgrade)
+  v1_files = Files.in_memory({})
+  sc_v1 = Ledger.schema(1).with_require_reason(true).with_migration(
+    Ledger.migration(1, "init v1", fn(tx) Ok(tx) end)
+  )
+  assert Ledger.open(v1_files, default_db_path, sc_v1, t0) is Ok(ldb_v1)
+  v1_meta = WriteMeta(principal: "operator", action: "seed_v1", reason: "legacy v1 fixture", at: t0)
+  assert Ledger.write(
+    ldb_v1,
+    v1_meta,
+    "seed legacy v1 rows",
+    Json.Object({}),
+    fn(tx)
+      t1 = try Table.put(
+        tx,
+        sessions_table(),
+        "chief-main",
+        SessionSummary(
+          id: "chief-main",
+          bot_name: "chief",
+          title: "Main",
+          trust: Owner,
+          canonical?: true,
+          compaction_seq: 0,
+          created_at: now,
+          updated_at: now,
+          event_count: 1
+        )
+      )
+      t2 = try Table.put(
+        t1,
+        events_table(),
+        1,
+        SessionEvent(
+          id: 1,
+          session_id: "chief-main",
+          seq: 1,
+          kind: "message",
+          role: "user",
+          content: "Legacy cobalt invoice lookup",
+          tool_name: None,
+          tool_call_id: None,
+          tool_calls_json: None,
+          cost_usd: 0.0,
+          created_at: now
+        )
+      )
+      t3 = try Table.put(
+        t2,
+        memories_table(),
+        1,
+        MemoryRow(
+          id: 1,
+          scope: "shared",
+          kind: "fact",
+          content: "Legacy amber preference active",
+          provenance: "user",
+          origin: "owner",
+          session_kind: "direct",
+          staged: false,
+          archived?: false,
+          created_at: now
+        )
+      )
+      t4 = try Table.put(
+        t3,
+        memories_table(),
+        2,
+        MemoryRow(
+          id: 2,
+          scope: "shared",
+          kind: "fact",
+          content: "Legacy archived hidden note",
+          provenance: "user",
+          origin: "owner",
+          session_kind: "direct",
+          staged: false,
+          archived?: true,
+          created_at: now
+        )
+      )
+      t5 = try Table.put(t4, seqs_table(), "events", 1)
+      t6 = try Table.put(t5, seqs_table(), "memories", 2)
+      t7 = try Table.put(t6, seqs_table(), "_seeded", 1)
+      t8 = try Modb.tx_put(t7, "event_tokens", "cobalt".bytes, Bytes.empty).map_error(fn(e)
+        Table.Storage(e)
+      end)
+      Modb.tx_put(t8, "memory_tokens", "amber".bytes, Bytes.empty).map_error(fn(e)
+        Table.Storage(e)
+      end)
+    end
+  ) is
+    Ok(_)
+
+  # Cold read immediately after opening upgraded binary must auto-migrate v1 -> v2 and serve hits
+  db_v2 = open(v1_files, clock)
+  assert search_events(db_v2, "cobalt", 10) is Ok(v2_ehits) and v2_ehits.size == 1
+  assert search_memories(db_v2, None, "amber") is Ok(v2_mhits) and v2_mhits.size == 1
+  assert search_memories(db_v2, None, "archived") == Ok([])
+  assert verify_all(db_v2) is Ok(v2_rep) and v2_rep.ok? and v2_rep.schema_version == 2
+  assert Modb.open_read_only(v1_files.read_only, default_db_path) is Ok(raw_v2)
+  assert Modb.buckets(raw_v2) is Ok(bkts)
+  assert not bkts.contains?("event_tokens") and not bkts.contains?("memory_tokens")
+  assert bkts.contains?("events_fts_postings") and bkts.contains?("memories_fts_postings")
 end
