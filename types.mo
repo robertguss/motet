@@ -96,7 +96,8 @@ decision_from_text,
 approval_status_to_text,
 approval_status_from_text,
 StreamBotRequest(..),
-StreamCommitRequest(..)
+StreamCommitRequest(..),
+InternalSsePublishRequest(..)
 use Json
 
 enum ProviderKind
@@ -932,4 +933,11 @@ struct StreamCommitRequest
   prompt: Text
   reply: Text
   bot_name: Text
+end
+
+## Request body for loopback `POST /v1/events/publish` (used by workers and `motet watch`).
+struct InternalSsePublishRequest
+  topic: Text
+  event: Text
+  payload: Json
 end

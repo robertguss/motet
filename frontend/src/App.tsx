@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Activity,
   Bot,
@@ -40,7 +40,7 @@ import {
   VaultSecretMeta,
   WebhookConfig,
 } from './lib/api';
-import { subscribeSse } from './lib/sse';
+import { SseEventFrame, subscribeSse } from './lib/sse';
 import { Badge, Button } from './components/ui';
 import { ChatStudioView } from './views/ChatStudioView';
 import { BotsView, InboxView } from './views/InboxAndBotsView';
@@ -154,6 +154,14 @@ export default function App() {
     window.setTimeout(() => setToastMsg((cur) => (cur === msg ? '' : cur)), 3600);
   }, []);
 
+  const sseListenersRef = useRef<Set<(ev: SseEventFrame) => void>>(new Set());
+  const subscribeLiveEvents = useCallback((listener: (ev: SseEventFrame) => void) => {
+    sseListenersRef.current.add(listener);
+    return () => {
+      sseListenersRef.current.delete(listener);
+    };
+  }, []);
+
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('motet_theme', theme);
@@ -231,7 +239,13 @@ export default function App() {
     const unsubSse = subscribeSse('/v1/events/stream', {
       onStatus: (connected) => setSseConnected(connected),
       onEvent: (ev) => {
-        if (ev.event !== 'health') {
+        sseListenersRef.current.forEach((fn) => fn(ev));
+        if (
+          ev.event !== 'health' &&
+          ev.event !== 'ai.token' &&
+          ev.event !== 'ai.stream_started' &&
+          ev.event !== 'run.step'
+        ) {
           void refreshAll();
         }
       },
@@ -327,6 +341,7 @@ export default function App() {
               activeBot={activeBot}
               onSelectBot={setActiveBot}
               onRefresh={refreshAll}
+              subscribeLiveEvents={subscribeLiveEvents}
               toast={toast}
             />
           ) : (

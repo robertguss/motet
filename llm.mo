@@ -8,14 +8,17 @@ expose PromptTiers(..),
 ToolDef(..),
 LlmMessage(..),
 LlmResponse(..),
+StreamSink(..),
 EmbedTask(..),
 EmbedProvider(..),
 EmbedConfig(..),
 build_http_request,
+build_stream_http_request,
 resolve_gemini_stream_url,
 build_stream_relay,
 chat_turn,
 chat_turn_with_key,
+chat_turn_stream_with_key,
 resolve_embed_config,
 build_embed_request,
 build_batch_embed_request,
@@ -26,7 +29,7 @@ use Http
 use Json
 use Mcp{parse_host_port}
 use Modb.Vec
-use Types{BotConfig, MotetError, ProviderKind, ToolCallReq}
+use Types{BotConfig, InternalSsePublishRequest, MotetError, ProviderKind, ToolCallReq}
 
 struct PromptTiers
   stable: Text
@@ -52,6 +55,25 @@ struct LlmResponse
   input_tokens: Int
   output_tokens: Int
   cached_input_tokens: Int
+end
+
+## Target HTTP loopback endpoint for coalesced SSE live-event pushes during streamed LLM turns.
+struct StreamSink
+  url: Text
+  bearer_token: Option(Text)
+  topic: Text
+  meta: Json
+end
+
+struct ToolSlot
+  id: Text
+  name: Text
+  args: Text
+end
+
+struct CoalesceBuf
+  buf: Text
+  last_flush: Time
 end
 
 fn parse_json_or_empty_obj(raw: Text) : Json
@@ -615,15 +637,480 @@ fn build_http_request(
   end
 end
 
-## Sends one LLM turn using an already-resolved API key (Vault or Env) with 429/529 retry.
-fn chat_turn_with_key(
+fn build_openai_stream_payload(
+  bot: BotConfig,
+  tiers: PromptTiers,
+  messages: List(LlmMessage),
+  tools: List(ToolDef)
+) : Json
+  base = with_stream_flag(build_openai_payload(bot, tiers, messages, tools))
+  if bot.model_tier == "local"
+    base
+  else
+    case base
+      Json.Object(m): Json.Object(
+        m.set("stream_options", Json.Object({"include_usage": Json.Boolean(true)}))
+      )
+      Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): base
+    end
+  end
+end
+
+## Builds a streaming HTTP request (`stream: true` / Gemini `streamGenerateContent?alt=sse`)
+## supporting tools and exact token usage metadata.
+fn build_stream_http_request(
+  bot: BotConfig,
+  api_key: Text,
+  tiers: PromptTiers,
+  messages: List(LlmMessage),
+  tools: List(ToolDef)
+) : Http.Request
+  case bot.provider
+    OpenAiCompat:
+      payload = build_openai_stream_payload(bot, tiers, messages, tools)
+      var req = Http.post(bot.endpoint)
+      if not api_key.empty?
+        req = req.header("Authorization", "Bearer #{api_key}")
+      end
+      req.json(payload).within(60.seconds)
+    Anthropic:
+      payload = with_stream_flag(build_anthropic_payload(bot, tiers, messages, tools))
+      Http.post(bot.endpoint).header("x-api-key", api_key).header("anthropic-version", "2023-06-01")
+        .json(payload).within(60.seconds)
+    Gemini:
+      url = resolve_gemini_stream_url(bot.endpoint, bot.model)
+      payload = build_gemini_payload(tiers, messages, tools)
+      Http.post(url).header("x-goog-api-key", api_key).json(payload).within(60.seconds)
+  end
+end
+
+fn empty_tool_slots() : Map(Int, ToolSlot)
+  {}
+end
+
+fn finalize_tool_slots(
+  slots: Map(Int, ToolSlot),
+  max_idx: Int,
+  default_prefix: Text
+) : List(ToolCallReq)
+  var out = []
+  var i = 0
+  while i <= max_idx
+    case slots.get(i)
+      Some(slot) if not slot.name.trim.empty?:
+        cid = if slot.id.trim.empty?: "#{default_prefix}#{i + 1}" else: slot.id
+        args_str = if slot.args.trim.empty?: "{}" else: slot.args
+        out = out.append(
+          ToolCallReq(id: cid, name: slot.name, arguments_json: args_str, thought_signature: None)
+        )
+      Some(_) | None: Unit
+    end
+    i += 1
+  end
+  out
+end
+
+fn build_sink_payload(meta: Json, delta: Text) : Json
+  case meta
+    Json.Object(m): Json.Object(m.set("delta", Json.String(delta)))
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): Json.Object({
+      "delta": Json.String(delta),
+      "meta": meta
+    })
+  end
+end
+
+fn flush_stream_sink(sink_net: Network, sink: StreamSink, chunk: Text) : Unit
+  return Unit if chunk.empty?
+  body = InternalSsePublishRequest(
+    topic: sink.topic,
+    event: "ai.token",
+    payload: build_sink_payload(sink.meta, chunk)
+  )
+  var req = Http.post(sink.url).json(body.to_json).within(2.seconds)
+  case sink.bearer_token
+    Some(tok) if not tok.trim.empty?: req = req.header("Authorization", "Bearer #{tok.trim}")
+    Some(_) | None: Unit
+  end
+  _ignored = req.send(sink_net)
+  Unit
+end
+
+fn push_coalesced_delta(
+  state: CoalesceBuf,
+  delta: Text,
+  clock: Clock,
+  sink_opt: Option(StreamSink),
+  sink_net: Network
+) : CoalesceBuf
+  return state if delta.empty?
+  case sink_opt
+    None: state
+    Some(sink):
+      combined = "#{state.buf}#{delta}"
+      elapsed_ms = (clock.now - state.last_flush).in_milliseconds
+      if combined.chars.size >= 24 or combined.contains?("\n") or elapsed_ms >= 60
+        flush_stream_sink(sink_net, sink, combined)
+        CoalesceBuf(buf: "", last_flush: clock.now)
+      else
+        CoalesceBuf(buf: combined, last_flush: state.last_flush)
+      end
+  end
+end
+
+fn flush_coalesced_end(
+  state: CoalesceBuf,
+  sink_opt: Option(StreamSink),
+  sink_net: Network
+) : Unit
+  return Unit if state.buf.empty?
+  case sink_opt
+    Some(sink): flush_stream_sink(sink_net, sink, state.buf)
+    None: Unit
+  end
+end
+
+fn consume_openai_sse(
+  stream0: Http.Stream,
+  clock: Clock,
+  sink_opt: Option(StreamSink),
+  sink_net: Network
+) : Result(LlmResponse, MotetError)
+  var cur = stream0
+  var text_parts = []
+  var slots = empty_tool_slots()
+  var max_idx = -1
+  var in_toks = 0
+  var out_toks = 0
+  var cached_toks = 0
+  var coal = CoalesceBuf(buf: "", last_flush: clock.now)
+  var done = false
+  while not done
+    (ev_opt, next_st) = try cur.next_sse_event.map_error(
+      fn(e) UpstreamFailed(message: "LLM SSE stream error: #{e}") end
+    )
+    cur = next_st
+    case ev_opt
+      None: done = true
+      Some(ev):
+        raw = ev.data.trim
+        if raw.empty? or raw == "[DONE]"
+          if raw == "[DONE]"
+            done = true
+          end
+        else
+          case Json.parse(raw)
+            Error(_): Unit
+            Ok(doc):
+              case doc.text_at("error.message")
+                Some(emsg) if not emsg.trim.empty?:
+                  return Error(UpstreamFailed(message: "LLM stream error: #{emsg}"))
+                Some(_) | None: Unit
+              end
+              case doc.path("choices.0.delta")
+                Some(delta):
+                  case delta.text_at("content")
+                    Some(t) if not t.empty?:
+                      text_parts = text_parts.append(t)
+                      coal = push_coalesced_delta(coal, t, clock, sink_opt, sink_net)
+                    Some(_) | None: Unit
+                  end
+                  tcs = delta.list_at("tool_calls") or []
+                  for (pos, tc) in tcs.enumerate
+                    idx = tc.int_at("index") or pos
+                    existing = slots.get(idx) or ToolSlot(id: "", name: "", args: "")
+                    new_id = case tc.text_at("id")
+                      Some(cid) if not cid.trim.empty?: cid
+                      Some(_) | None: existing.id
+                    end
+                    new_name = case tc.text_at("function.name")
+                      Some(fn_part) if not fn_part.empty?: "#{existing.name}#{fn_part}"
+                      Some(_) | None: existing.name
+                    end
+                    new_args = case tc.path("function.arguments")
+                      Some(Json.String(ap)): "#{existing.args}#{ap}"
+                      Some(other): "#{existing.args}#{other.to_text}"
+                      None: existing.args
+                    end
+                    slots = slots.set(idx, ToolSlot(id: new_id, name: new_name, args: new_args))
+                    if idx > max_idx
+                      max_idx = idx
+                    end
+                  end
+                None: Unit
+              end
+              case doc.int_at("usage.prompt_tokens")
+                Some(v): in_toks = v
+                None: Unit
+              end
+              case doc.int_at("usage.completion_tokens")
+                Some(v): out_toks = v
+                None: Unit
+              end
+              case doc.int_at("usage.prompt_tokens_details.cached_tokens")
+                Some(v): cached_toks = v
+                None: Unit
+              end
+          end
+        end
+    end
+  end
+  flush_coalesced_end(coal, sink_opt, sink_net)
+  Ok(
+    LlmResponse(
+      text: text_parts.join(""),
+      tool_calls: finalize_tool_slots(slots, max_idx, "call_"),
+      input_tokens: in_toks,
+      output_tokens: out_toks,
+      cached_input_tokens: cached_toks
+    )
+  )
+end
+
+fn consume_anthropic_sse(
+  stream0: Http.Stream,
+  clock: Clock,
+  sink_opt: Option(StreamSink),
+  sink_net: Network
+) : Result(LlmResponse, MotetError)
+  var cur = stream0
+  var text_parts = []
+  var has_text? = false
+  var slots = empty_tool_slots()
+  var max_idx = -1
+  var base_in = 0
+  var cache_read = 0
+  var cache_create = 0
+  var out_toks = 0
+  var coal = CoalesceBuf(buf: "", last_flush: clock.now)
+  var done = false
+  while not done
+    (ev_opt, next_st) = try cur.next_sse_event.map_error(
+      fn(e) UpstreamFailed(message: "LLM SSE stream error: #{e}") end
+    )
+    cur = next_st
+    case ev_opt
+      None: done = true
+      Some(ev):
+        raw = ev.data.trim
+        if not raw.empty?
+          case Json.parse(raw)
+            Error(_): Unit
+            Ok(doc):
+              kind = doc.text_at("type") or (ev.event or "")
+              if kind == "error"
+                emsg = doc.text_at("error.message") or "Anthropic stream error"
+                return Error(UpstreamFailed(message: "LLM stream error: #{emsg}"))
+              else if kind == "message_start"
+                base_in = doc.int_at("message.usage.input_tokens") or base_in
+                cache_read = doc.int_at("message.usage.cache_read_input_tokens") or cache_read
+                cache_create = doc.int_at("message.usage.cache_creation_input_tokens") or
+                  cache_create
+                case doc.int_at("message.usage.output_tokens")
+                  Some(v) if v > out_toks: out_toks = v
+                  Some(_) | None: Unit
+                end
+              else if kind == "content_block_start"
+                idx = doc.int_at("index") or 0
+                case doc.path("content_block")
+                  Some(cb):
+                    cb_kind = cb.text_at("type") or ""
+                    if cb_kind == "text"
+                      if has_text?
+                        text_parts = text_parts.append("\n")
+                        coal = push_coalesced_delta(coal, "\n", clock, sink_opt, sink_net)
+                      end
+                      has_text? = true
+                      case cb.text_at("text")
+                        Some(t) if not t.empty?:
+                          text_parts = text_parts.append(t)
+                          coal = push_coalesced_delta(coal, t, clock, sink_opt, sink_net)
+                        Some(_) | None: Unit
+                      end
+                    else if cb_kind == "tool_use"
+                      cid = cb.text_at("id") or "toolu_#{idx + 1}"
+                      fname = cb.text_at("name") or ""
+                      init_args = case cb.path("input")
+                        Some(Json.Object(m)) if not m.empty?: Json.Object(m).to_text
+                        Some(_) | None: ""
+                      end
+                      slots = slots.set(idx, ToolSlot(id: cid, name: fname, args: init_args))
+                      if idx > max_idx
+                        max_idx = idx
+                      end
+                    end
+                  None: Unit
+                end
+              else if kind == "content_block_delta"
+                idx = doc.int_at("index") or 0
+                case doc.path("delta")
+                  Some(d):
+                    d_kind = d.text_at("type") or ""
+                    if d_kind == "text_delta"
+                      has_text? = true
+                      case d.text_at("text")
+                        Some(t) if not t.empty?:
+                          text_parts = text_parts.append(t)
+                          coal = push_coalesced_delta(coal, t, clock, sink_opt, sink_net)
+                        Some(_) | None: Unit
+                      end
+                    else if d_kind == "input_json_delta"
+                      case d.text_at("partial_json")
+                        Some(pj) if not pj.empty?:
+                          existing = slots.get(idx) or
+                            ToolSlot(id: "toolu_#{idx + 1}", name: "", args: "")
+                          slots = slots.set(
+                            idx,
+                            ToolSlot(
+                              id: existing.id,
+                              name: existing.name,
+                              args: "#{existing.args}#{pj}"
+                            )
+                          )
+                          if idx > max_idx
+                            max_idx = idx
+                          end
+                        Some(_) | None: Unit
+                      end
+                    end
+                  None: Unit
+                end
+              else if kind == "message_delta"
+                case doc.int_at("usage.input_tokens")
+                  Some(v) if v > base_in: base_in = v
+                  Some(_) | None: Unit
+                end
+                case doc.int_at("usage.cache_read_input_tokens")
+                  Some(v) if v > cache_read: cache_read = v
+                  Some(_) | None: Unit
+                end
+                case doc.int_at("usage.cache_creation_input_tokens")
+                  Some(v) if v > cache_create: cache_create = v
+                  Some(_) | None: Unit
+                end
+                case doc.int_at("usage.output_tokens")
+                  Some(v): out_toks = v
+                  None: Unit
+                end
+              else if kind == "message_stop"
+                done = true
+              end
+          end
+        end
+    end
+  end
+  flush_coalesced_end(coal, sink_opt, sink_net)
+  total_in = base_in.saturating_add(cache_read).saturating_add(cache_create)
+  Ok(
+    LlmResponse(
+      text: text_parts.join("").trim,
+      tool_calls: finalize_tool_slots(slots, max_idx, "toolu_"),
+      input_tokens: total_in,
+      output_tokens: out_toks,
+      cached_input_tokens: cache_read
+    )
+  )
+end
+
+fn consume_gemini_sse(
+  stream0: Http.Stream,
+  clock: Clock,
+  sink_opt: Option(StreamSink),
+  sink_net: Network
+) : Result(LlmResponse, MotetError)
+  var cur = stream0
+  var text_parts = []
+  var calls = []
+  var in_toks = 0
+  var out_toks = 0
+  var cached_toks = 0
+  var coal = CoalesceBuf(buf: "", last_flush: clock.now)
+  var done = false
+  while not done
+    (ev_opt, next_st) = try cur.next_sse_event.map_error(
+      fn(e) UpstreamFailed(message: "LLM SSE stream error: #{e}") end
+    )
+    cur = next_st
+    case ev_opt
+      None: done = true
+      Some(ev):
+        raw = ev.data.trim
+        if not raw.empty? and raw != "[DONE]"
+          case Json.parse(raw)
+            Error(_): Unit
+            Ok(doc):
+              case doc.text_at("error.message")
+                Some(emsg) if not emsg.trim.empty?:
+                  return Error(UpstreamFailed(message: "LLM stream error: #{emsg}"))
+                Some(_) | None: Unit
+              end
+              parts = doc.list_at("candidates.0.content.parts") or []
+              for (pidx, p) in parts.enumerate
+                case p.text_at("text")
+                  Some(t) if not t.empty?:
+                    text_parts = text_parts.append(t)
+                    coal = push_coalesced_delta(coal, t, clock, sink_opt, sink_net)
+                  Some(_) | None: Unit
+                end
+                case p.path("functionCall")
+                  Some(fc):
+                    case fc.text_at("name")
+                      Some(fname):
+                        cid = fc.text_at("id") or "gem_call_#{calls.size + pidx + 1}"
+                        fargs = fc.get("args") or Json.Object({})
+                        sig = p.text_at("thoughtSignature")
+                        calls = calls.append(
+                          ToolCallReq(
+                            id: cid,
+                            name: fname,
+                            arguments_json: fargs.to_text,
+                            thought_signature: sig
+                          )
+                        )
+                      None: Unit
+                    end
+                  None: Unit
+                end
+              end
+              case doc.int_at("usageMetadata.promptTokenCount")
+                Some(v): in_toks = v
+                None: Unit
+              end
+              case doc.int_at("usageMetadata.candidatesTokenCount")
+                Some(v): out_toks = v
+                None: Unit
+              end
+              case doc.int_at("usageMetadata.cachedContentTokenCount")
+                Some(v): cached_toks = v
+                None: Unit
+              end
+          end
+        end
+    end
+  end
+  flush_coalesced_end(coal, sink_opt, sink_net)
+  Ok(
+    LlmResponse(
+      text: text_parts.join("").trim,
+      tool_calls: calls,
+      input_tokens: in_toks,
+      output_tokens: out_toks,
+      cached_input_tokens: cached_toks
+    )
+  )
+end
+
+## Sends one LLM turn with optional live SSE token sink (`StreamSink`), supporting SSE streams
+## (with tool calls + usage across OpenAI/Anthropic/Gemini) and transparent JSON response fallback.
+fn chat_turn_stream_with_key(
   network: Network,
   clock: Clock,
   bot: BotConfig,
   api_key: Text,
   tiers: PromptTiers,
   messages: List(LlmMessage),
-  tools: List(ToolDef)
+  tools: List(ToolDef),
+  sink_opt: Option(StreamSink)
 ) : Result(LlmResponse, MotetError)
   if not bot.api_key_env.trim.empty? and api_key.trim.empty? and bot.model_tier != "local"
     return Error(
@@ -633,30 +1120,61 @@ fn chat_turn_with_key(
     )
   end
 
+  use_stream_req? = not (sink_opt is None)
   target_url = case bot.provider
-    Gemini: resolve_gemini_url(bot.endpoint, bot.model)
+    Gemini:
+      if use_stream_req?
+        resolve_gemini_stream_url(bot.endpoint, bot.model)
+      else
+        resolve_gemini_url(bot.endpoint, bot.model)
+      end
     OpenAiCompat | Anthropic: bot.endpoint
   end
-  pinned = network.allow_hosts([parse_host_port(target_url)])
-  req = build_http_request(bot, api_key.trim, tiers, messages, tools)
+  llm_net = network.allow_hosts([parse_host_port(target_url)])
+  req = if use_stream_req?
+    build_stream_http_request(bot, api_key.trim, tiers, messages, tools)
+  else
+    build_http_request(bot, api_key.trim, tiers, messages, tools)
+  end
 
   var attempt = 0
   while attempt < 3
-    resp = try req.send(pinned).map_error(
+    st0 = try req.open_stream(llm_net).map_error(
       fn(e) UpstreamFailed(message: "LLM request failed: #{e}") end
     )
-    if resp.status == 429 or resp.status == 529
+    status = st0.stream_status
+    if status == 429 or status == 529
       if attempt < 2
         clock.sleep((attempt + 1).seconds)
         attempt += 1
         continue
       end
     end
-    if not resp.ok?
-      err_txt = (resp.text or "").replace("\n", " ").replace("\r", "").trim
+    if status < 200 or status >= 300
+      err_txt = case st0.collect
+        Ok(r): (r.text or "").replace("\n", " ").replace("\r", "").trim
+        Error(_): ""
+      end
       err_short = Text.from_chars(err_txt.chars.take(240))
-      return Error(UpstreamFailed(message: "LLM HTTP #{resp.status}: #{err_short}"))
+      return Error(UpstreamFailed(message: "LLM HTTP #{status}: #{err_short}"))
     end
+
+    ctype = (st0.stream_header("content-type") or "").ascii_lowercase
+    if ctype.contains?("text/event-stream")
+      sink_net = case sink_opt
+        Some(s): network.allow_hosts([parse_host_port(s.url)])
+        None: network
+      end
+      return case bot.provider
+        OpenAiCompat: consume_openai_sse(st0, clock, sink_opt, sink_net)
+        Anthropic: consume_anthropic_sse(st0, clock, sink_opt, sink_net)
+        Gemini: consume_gemini_sse(st0, clock, sink_opt, sink_net)
+      end
+    end
+
+    resp = try st0.collect.map_error(
+      fn(e) UpstreamFailed(message: "LLM response collect error: #{e}") end
+    )
     doc = try resp.json.map_error(
       fn(e) UpstreamFailed(message: "LLM response JSON parse error: #{e}") end
     )
@@ -667,6 +1185,19 @@ fn chat_turn_with_key(
     end
   end
   Error(UpstreamFailed(message: "LLM retry loop exhausted"))
+end
+
+## Sends one LLM turn using an already-resolved API key (Vault or Env) with 429/529 retry.
+fn chat_turn_with_key(
+  network: Network,
+  clock: Clock,
+  bot: BotConfig,
+  api_key: Text,
+  tiers: PromptTiers,
+  messages: List(LlmMessage),
+  tools: List(ToolDef)
+) : Result(LlmResponse, MotetError)
+  chat_turn_stream_with_key(network, clock, bot, api_key, tiers, messages, tools, None)
 end
 
 ## Sends one LLM turn reading its API key from Env (compatible helper).
@@ -1252,4 +1783,202 @@ test "build_stream_relay produces valid OpenAI, Anthropic, and Gemini SSE relay 
     rgem.token_event == None and
     rgem.headers.any?(fn(h) h.0 == "x-goog-api-key" and h.1 == "gem-k" end)
   assert build_stream_relay(gem_bot, "   ", tiers, msgs) is Error(_)
+end
+
+test "chat_turn_stream_with_key parses OpenAI, Anthropic, and Gemini SSE with tools, usage, and coalesced StreamSink"
+  clock = Clock.fixed(Time.parse("2026-04-15T09:00:00Z") or stop "time")
+  tiers = PromptTiers(stable: "S", context: "C", volatile: "V")
+  msgs = [UserMsg(content: "Check weather")]
+  tools = [
+    ToolDef(
+      name: "get_weather",
+      description: "Get weather",
+      schema: Json.Object({"type": Json.String("object")})
+    )
+  ]
+  sink = StreamSink(
+    url: "http://127.0.0.1:8000/v1/events/publish",
+    bearer_token: Some("tok-1"),
+    topic: "runs",
+    meta: Json.Object({"session_id": Json.String("s1"), "run_id": Json.String("r1")})
+  )
+
+  oai_bot = BotConfig(
+    name: "scout",
+    role: "Research",
+    persona: "Scout",
+    is_primary?: false,
+    model_tier: "grok",
+    provider: OpenAiCompat,
+    endpoint: "https://api.x.ai/v1/chat/completions",
+    api_key_env: "XAI_API_KEY",
+    model: "grok-4",
+    workspace: ".",
+    allowed_programs: [],
+    allowed_hosts: ["api.x.ai:443"],
+    connectors: [],
+    read_only_connectors: [],
+    daily_budget_usd: 5.0,
+    max_steps: 8,
+    active?: true
+  )
+  oai_req = build_stream_http_request(oai_bot, "xai-k", tiers, msgs, tools)
+  oai_sse = [
+    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}",
+    "data: {\"choices\":[{\"delta\":{\"content\":\"world\\n\"}}]}",
+    "data: {\"choices\":[{\"delta\":{\"content\":\"Checking\",\"tool_calls\":[{\"index\":0,\"id\":\"call_w1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\"}}]}}]}",
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"SF\\\"}\"}}]}}]}",
+    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":18,\"prompt_tokens_details\":{\"cached_tokens\":10}}}",
+    "data: [DONE]",
+    ""
+  ].join("\n\n")
+  sink_req1 = Http.post(sink.url).header("Authorization", "Bearer tok-1").json(
+    InternalSsePublishRequest(
+      topic: "runs",
+      event: "ai.token",
+      payload: Json.Object({
+        "session_id": Json.String("s1"),
+        "run_id": Json.String("r1"),
+        "delta": Json.String("Hello world\n")
+      })
+    ).to_json
+  ).within(2.seconds)
+  sink_req2 = Http.post(sink.url).header("Authorization", "Bearer tok-1").json(
+    InternalSsePublishRequest(
+      topic: "runs",
+      event: "ai.token",
+      payload: Json.Object({
+        "session_id": Json.String("s1"),
+        "run_id": Json.String("r1"),
+        "delta": Json.String("Checking")
+      })
+    ).to_json
+  ).within(2.seconds)
+  net_oai = Network.fake(
+    Http.replies([
+      (
+        oai_req,
+        Http.Response(
+          status: 200,
+          headers: [("Content-Type", "text/event-stream")],
+          body: oai_sse.bytes
+        )
+      ),
+      (sink_req1, Http.reply(200, "{\"ok\":true}")),
+      (sink_req2, Http.reply(200, "{\"ok\":true}"))
+    ])
+  )
+  assert chat_turn_stream_with_key(net_oai, clock, oai_bot, "xai-k", tiers, msgs, tools, Some(sink)) is
+    Ok(roai)
+  assert roai.text == "Hello world\nChecking"
+  assert roai.input_tokens == 42 and roai.output_tokens == 18 and roai.cached_input_tokens == 10
+  assert roai.tool_calls.size == 1
+  assert (roai.tool_calls.first or ToolCallReq(id: "", name: "", arguments_json: "", thought_signature: None)).id ==
+    "call_w1"
+  assert (roai.tool_calls.first or ToolCallReq(id: "", name: "", arguments_json: "", thought_signature: None)).name ==
+    "get_weather"
+  assert (roai.tool_calls.first or ToolCallReq(id: "", name: "", arguments_json: "", thought_signature: None)).arguments_json ==
+    "{\"city\":\"SF\"}"
+
+  ant_bot = BotConfig(
+    name: "chief",
+    role: "Chief",
+    persona: "Chief",
+    is_primary?: true,
+    model_tier: "claude",
+    provider: Anthropic,
+    endpoint: "https://api.anthropic.com/v1/messages",
+    api_key_env: "ANTHROPIC_API_KEY",
+    model: "claude-sonnet-4-5",
+    workspace: ".",
+    allowed_programs: [],
+    allowed_hosts: ["api.anthropic.com:443"],
+    connectors: [],
+    read_only_connectors: [],
+    daily_budget_usd: 10.0,
+    max_steps: 8,
+    active?: true
+  )
+  ant_req = build_stream_http_request(ant_bot, "sk-ant", tiers, msgs, tools)
+  ant_sse = [
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":5,\"output_tokens\":1}}}",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Working \"}}",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"on it.\"}}",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"get_weather\",\"input\":{}}}",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"NYC\\\"}\"}}",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":33}}",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}",
+    ""
+  ].join("\n\n")
+  net_ant = Network.fake(
+    Http.replies([
+      (
+        ant_req,
+        Http.Response(
+          status: 200,
+          headers: [("Content-Type", "text/event-stream; charset=utf-8")],
+          body: ant_sse.bytes
+        )
+      )
+    ])
+  )
+  assert chat_turn_stream_with_key(net_ant, clock, ant_bot, "sk-ant", tiers, msgs, tools, Some(sink)) is
+    Ok(rant)
+  assert rant.text == "Working on it."
+  assert rant.input_tokens == 125 and rant.output_tokens == 33 and rant.cached_input_tokens == 20
+  assert rant.tool_calls.size == 1
+  assert (rant.tool_calls.first or ToolCallReq(id: "", name: "", arguments_json: "", thought_signature: None)) ==
+    ToolCallReq(id: "toolu_9", name: "get_weather", arguments_json: "{\"city\":\"NYC\"}", thought_signature: None)
+
+  gem_bot = BotConfig(
+    name: "fin",
+    role: "Finance",
+    persona: "Finance",
+    is_primary?: false,
+    model_tier: "gemini",
+    provider: Gemini,
+    endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
+    api_key_env: "GEMINI_API_KEY",
+    model: "gemini-2.5-flash",
+    workspace: ".",
+    allowed_programs: [],
+    allowed_hosts: ["generativelanguage.googleapis.com:443"],
+    connectors: [],
+    read_only_connectors: [],
+    daily_budget_usd: 3.0,
+    max_steps: 8,
+    active?: true
+  )
+  gem_req = build_stream_http_request(gem_bot, "gem-k", tiers, msgs, tools)
+  gem_sse = [
+    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Checking \"}]}}],\"usageMetadata\":{\"promptTokenCount\":55,\"candidatesTokenCount\":4,\"cachedContentTokenCount\":12}}",
+    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"calendar.\"},{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"LA\"}},\"thoughtSignature\":\"sig-9\"}]}}],\"usageMetadata\":{\"promptTokenCount\":55,\"candidatesTokenCount\":14,\"cachedContentTokenCount\":12}}",
+    ""
+  ].join("\n\n")
+  net_gem = Network.fake(
+    Http.replies([
+      (
+        gem_req,
+        Http.Response(
+          status: 200,
+          headers: [("Content-Type", "text/event-stream")],
+          body: gem_sse.bytes
+        )
+      )
+    ])
+  )
+  assert chat_turn_stream_with_key(net_gem, clock, gem_bot, "gem-k", tiers, msgs, tools, Some(sink)) is
+    Ok(rgem)
+  assert rgem.text == "Checking calendar."
+  assert rgem.input_tokens == 55 and rgem.output_tokens == 14 and rgem.cached_input_tokens == 12
+  assert rgem.tool_calls.size == 1
+  assert (rgem.tool_calls.first or ToolCallReq(id: "", name: "", arguments_json: "", thought_signature: None)) ==
+    ToolCallReq(
+      id: "gem_call_2",
+      name: "get_weather",
+      arguments_json: "{\"city\":\"LA\"}",
+      thought_signature: Some("sig-9")
+    )
 end

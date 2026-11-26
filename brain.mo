@@ -5,7 +5,10 @@
 ## - Editable approval drafts + narrow Always-Allow rules + auto-resume after approval/denial
 ## - Async queued runs + live mid-run steering (steer / followup / interrupt) + standing routines.
 module Brain
-expose build_prompt_tiers,
+expose LiveEventSink(..),
+live_sink_from_env,
+emit_live_event,
+build_prompt_tiers,
 load_prior_messages,
 run_turn,
 run_turn_canonical,
@@ -19,7 +22,8 @@ use Command
 use Compaction
 use Http
 use Json
-use Llm{LlmMessage, PromptTiers, build_http_request}
+use Llm{LlmMessage, PromptTiers, StreamSink, build_http_request}
+use Mcp{parse_host_port}
 use Memory
 use Policy
 use Scheduler
@@ -42,6 +46,7 @@ use Types{
   BotRun,
   ConnectorSpec,
   EffectClass,
+  InternalSsePublishRequest,
   MotetError,
   ResolveApprovalRequest,
   TickSummary,
@@ -51,6 +56,50 @@ use Types{
   effect_to_text,
   trust_to_text
 }
+
+## Loopback `/v1/events/publish` target discovered from `MO_SERVE_PORT` or `MOTET_PORT`.
+struct LiveEventSink
+  url: Text
+  bearer_token: Option(Text)
+end
+
+## Resolves loopback SSE publish sink when running inside `mo serve` or alongside a known `MOTET_PORT`.
+fn live_sink_from_env(env: Env) : Option(LiveEventSink)
+  raw_port = ((env.get("MO_SERVE_PORT") or (env.get("MOTET_PORT") or ""))).trim
+  return None if raw_port.empty?
+  case raw_port.to_int
+    Some(p) if p > 0 and p <= 65535:
+      tok_opt = case env.get("MOTET_API_TOKEN")
+        Some(t) if not t.trim.empty?: Some(t.trim)
+        Some(_) | None: None
+      end
+      Some(LiveEventSink(url: "http://127.0.0.1:#{p}/v1/events/publish", bearer_token: tok_opt))
+    Some(_) | None: None
+  end
+end
+
+## Best-effort loopback SSE publish; never aborts agent work or background jobs if UI server is offline.
+fn emit_live_event(
+  network: Network,
+  sink_opt: Option(LiveEventSink),
+  topic: Text,
+  event: Text,
+  payload: Json
+) : Unit
+  case sink_opt
+    None: Unit
+    Some(sink):
+      pinned = network.allow_hosts([parse_host_port(sink.url)])
+      body = InternalSsePublishRequest(topic: topic, event: event, payload: payload)
+      var req = Http.post(sink.url).json(body.to_json).within(2.seconds)
+      case sink.bearer_token
+        Some(tok) if not tok.trim.empty?: req = req.header("Authorization", "Bearer #{tok.trim}")
+        Some(_) | None: Unit
+      end
+      _ignored = req.send(pinned)
+      Unit
+  end
+end
 
 ## Assembles the 3-tier cache-stable system prompt frozen at session start.
 ## Stable + Context receive Anthropic cache_control breakpoints; Volatile holds
@@ -487,14 +536,37 @@ fn run_turn_internal(
       break
     end
 
-    resp = try Llm.chat_turn_with_key(
+    live_sink = live_sink_from_env(rt.env)
+    run_id_json = case active_run_id
+      Some(rid): Json.String(rid)
+      None: Json.Null
+    end
+    llm_sink_opt = case live_sink
+      Some(ls): Some(
+        StreamSink(
+          url: ls.url,
+          bearer_token: ls.bearer_token,
+          topic: "runs",
+          meta: Json.Object({
+            "session_id": Json.String(session_id),
+            "run_id": run_id_json,
+            "bot_name": Json.String(bot.name),
+            "step": Json.int(steps + 1)
+          })
+        )
+      )
+      None: None
+    end
+
+    resp = try Llm.chat_turn_stream_with_key(
       rt.network,
       rt.clock,
       bot,
       api_key,
       tiers,
       messages,
-      tool_defs
+      tool_defs,
+      llm_sink_opt
     )
     step_now = rt.clock.now.to_text
 
@@ -526,6 +598,20 @@ fn run_turn_internal(
       Some(rid): try Store.update_run_progress(db, rid, steps, total_spent, step_now)
       None: Unit
     end
+    emit_live_event(
+      rt.network,
+      live_sink,
+      "runs",
+      "run.step",
+      Json.Object({
+        "run_id": run_id_json,
+        "session_id": Json.String(session_id),
+        "bot_name": Json.String(bot.name),
+        "steps": Json.int(steps),
+        "spent_usd": total_spent.to_json,
+        "status": Json.String("running")
+      })
+    )
 
     if day_spent + step_cost > bot.daily_budget_usd and not resp.tool_calls.empty?
       stopped_reason = Some("daily budget exhausted for #{bot.name}")
@@ -678,6 +764,19 @@ fn run_turn_internal(
             step_now
           )
           pending_approvals = pending_approvals.append(item)
+          emit_live_event(
+            rt.network,
+            live_sink,
+            "inbox",
+            "inbox.created",
+            Json.Object({
+              "approval_id": Json.int(item.id),
+              "bot_name": Json.String(item.bot_name),
+              "session_id": Json.String(item.session_id),
+              "tool_name": Json.String(item.tool_name),
+              "effect_class": Json.String(effect_to_text(item.effect_class))
+            })
+          )
           "PAUSED_FOR_APPROVAL (Needs You ##{item.id}): #{outcome.reason}. Inform the user what is waiting in their Needs You inbox."
         Deny: "POLICY_DENIED: #{outcome.reason}"
       end
@@ -919,6 +1018,7 @@ end
 
 ## Executes a single claimed async BotRun, updating progress & status durably in MoDB.
 fn execute_run(rt: ToolRuntime, db: Store.DbHandle, run: BotRun) : Result(BotRun, MotetError)
+  live_sink = live_sink_from_env(rt.env)
   case run_turn_internal(
     rt,
     db,
@@ -947,7 +1047,12 @@ fn execute_run(rt: ToolRuntime, db: Store.DbHandle, run: BotRun) : Result(BotRun
         rep.stopped_reason or "",
         rt.clock.now.to_text
       )
-      (try Store.get_run(db, run.id)).or_fail(StorageFailed(message: "finished run missing"))
+      fin_run = try (try Store.get_run(db, run.id)).or_fail(
+        StorageFailed(message: "finished run missing")
+      )
+      fin_ev = if fin_status == "cancelled": "run.cancelled" else: "run.completed"
+      emit_live_event(rt.network, live_sink, "runs", fin_ev, fin_run.to_json)
+      Ok(fin_run)
     Error(err):
       try Store.finish_run(
         db,
@@ -959,7 +1064,11 @@ fn execute_run(rt: ToolRuntime, db: Store.DbHandle, run: BotRun) : Result(BotRun
         "#{err}",
         rt.clock.now.to_text
       )
-      (try Store.get_run(db, run.id)).or_fail(StorageFailed(message: "failed run missing"))
+      fail_run = try (try Store.get_run(db, run.id)).or_fail(
+        StorageFailed(message: "failed run missing")
+      )
+      emit_live_event(rt.network, live_sink, "runs", "run.failed", fail_run.to_json)
+      Ok(fail_run)
   end
 end
 
@@ -1067,6 +1176,18 @@ fn run_due_routines(rt: ToolRuntime, db: Store.DbHandle) : Result(TickSummary, M
         ran += 1
         approvals += reply.pending_approvals.size
         results = results.append("#{r.bot_name}:#{r.name} -> #{reply.reply}")
+        emit_live_event(
+          rt.network,
+          live_sink_from_env(rt.env),
+          "runs",
+          "routine.ran",
+          Json.Object({
+            "routine_id": Json.int(r.id),
+            "name": Json.String(r.name),
+            "bot_name": Json.String(r.bot_name),
+            "approvals": Json.int(reply.pending_approvals.size)
+          })
+        )
       Error(err):
         try Store.mark_routine_ran(db, r.id, now_text, next_due)
         results = results.append("#{r.bot_name}:#{r.name} error -> #{err}")
@@ -1545,4 +1666,53 @@ test "Brain Gate 3 Lethal Trifecta downgrades Always-Allow external write to Nee
     child_ts.parent_session_id == Some("work-main")
   assert Store.authorize_session_action(db, "child-sess-1", "write_external") is Ok(Some(_))
   assert Store.verify_all(db) is Ok(vr) and vr.ok?
+end
+
+test "Brain execute_run streams tokens via StreamSink and emits live run.step + run.completed events"
+  files = Files.in_memory({})
+  t0 = Time.parse("2026-11-26T10:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = Store.open(files, clock)
+  assert Store.seed_defaults(db, t0.to_text) is Ok(Unit)
+  cmd = Command.fake({})
+  env = Env.of({"ANTHROPIC_API_KEY": "test-ant", "MO_SERVE_PORT": "8000", "MOTET_API_TOKEN": "tok-b"})
+
+  assert Store.get_bot(db, "chief") is Ok(Some(chief_bot))
+  assert build_prompt_tiers(db, files.read_only, chief_bot, Owner, t0.to_text) is Ok(tiers)
+  tool_defs = core_tool_defs()
+  sid = "chief-main"
+  assert Store.get_or_create_canonical_session(db, "chief", t0.to_text) is Ok(_)
+  assert Store.enqueue_run(db, "run-stream-1", "chief", sid, Owner, false, "Say hello", t0.to_text) is
+    Ok(run)
+
+  req1 = Llm.build_stream_http_request(
+    chief_bot,
+    "test-ant",
+    tiers,
+    [UserMsg(content: "Say hello")],
+    tool_defs
+  )
+  sse1 = [
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"output_tokens\":1}}}",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello streamed\"}}",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}",
+    ""
+  ].join("\n\n")
+  net = Network.fake(
+    Http.replies([
+      (
+        req1,
+        Http.Response(
+          status: 200,
+          headers: [("Content-Type", "text/event-stream")],
+          body: sse1.bytes
+        )
+      )
+    ])
+  )
+  rt = ToolRuntime(files: files, command: cmd, network: net, env: env, clock: clock)
+  assert execute_run(rt, db, run) is Ok(fin)
+  assert fin.status == "completed" and fin.reply == "Hello streamed" and fin.steps == 1
+  assert fin.spent_usd > 0.0
 end

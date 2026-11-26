@@ -580,7 +580,15 @@ fn cmd_watch(rt: ToolRuntime, db: Store.DbHandle, console: Console, rest: List(T
       Ok(_) | Error(_): Unit
     end
     case Telegram.poll_once(rt, db)
-      Ok(t) if t > 0: console.print("telegram: processed #{t} update(s)")
+      Ok(t) if t > 0:
+        Brain.emit_live_event(
+          rt.network,
+          Brain.live_sink_from_env(rt.env),
+          "motet",
+          "telegram.updated",
+          Json.Object({"updates": Json.int(t)})
+        )
+        console.print("telegram: processed #{t} update(s)")
       Ok(_) | Error(_): Unit
     end
     case Brain.run_due_routines(rt, db)

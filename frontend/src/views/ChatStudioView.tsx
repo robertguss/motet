@@ -23,7 +23,7 @@ import {
   SessionEvent,
   SessionSummary,
 } from '../lib/api';
-import { streamPostSse } from '../lib/sse';
+import { SseEventFrame, streamPostSse } from '../lib/sse';
 import { Badge, Button, Card, Field, inputCls, MarkdownView } from '../components/ui';
 
 interface ChatStudioProps {
@@ -34,6 +34,7 @@ interface ChatStudioProps {
   activeBot: string;
   onSelectBot: (name: string) => void;
   onRefresh: () => Promise<void>;
+  subscribeLiveEvents?: (listener: (ev: SseEventFrame) => void) => () => void;
   toast: (msg: string) => void;
 }
 
@@ -45,6 +46,7 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
   activeBot,
   onSelectBot,
   onRefresh,
+  subscribeLiveEvents,
   toast,
 }) => {
   const [sessionId, setSessionId] = useState<string>('');
@@ -62,6 +64,7 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
   const [fastStream, setFastStream] = useState(false);
   const [streamingPrompt, setStreamingPrompt] = useState<string | null>(null);
   const [streamingReply, setStreamingReply] = useState('');
+  const [liveRunReply, setLiveRunReply] = useState('');
   const streamAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
@@ -77,6 +80,26 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
 
   const feedRef = useRef<HTMLDivElement | null>(null);
   const lastSeqRef = useRef<number>(0);
+  const activeContextRef = useRef<{ activeBot: string; sessionId: string; activeRun: BotRun | null }>({
+    activeBot,
+    sessionId,
+    activeRun,
+  });
+  activeContextRef.current = { activeBot, sessionId, activeRun };
+
+  async function syncIncrementalEvents(sid: string) {
+    const delta = await api<SessionEvent[]>(
+      `/v1/sessions/${encodeURIComponent(sid)}/events?after_seq=${lastSeqRef.current}`
+    );
+    if (delta.length > 0) {
+      setEvents((prev) => {
+        const seen = new Set(prev.map((e) => e.seq));
+        const merged = [...prev, ...delta.filter((d) => !seen.has(d.seq))];
+        lastSeqRef.current = merged[merged.length - 1]?.seq ?? lastSeqRef.current;
+        return merged;
+      });
+    }
+  }
 
   const bot = bots.find((b) => b.name === activeBot) || bots.find((b) => b['active?']) || bots[0];
   const botSessions = sessions.filter((s) => s.bot_name === activeBot);
@@ -103,42 +126,114 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
       }
     }
     setActiveRun(null);
+    setLiveRunReply('');
     loadCanonical();
     return () => {
       cancelled = true;
     };
   }, [activeBot]);
 
-  // Tail live incremental events (?after_seq=N) while an async BotRun is active
+  // Live SSE streaming + real-time run/approval updates (falls back to 5s poll only if needed)
+  useEffect(() => {
+    if (!subscribeLiveEvents) return;
+    return subscribeLiveEvents((ev) => {
+      let parsed: Record<string, unknown> | null = null;
+      try {
+        parsed = JSON.parse(ev.data) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      if (!parsed || typeof parsed !== 'object') return;
+      const { activeBot: curBot, sessionId: curSid, activeRun: curRun } = activeContextRef.current;
+      const evSid = typeof parsed.session_id === 'string' ? parsed.session_id : '';
+      const evRunId = typeof parsed.run_id === 'string' ? parsed.run_id : '';
+      const evBot = typeof parsed.bot_name === 'string' ? parsed.bot_name : '';
+      const matchesRun = !!curRun && !!evRunId && evRunId === curRun.id;
+      const matchesSession = !!curSid && !!evSid && evSid === curSid;
+      const matchesCanonicalBoot = !curSid && !curRun && !!curBot && evBot === curBot && evSid === `${curBot}-main`;
+
+      if (ev.event === 'ai.token') {
+        const tokDelta = parsed.delta;
+        if ((matchesRun || matchesSession || matchesCanonicalBoot) && typeof tokDelta === 'string') {
+          setLiveRunReply((prev) => prev + tokDelta);
+        }
+        return;
+      }
+      if (ev.event === 'run.step') {
+        if (matchesRun || matchesSession) {
+          const nextSteps = typeof parsed.steps === 'number' ? parsed.steps : undefined;
+          const nextSpent = parsed.spent_usd !== undefined ? String(parsed.spent_usd) : undefined;
+          setActiveRun((prev) =>
+            prev && (prev.id === evRunId || !evRunId)
+              ? {
+                  ...prev,
+                  status: 'running',
+                  steps: nextSteps ?? prev.steps,
+                  spent_usd: nextSpent ?? prev.spent_usd,
+                }
+              : prev
+          );
+          setLiveRunReply('');
+          if (evSid) void syncIncrementalEvents(evSid);
+        }
+        return;
+      }
+      if (ev.event === 'inbox.created') {
+        if (matchesSession || evBot === curBot) {
+          void onRefresh();
+        }
+        return;
+      }
+      if (ev.event === 'run.completed' || ev.event === 'run.failed' || ev.event === 'run.cancelled') {
+        const rid = typeof parsed.id === 'string' ? parsed.id : evRunId;
+        const sid = typeof parsed.session_id === 'string' ? parsed.session_id : evSid;
+        if ((curRun && rid === curRun.id) || (curSid && sid === curSid)) {
+          setLiveRunReply('');
+          setActiveRun((prev) =>
+            prev && prev.id === rid
+              ? {
+                  ...prev,
+                  status:
+                    typeof parsed.status === 'string'
+                      ? parsed.status
+                      : ev.event === 'run.failed'
+                        ? 'failed'
+                        : ev.event === 'run.cancelled'
+                          ? 'cancelled'
+                          : 'completed',
+                  steps: typeof parsed.steps === 'number' ? parsed.steps : prev.steps,
+                  spent_usd: parsed.spent_usd !== undefined ? String(parsed.spent_usd) : prev.spent_usd,
+                }
+              : prev
+          );
+          if (sid) void syncIncrementalEvents(sid);
+          void onRefresh();
+        }
+      }
+    });
+  }, [subscribeLiveEvents, onRefresh]);
+
+  // Fallback safety poll at 5s only if SSE is unavailable or while an async BotRun is active
   useEffect(() => {
     if (!activeRun || (activeRun.status !== 'queued' && activeRun.status !== 'running')) return;
     const runId = activeRun.id;
     const sid = activeRun.session_id;
     const timer = window.setInterval(async () => {
       try {
-        const [runState, delta] = await Promise.all([
+        const [runState] = await Promise.all([
           api<BotRun>(`/v1/runs/${encodeURIComponent(runId)}`),
-          api<SessionEvent[]>(
-            `/v1/sessions/${encodeURIComponent(sid)}/events?after_seq=${lastSeqRef.current}`
-          ),
+          syncIncrementalEvents(sid),
         ]);
-        if (delta.length > 0) {
-          setEvents((prev) => {
-            const seen = new Set(prev.map((e) => e.seq));
-            const merged = [...prev, ...delta.filter((d) => !seen.has(d.seq))];
-            lastSeqRef.current = merged[merged.length - 1]?.seq ?? lastSeqRef.current;
-            return merged;
-          });
-        }
         setActiveRun(runState);
         if (runState.status !== 'queued' && runState.status !== 'running') {
           window.clearInterval(timer);
+          setLiveRunReply('');
           await onRefresh();
         }
       } catch {
         // transient poll error
       }
-    }, 600);
+    }, 5000);
     return () => window.clearInterval(timer);
   }, [activeRun?.id, activeRun?.status]);
 
@@ -146,11 +241,12 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
     if (feedRef.current) {
       feedRef.current.scrollTop = feedRef.current.scrollHeight;
     }
-  }, [events.length, activeRun?.steps]);
+  }, [events.length, activeRun?.steps, liveRunReply.length]);
 
   async function openSession(sid: string) {
     setSessionId(sid);
     setActiveRun(null);
+    setLiveRunReply('');
     try {
       const evs = await api<SessionEvent[]>(`/v1/sessions/${encodeURIComponent(sid)}/events`);
       setEvents(evs);
@@ -165,6 +261,7 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
     setEvents([]);
     lastSeqRef.current = 0;
     setActiveRun(null);
+    setLiveRunReply('');
   }
 
   async function handleSend(e: React.FormEvent) {
@@ -586,6 +683,17 @@ export const ChatStudioView: React.FC<ChatStudioProps> = ({
                   <MarkdownView content={streamingReply || '…'} />
                 </div>
               </>
+            )}
+
+            {/* Live Assistant Tokens Pushed via Cross-Worker SSE During Async Agent Runs */}
+            {liveRunReply && (
+              <div className="self-start max-w-[90%] rounded-2xl rounded-bl-sm border border-[var(--accent)] bg-[var(--card)] px-4 py-3 flex flex-col gap-1.5">
+                <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-[var(--accent-hover)]">
+                  <Sparkles className="w-3.5 h-3.5 animate-pulse" />
+                  <span>Streaming reply…</span>
+                </div>
+                <MarkdownView content={liveRunReply} />
+              </div>
             )}
 
             {/* Single Live Progress Draft Block with Mid-Run Steering */}

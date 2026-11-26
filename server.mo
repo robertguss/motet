@@ -62,6 +62,7 @@ use Types{
   EvaluateIntentsResponse,
   EventSearchResponse,
   HealthSummary,
+  InternalSsePublishRequest,
   AckFeedRequest,
   MemoryEntry,
   MemorySearchResponse,
@@ -231,6 +232,7 @@ api
   get "/v1/artifacts" get_artifacts
   get "/v1/budget" get_budget
   get "/v1/events/stream" get_events_stream
+  post "/v1/events/publish" post_publish_event
 
   get "/v1/modb/verify" get_modb_verify
   post "/v1/modb/verify/checkpoint" post_modb_verify_checkpoint
@@ -408,12 +410,27 @@ fn job_poll_telegram(
 ) : Result(Unit, MotetError)
   db = try ensure_ready(files, clock)
   rt = ToolRuntime(files: files, command: command, network: network, env: env, clock: clock)
-  _n = Telegram.poll_once(rt, db)
+  case Telegram.poll_once(rt, db)
+    Ok(t) if t > 0: Brain.emit_live_event(
+      network,
+      Brain.live_sink_from_env(env),
+      "motet",
+      "telegram.updated",
+      Json.Object({"updates": Json.int(t)})
+    )
+    Ok(_) | Error(_): Unit
+  end
   Ok(Unit)
 end
 
 ## Background worker job: runs overnight Dreaming consolidation once per local day around 03:00.
-fn job_run_dreaming(_payload: Json, files: Files, clock: Clock) : Result(Unit, MotetError)
+fn job_run_dreaming(
+  _payload: Json,
+  files: Files,
+  network: Network,
+  env: Env,
+  clock: Clock
+) : Result(Unit, MotetError)
   db = try ensure_ready(files, clock)
   settings = try Store.get_settings(db)
   now_t = clock.now
@@ -423,6 +440,13 @@ fn job_run_dreaming(_payload: Json, files: Files, clock: Clock) : Result(Unit, M
     already = try Memory.has_dreamed_today(db, day_prefix)
     if not already
       _d = try Memory.run_dreaming(db, now_t.to_text)
+      Brain.emit_live_event(
+        network,
+        Brain.live_sink_from_env(env),
+        "motet",
+        "memory.dreamed",
+        Json.Object({"day": Json.String(day_prefix)})
+      )
     end
   end
   Ok(Unit)
@@ -2031,6 +2055,29 @@ fn get_events_stream(_op: Operator, files: Files, env: Env, clock: Clock, req: A
       req_last_event_id(req),
       Some(2000),
       [(Some("health"), Json.encode(h)), (Some("inbox"), Json.encode(inbox))]
+    )
+  )
+end
+
+## Publishes a live event onto the cross-worker `SseBroker` (used by background jobs and `motet watch`).
+fn post_publish_event(_op: Operator, body: InternalSsePublishRequest) : Result(
+  Api.Response,
+  MotetError
+)
+  topic = body.topic.trim
+  event = body.event.trim
+  if topic.empty? or topic.chars.size > 64 or topic.contains?("\r") or topic.contains?("\n")
+    return Error(BadInput(message: "invalid SSE topic"))
+  end
+  if event.empty? or event.chars.size > 64 or event.contains?("\r") or event.contains?("\n")
+    return Error(BadInput(message: "invalid SSE event name"))
+  end
+  Ok(
+    Api.with_sse_publish_json(
+      Api.json_response(200, Json.Object({"ok": Json.Boolean(true)})),
+      topic,
+      event,
+      body.payload
     )
   )
 end
@@ -5266,4 +5313,36 @@ test "HTTP and MCP serve hybrid/BM25/semantic search, Vault Gemini reindex, and 
   )
   assert f_stream.status == 200 and f_stream.text.contains?("event: feed.snapshot")
   assert Api.sse_subscribe_topics(f_stream) == ["bucket:events", "feed:srv-sse-events"]
+
+  pub_res = ApiTest.send(
+    Server,
+    Api.post("/v1/events/publish").with_bearer("secret-op").with_json(
+      InternalSsePublishRequest(
+        topic: "runs",
+        event: "ai.token",
+        payload: Json.Object({"session_id": "chief-main".to_json, "delta": "hi ".to_json})
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert pub_res.status == 200
+  pub_evs = Api.sse_published_events(pub_res)
+  assert pub_evs.any?(fn(p)
+    p.topic == "runs" and p.event == Some("ai.token") and p.data.contains?("hi ")
+  end)
+
+  pub_bad = ApiTest.send(
+    Server,
+    Api.post("/v1/events/publish").with_bearer("secret-op").with_json(
+      InternalSsePublishRequest(topic: "", event: "ai.token", payload: Json.Object({}))
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert pub_bad.status == 400
 end

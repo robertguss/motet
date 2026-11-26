@@ -856,4 +856,96 @@ describe('Motet Control Plane Dashboard', () => {
       expect(screen.getByText('cos 0.912')).toBeInTheDocument();
     });
   });
+
+  it('streams ai.token events live from /v1/events/stream into active ChatStudio run without refreshing dashboard', async () => {
+    let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const enc = new TextEncoder();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const json = (obj: unknown) =>
+        new Response(JSON.stringify(obj), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      if (url.includes('/v1/health')) {
+        return json({
+          status: 'ok',
+          bots: 1,
+          pending_approvals: 0,
+          queued_runs: 0,
+          total_spent_usd: '0.00',
+          vault_secrets: 0,
+          connectors: 0,
+          telegram_enabled: false,
+          push_subscriptions: 0,
+        });
+      }
+      if (url.includes('/v1/bots/chief/canonical')) {
+        return json({
+          id: 'chief-main',
+          bot_name: 'chief',
+          title: 'Chief chat',
+          trust: 'owner',
+          compaction_seq: 0,
+          created_at: '2026-11-26T00:00:00Z',
+          updated_at: '2026-11-26T00:00:00Z',
+          event_count: 0,
+        });
+      }
+      if (url.includes('/v1/bots')) {
+        return json([
+          {
+            name: 'chief',
+            role: 'Coordinator',
+            persona: 'Chief',
+            'active?': true,
+            'is_primary?': true,
+            model_tier: 'claude',
+            provider: 'anthropic',
+            endpoint: 'https://api.anthropic.com/v1/messages',
+            api_key_env: 'ANTHROPIC_API_KEY',
+            model: 'claude-sonnet-4-5',
+            workspace: '.',
+            allowed_programs: [],
+            allowed_hosts: [],
+            connectors: [],
+            read_only_connectors: [],
+            daily_budget_usd: '10.00',
+            max_steps: 8,
+          },
+        ]);
+      }
+      if (url.includes('/v1/events/stream')) {
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            streamController = c;
+            c.enqueue(enc.encode('event: health\ndata: {"status":"ok"}\n\n'));
+          },
+        });
+        return new Response(body, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      }
+      return json([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText('chief — Main Chat')).toBeInTheDocument();
+      expect(streamController).not.toBeNull();
+    });
+    streamController!.enqueue(
+      enc.encode(
+        'event: ai.token\ndata: {"session_id":"chief-main","run_id":"r-live","bot_name":"chief","delta":"Streaming live chunk"}\n\n'
+      )
+    );
+    await waitFor(() => {
+      expect(screen.getByText('Streaming live chunk')).toBeInTheDocument();
+    });
+    const healthCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/v1/health')).length;
+    expect(healthCalls).toBe(1);
+    streamController!.close();
+  });
 });
