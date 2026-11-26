@@ -9,8 +9,11 @@ function mockFetch() {
   let worldLanded = false;
   let dreamLanded = false;
   let reindexed = false;
+  let syncPeerPresent = false;
+  let syncPending: { seq: number; hash: string } | null = null;
+  let syncAckedSeq = 0;
 
-  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const url = String(input);
     const json = (data: unknown) =>
       new Response(JSON.stringify(data), {
@@ -493,6 +496,15 @@ function mockFetch() {
         bucket_diffs: [{ bucket: 'memories', added: 1, removed: 1, modified: 0 }],
       });
     }
+    if (url.includes('/v1/modb/query/explain')) {
+      return json({
+        view: 'bots',
+        strategy: 'index_eq',
+        index_used: true,
+        field: 'bot_name',
+        value: 'chief',
+      });
+    }
     if (url.includes('/v1/modb/query')) {
       return json({
         view: 'bots',
@@ -503,6 +515,129 @@ function mockFetch() {
         answer_hash: '1122334455667788',
         rows: [{ name: 'chief', role: 'Chief of Staff' }],
       });
+    }
+    if (url.includes('/v1/modb/matviews/approvals_by_status/refresh')) {
+      return json({
+        name: 'approvals_by_status',
+        strategy: 'incremental',
+        diffs_applied: 2,
+        groups_touched: 1,
+        group_recomputes: 0,
+        last_txid: 46,
+        group_count: 1,
+      });
+    }
+    if (url.includes('/v1/modb/matviews/approvals_by_status/query')) {
+      return json({
+        name: 'approvals_by_status',
+        last_txid: 46,
+        total_groups: 1,
+        returned_groups: 1,
+        suppressed_groups: 0,
+        rows: [{ status: 'pending', count: 1 }],
+      });
+    }
+    if (url.includes('/v1/modb/matviews')) {
+      return json([
+        {
+          def: {
+            name: 'approvals_by_status',
+            description: 'Grouped approval queue counts',
+            source_bucket: 'approvals',
+            group_by: 'status',
+            aggregates: [{ alias: 'count', op: 'mat_count' }],
+          },
+          last_txid: 45,
+          'pin_aligned?': true,
+          group_count: 1,
+          source_rows_seen: 1,
+          rebuilds: 1,
+          incremental_refreshes: 2,
+          group_recomputes: 0,
+        },
+      ]);
+    }
+    if (url.includes('/v1/modb/sync/peers/offsite-backup/snapshot')) {
+      return json({
+        format_version: 1,
+        kind: 'snapshot',
+        alg: 'AES-256-GCM',
+        key_id: 'motet-backup-v1',
+        aad: 'motet-prod',
+        nonce_b64: 'AAAAAAAAAAAA',
+        ciphertext_b64: 'BBBB',
+        created_at: '2026-11-26T00:00:00Z',
+      });
+    }
+    if (url.includes('/v1/modb/sync/peers/offsite-backup/export')) {
+      syncPending = { seq: 1, hash: 'deadbeef00112233' };
+      return json({
+        format_version: 1,
+        kind: 'delta',
+        alg: 'AES-256-GCM',
+        key_id: 'motet-backup-v1',
+        aad: 'motet-prod',
+        nonce_b64: 'CCCCCCCCCCCC',
+        ciphertext_b64: 'DDDD',
+        created_at: '2026-11-26T00:01:00Z',
+      });
+    }
+    if (url.includes('/v1/modb/sync/peers/offsite-backup/ack')) {
+      syncPending = null;
+      syncAckedSeq = 1;
+      return json({
+        peer_id: 'offsite-backup',
+        'include_internal?': true,
+        'from_empty?': false,
+        acked_seq: 1,
+        acked_txid: 46,
+        acked_hash: 'deadbeef00112233',
+        pending_seq: null,
+        pending_txid: null,
+        pending_hash: null,
+        created_at: '2026-11-26T00:00:00Z',
+        updated_at: '2026-11-26T00:02:00Z',
+      });
+    }
+    if (url.includes('/v1/modb/sync/peers/offsite-backup') && (init?.method || 'GET') === 'DELETE') {
+      syncPeerPresent = false;
+      return json({ ok: true, peer_id: 'offsite-backup' });
+    }
+    if (url.includes('/v1/modb/sync/peers') && (init?.method || 'GET') === 'POST') {
+      syncPeerPresent = true;
+      syncPending = null;
+      syncAckedSeq = 0;
+      return json({
+        peer_id: 'offsite-backup',
+        'include_internal?': true,
+        'from_empty?': false,
+        acked_seq: 0,
+        acked_txid: 42,
+        acked_hash: '0000000000000000',
+        pending_seq: null,
+        pending_txid: null,
+        pending_hash: null,
+        created_at: '2026-11-26T00:00:00Z',
+        updated_at: '2026-11-26T00:00:00Z',
+      });
+    }
+    if (url.includes('/v1/modb/sync/peers')) {
+      if (!syncPeerPresent) return json([]);
+      return json([
+        {
+          peer_id: 'offsite-backup',
+          'include_internal?': true,
+          'from_empty?': false,
+          acked_seq: syncAckedSeq,
+          acked_txid: syncAckedSeq > 0 ? 46 : 42,
+          acked_hash: syncAckedSeq > 0 ? 'deadbeef00112233' : '0000000000000000',
+          pending_seq: syncPending?.seq ?? null,
+          pending_txid: syncPending ? 46 : null,
+          pending_hash: syncPending?.hash ?? null,
+          created_at: '2026-11-26T00:00:00Z',
+          updated_at: '2026-11-26T00:00:00Z',
+        },
+      ]);
     }
     if (url.includes('/v1/analytics')) {
       return json({
@@ -778,12 +913,26 @@ describe('Motet Control Plane Dashboard', () => {
       expect(screen.getByText('revoked')).toBeInTheDocument();
     });
 
-    // Views & Read Explorer tab + k-anonymous Release + Read Provenance Log
+    // Views & Read Explorer tab + Explain Plan + MatViews + k-anonymous Release + Read Provenance Log
     fireEvent.click(screen.getByText('Views & Read Explorer'));
     await waitFor(() => {
       expect(screen.getByText('Zero-Approval Sandboxed ReadProgram Explorer')).toBeInTheDocument();
+      expect(screen.getByText(/Materialized Views/)).toBeInTheDocument();
+      expect(screen.getByText('approvals_by_status')).toBeInTheDocument();
       expect(screen.getByText(/Read Provenance Log/)).toBeInTheDocument();
       expect(screen.getByText('#1')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Explain Plan'));
+    await waitFor(() => {
+      expect(screen.getByText('strategy=index_eq')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Refresh O(diff)'));
+    await waitFor(() => {
+      expect(screen.getByText('diffs=2')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Query MatView'));
+    await waitFor(() => {
+      expect(screen.getByText('approvals_by_status: 1/1 groups')).toBeInTheDocument();
     });
     fireEvent.click(screen.getByText('Run Query'));
     await waitFor(() => {
@@ -792,6 +941,34 @@ describe('Motet Control Plane Dashboard', () => {
     fireEvent.click(screen.getByText('Run Release'));
     await waitFor(() => {
       expect(screen.getByText('cohort=3 (min k=2)')).toBeInTheDocument();
+    });
+
+    // Sync & Backups tab + two-phase peer init / encrypted snapshot / export delta / ack / remove
+    fireEvent.click(screen.getByText('Sync & Backups'));
+    await waitFor(() => {
+      expect(screen.getByText('Register Incremental Sync Peer (Modb.Sync)')).toBeInTheDocument();
+      expect(screen.getByText('No sync peers registered')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Register Sync Peer'));
+    await waitFor(() => {
+      expect(screen.getByText('offsite-backup')).toBeInTheDocument();
+      expect(screen.getByText('acked seq #0')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Base Snapshot'));
+    await waitFor(() => {
+      expect(screen.getByText(/offsite-backup base snapshot/)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Export Delta'));
+    await waitFor(() => {
+      expect(screen.getByText('pending seq #1')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Ack Pending'));
+    await waitFor(() => {
+      expect(screen.getByText('acked seq #1')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Remove Peer'));
+    await waitFor(() => {
+      expect(screen.getByText('No sync peers registered')).toBeInTheDocument();
     });
 
     // Speculative Worlds tab + M10 Telemetry/Child hierarchy + Exclude World in Replay Studio

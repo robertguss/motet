@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+# Hourly encrypted CoW-incremental backup + restore verification for Motet's live MoDB.
+# Uses `Modb.Sync` persistent two-phase root pins (`sync:auto-backup` / `sync_pending:auto-backup`)
+# with AES-256-GCM sealing (`MODB_BACKUP_KEY_HEX`) and periodic full `motet sync restore` + `modb verify`.
+
+STATE_DIR="${MOTET_STATE_DIR:-$HOME/.local/share/motet}"
+ENV_FILE="${MOTET_ENV_FILE:-$HOME/.config/motet/env}"
+PEER_ID="${MODB_BACKUP_PEER_ID:-auto-backup}"
+KEY_ID="${MODB_BACKUP_KEY_ID:-motet-auto-v1}"
+AAD="${MODB_BACKUP_AAD:-motet-auto-backup}"
+RETENTION_GENS="${MODB_BACKUP_RETENTION_GENS:-4}"
+MAX_DELTAS_PER_GEN="${MODB_BACKUP_MAX_DELTAS:-168}"
+MAX_GEN_AGE_SEC="${MODB_BACKUP_MAX_GEN_AGE_SEC:-604800}"
+VERIFY_EVERY_N="${MODB_BACKUP_VERIFY_EVERY_N:-6}"
+MOTET_BIN="${MOTET_BIN:-$(command -v motet || echo "$HOME/.local/bin/motet")}"
+MODB_BIN="${MODB_BIN:-$(command -v modb || echo "$HOME/.local/bin/modb")}"
+
+FORCE_ROTATE=0
+FORCE_VERIFY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --rotate)
+      FORCE_ROTATE=1
+      shift
+      ;;
+    --verify-restore)
+      FORCE_VERIFY=1
+      shift
+      ;;
+    --peer)
+      PEER_ID="${2:?--peer requires an argument}"
+      shift 2
+      ;;
+    *)
+      echo "usage: $0 [--rotate] [--verify-restore] [--peer <id>]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "${MODB_BACKUP_KEY_HEX:-}" ] && [ -r "$ENV_FILE" ]; then
+  # Extract only MODB_BACKUP_KEY_HEX without echoing any secret values.
+  _key_line="$(grep -E '^(export[[:space:]]+)?MODB_BACKUP_KEY_HEX=' "$ENV_FILE" | tail -n 1 || true)"
+  if [ -n "$_key_line" ]; then
+    _key_val="${_key_line#*=}"
+    _key_val="${_key_val%\"}"
+    _key_val="${_key_val#\"}"
+    _key_val="${_key_val%\'}"
+    _key_val="${_key_val#\'}"
+    export MODB_BACKUP_KEY_HEX="$_key_val"
+  fi
+  unset _key_line _key_val
+fi
+
+if [ -z "${MODB_BACKUP_KEY_HEX:-}" ]; then
+  echo "[motet-modb-backup] ERROR: MODB_BACKUP_KEY_HEX is unset (check $ENV_FILE)" >&2
+  exit 1
+fi
+
+if [ ! -x "$MOTET_BIN" ]; then
+  echo "[motet-modb-backup] ERROR: motet binary not found/executable at $MOTET_BIN" >&2
+  exit 1
+fi
+if [ ! -x "$MODB_BIN" ]; then
+  echo "[motet-modb-backup] ERROR: modb binary not found/executable at $MODB_BIN" >&2
+  exit 1
+fi
+if [ ! -f "$STATE_DIR/motet.modb" ]; then
+  echo "[motet-modb-backup] ERROR: live database not found at $STATE_DIR/motet.modb" >&2
+  exit 1
+fi
+
+BACKUP_ROOT="backups/encrypted"
+ABS_BACKUP_ROOT="$STATE_DIR/$BACKUP_ROOT"
+mkdir -p "$ABS_BACKUP_ROOT"
+chmod 700 "$ABS_BACKUP_ROOT"
+
+LOCK_FILE="$ABS_BACKUP_ROOT/.backup.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -w 30 9; then
+  echo "[motet-modb-backup] ERROR: timed out waiting for backup lock $LOCK_FILE" >&2
+  exit 1
+fi
+
+TMP_RESTORE_REL=""
+cleanup() {
+  if [ -n "$TMP_RESTORE_REL" ]; then
+    rm -f "$STATE_DIR/$TMP_RESTORE_REL" "$STATE_DIR/${TMP_RESTORE_REL}.sync-restore.tmp" 2>/dev/null || true
+  fi
+  rm -f "$ABS_BACKUP_ROOT/.delta.tmp.json" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+cd "$STATE_DIR"
+
+PEERS_JSON="$("$MOTET_BIN" sync peers --json)"
+PEER_INFO="$(
+  python3 - "$PEER_ID" "$PEERS_JSON" <<'PY'
+import json, sys
+pid = sys.argv[1]
+peers = json.loads(sys.argv[2])
+match = next((p for p in peers if p.get("peer_id") == pid), None)
+if match is None:
+    print("0\t0\t0")
+else:
+    print(f"1\t{int(match.get('acked_seq', 0))}\t{int(match.get('acked_txid', 0))}")
+PY
+)"
+IFS=$'\t' read -r PEER_EXISTS ACKED_SEQ ACKED_TXID <<< "$PEER_INFO"
+
+CUR_GEN=""
+if [ -r "$ABS_BACKUP_ROOT/current.txt" ]; then
+  CUR_GEN="$(tr -d '[:space:]' < "$ABS_BACKUP_ROOT/current.txt")"
+fi
+
+GEN_AGE_EXCEEDED=0
+if [ -n "$CUR_GEN" ] && [ -r "$ABS_BACKUP_ROOT/$CUR_GEN/meta.json" ]; then
+  GEN_AGE_EXCEEDED="$(
+    python3 - "$ABS_BACKUP_ROOT/$CUR_GEN/meta.json" "$MAX_GEN_AGE_SEC" <<'PY'
+import json, sys, time
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    meta = json.load(fh)
+created_epoch = int(meta.get("created_epoch", 0))
+max_age = int(sys.argv[2])
+print("1" if created_epoch > 0 and (int(time.time()) - created_epoch) >= max_age else "0")
+PY
+  )"
+fi
+
+NEED_NEW_GEN=0
+if [ "$FORCE_ROTATE" -eq 1 ] || [ "$PEER_EXISTS" -ne 1 ] || [ -z "$CUR_GEN" ] || [ ! -f "$ABS_BACKUP_ROOT/$CUR_GEN/base.enc.json" ]; then
+  NEED_NEW_GEN=1
+elif [ "$ACKED_SEQ" -ge "$MAX_DELTAS_PER_GEN" ] || [ "$GEN_AGE_EXCEEDED" -eq 1 ]; then
+  NEED_NEW_GEN=1
+fi
+
+ACTION=""
+SHOULD_VERIFY=0
+LAST_OPS=0
+
+if [ "$NEED_NEW_GEN" -eq 1 ]; then
+  TS_SLUG="$(date -u +%Y%m%dT%H%M%SZ)"
+  GEN_NAME="gen-$TS_SLUG"
+  SUF=1
+  while [ -e "$ABS_BACKUP_ROOT/$GEN_NAME" ]; do
+    GEN_NAME="gen-${TS_SLUG}-${SUF}"
+    SUF=$((SUF + 1))
+  done
+  mkdir -p "$ABS_BACKUP_ROOT/$GEN_NAME"
+  chmod 700 "$ABS_BACKUP_ROOT/$GEN_NAME"
+
+  if [ "$PEER_EXISTS" -eq 1 ]; then
+    "$MOTET_BIN" sync remove-peer "$PEER_ID" >/dev/null
+  fi
+  INIT_JSON="$("$MOTET_BIN" sync init-peer "$PEER_ID" --include-internal --json)"
+  ACKED_TXID="$(
+    python3 - "$INIT_JSON" <<'PY'
+import json, sys
+print(int(json.loads(sys.argv[1]).get("acked_txid", 0)))
+PY
+  )"
+  ACKED_SEQ=0
+
+  REL_BASE="$BACKUP_ROOT/$GEN_NAME/base.enc.json"
+  "$MOTET_BIN" sync base-snapshot "$PEER_ID" "$REL_BASE" --encrypt --key-id "$KEY_ID" --aad "$AAD" >/dev/null
+  chmod 600 "$STATE_DIR/$REL_BASE"
+
+  python3 - "$ABS_BACKUP_ROOT/$GEN_NAME/meta.json" "$PEER_ID" "$KEY_ID" "$AAD" "$ACKED_TXID" <<'PY'
+import datetime, json, sys, time
+out_path, pid, key_id, aad, txid = sys.argv[1:6]
+meta = {
+    "peer_id": pid,
+    "key_id": key_id,
+    "aad": aad,
+    "base_file": "base.enc.json",
+    "base_txid": int(txid),
+    "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "created_epoch": int(time.time()),
+}
+tmp = out_path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(meta, fh, indent=2)
+    fh.write("\n")
+import os
+os.chmod(tmp, 0o600)
+os.replace(tmp, out_path)
+PY
+
+  printf '%s\n' "$GEN_NAME" > "$ABS_BACKUP_ROOT/current.txt.tmp"
+  chmod 600 "$ABS_BACKUP_ROOT/current.txt.tmp"
+  mv "$ABS_BACKUP_ROOT/current.txt.tmp" "$ABS_BACKUP_ROOT/current.txt"
+  CUR_GEN="$GEN_NAME"
+  ACTION="new_generation"
+  SHOULD_VERIFY=1
+
+  # Prune old generations past RETENTION_GENS (keep newest N).
+  python3 - "$ABS_BACKUP_ROOT" "$RETENTION_GENS" "$CUR_GEN" <<'PY'
+import os, shutil, sys
+root, keep_s, cur = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+gens = sorted([
+    d for d in os.listdir(root)
+    if d.startswith("gen-") and os.path.isdir(os.path.join(root, d))
+])
+if len(gens) > keep_s:
+    to_drop = gens[:len(gens) - keep_s]
+    for g in to_drop:
+        if g != cur:
+            shutil.rmtree(os.path.join(root, g), ignore_errors=True)
+PY
+else
+  REL_TMP_DELTA="$BACKUP_ROOT/.delta.tmp.json"
+  rm -f "$STATE_DIR/$REL_TMP_DELTA"
+  EXPORT_JSON="$("$MOTET_BIN" sync export "$PEER_ID" "$REL_TMP_DELTA" --encrypt --key-id "$KEY_ID" --aad "$AAD" --json)"
+  read -r EXP_SEQ EXP_OPS EXP_HASH <<< "$(
+    python3 - "$EXPORT_JSON" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+print(f"{int(d['seq'])} {int(d['ops'])} {d['delta_hash']}")
+PY
+  )"
+  LAST_OPS="$EXP_OPS"
+  if [ "$EXP_OPS" -eq 0 ]; then
+    rm -f "$STATE_DIR/$REL_TMP_DELTA"
+    ACTION="noop"
+  else
+    DELTA_FILE="$(printf '%06d.delta.enc.json' "$EXP_SEQ")"
+    mv "$STATE_DIR/$REL_TMP_DELTA" "$ABS_BACKUP_ROOT/$CUR_GEN/$DELTA_FILE"
+    chmod 600 "$ABS_BACKUP_ROOT/$CUR_GEN/$DELTA_FILE"
+    ACK_JSON="$("$MOTET_BIN" sync ack "$PEER_ID" --seq "$EXP_SEQ" --hash "$EXP_HASH" --json)"
+    read -r ACKED_SEQ ACKED_TXID <<< "$(
+      python3 - "$ACK_JSON" <<'PY'
+import json, sys
+p = json.loads(sys.argv[1])
+print(f"{int(p['acked_seq'])} {int(p['acked_txid'])}")
+PY
+    )"
+    ACTION="delta_exported"
+    if [ "$VERIFY_EVERY_N" -gt 0 ] && [ $((EXP_SEQ % VERIFY_EVERY_N)) -eq 0 ]; then
+      SHOULD_VERIFY=1
+    fi
+  fi
+fi
+
+if [ "$FORCE_VERIFY" -eq 1 ]; then
+  SHOULD_VERIFY=1
+fi
+
+VERIFIED_RESTORE=0
+VERIFIED_TXID=0
+VERIFIED_AUDIT=0
+if [ "$SHOULD_VERIFY" -eq 1 ]; then
+  TMP_RESTORE_REL="$BACKUP_ROOT/.verify-${CUR_GEN}.modb"
+  rm -f "$STATE_DIR/$TMP_RESTORE_REL" "$STATE_DIR/${TMP_RESTORE_REL}.sync-restore.tmp"
+  REL_BASE="$BACKUP_ROOT/$CUR_GEN/base.enc.json"
+  REL_DELTAS=()
+  while IFS= read -r df; do
+    [ -n "$df" ] && REL_DELTAS+=("$BACKUP_ROOT/$CUR_GEN/$(basename "$df")")
+  done < <(find "$ABS_BACKUP_ROOT/$CUR_GEN" -maxdepth 1 -name '*.delta.enc.json' | LC_ALL=C sort)
+
+  RESTORE_JSON="$("$MOTET_BIN" sync restore "$TMP_RESTORE_REL" --base "$REL_BASE" ${REL_DELTAS[@]+"${REL_DELTAS[@]}"} --decrypt --aad "$AAD" --json)"
+  VERIFY_JSON="$("$MODB_BIN" verify "$TMP_RESTORE_REL" --json)"
+  rm -f "$STATE_DIR/$TMP_RESTORE_REL" "$STATE_DIR/${TMP_RESTORE_REL}.sync-restore.tmp"
+  TMP_RESTORE_REL=""
+
+  read -r VERIFIED_RESTORE VERIFIED_TXID VERIFIED_AUDIT <<< "$(
+    python3 - "$RESTORE_JSON" "$VERIFY_JSON" <<'PY'
+import json, sys
+r = json.loads(sys.argv[1])
+v = json.loads(sys.argv[2])
+ok = bool(v.get("ok?", False)) and int(v.get("txid", 0)) == int(r.get("final_txid", -1))
+if not ok:
+    sys.stderr.write(f"verify mismatch: restore={r} verify={v}\n")
+    sys.exit(1)
+print(f"1 {int(v.get('txid', 0))} {int(v.get('audit_entries', 0))}")
+PY
+  )"
+fi
+
+python3 - "$ABS_BACKUP_ROOT" "$CUR_GEN" "$PEER_ID" "$KEY_ID" "$AAD" "$ACTION" "$ACKED_SEQ" "$ACKED_TXID" "$LAST_OPS" "$VERIFIED_RESTORE" "$VERIFIED_TXID" "$VERIFIED_AUDIT" <<'PY'
+import datetime, json, os, sys
+(
+    abs_root, cur_gen, peer_id, key_id, aad, action,
+    acked_seq_s, acked_txid_s, last_ops_s,
+    ver_ok_s, ver_tx_s, ver_audit_s
+) = sys.argv[1:13]
+gen_dir = os.path.join(abs_root, cur_gen)
+deltas = sorted(f for f in os.listdir(gen_dir) if f.endswith(".delta.enc.json"))
+gens = sorted(d for d in os.listdir(abs_root) if d.startswith("gen-") and os.path.isdir(os.path.join(abs_root, d)))
+prev = {}
+status_path = os.path.join(abs_root, "status.json")
+if os.path.exists(status_path):
+    try:
+        with open(status_path, "r", encoding="utf-8") as fh:
+            prev = json.load(fh)
+    except Exception:
+        prev = {}
+now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+ver_ok = ver_ok_s == "1"
+status = {
+    "last_run_at": now_iso,
+    "peer_id": peer_id,
+    "generation": cur_gen,
+    "action": action,
+    "acked_seq": int(acked_seq_s),
+    "acked_txid": int(acked_txid_s),
+    "delta_count": len(deltas),
+    "last_export_ops": int(last_ops_s),
+    "encrypted": True,
+    "key_id": key_id,
+    "aad": aad,
+    "retention_generations_kept": len(gens),
+    "verified_this_run": ver_ok,
+    "last_verified_at": now_iso if ver_ok else prev.get("last_verified_at"),
+    "last_verified_txid": int(ver_tx_s) if ver_ok else prev.get("last_verified_txid"),
+    "last_verified_audit_entries": int(ver_audit_s) if ver_ok else prev.get("last_verified_audit_entries"),
+}
+tmp = status_path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(status, fh, indent=2)
+    fh.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, status_path)
+PY
+
+echo "[motet-modb-backup] ok gen=$CUR_GEN action=$ACTION seq=$ACKED_SEQ tx=$ACKED_TXID ops=$LAST_OPS verified=$VERIFIED_RESTORE verify_tx=$VERIFIED_TXID audit=$VERIFIED_AUDIT"

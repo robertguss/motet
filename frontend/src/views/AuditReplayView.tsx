@@ -7,6 +7,7 @@ import {
   Eye,
   Filter,
   GitBranch,
+  HardDrive,
   History,
   KeyRound,
   Lock,
@@ -36,13 +37,19 @@ import {
   ModbGrant,
   ModbLandingMetrics,
   ModbLandOutcome,
+  ModbMatQueryResult,
+  ModbMatRefreshReport,
+  ModbMatViewMeta,
   ModbPolicyOverview,
   ModbPriorityTicket,
+  ModbQueryPlan,
   ModbReadLogEntry,
   ModbReadResult,
   ModbReleaseResult,
   ModbReplayBaselineStatus,
   ModbReplayProposal,
+  ModbSyncDelta,
+  ModbSyncPeer,
   ModbTaintSession,
   ModbVerifySummary,
   ModbWorldLandResult,
@@ -64,7 +71,7 @@ import {
   SectionHeader,
 } from '../components/ui';
 
-type SubTab = 'audit' | 'replay' | 'worlds' | 'grants' | 'views' | 'governance';
+type SubTab = 'audit' | 'replay' | 'worlds' | 'grants' | 'views' | 'governance' | 'sync';
 type ReplayFilterMode =
   | 'exclude_principal'
   | 'exclude_seqs'
@@ -305,8 +312,35 @@ export const AuditReplayView: React.FC<{
   const [readLimit, setReadLimit] = useState('25');
   const [readResult, setReadResult] = useState<ModbReadResult | null>(null);
   const [runningRead, setRunningRead] = useState(false);
+  const [queryPlan, setQueryPlan] = useState<ModbQueryPlan | null>(null);
+  const [explainingRead, setExplainingRead] = useState(false);
   const [releaseResult, setReleaseResult] = useState<ModbReleaseResult | null>(null);
   const [runningRelease, setRunningRelease] = useState<string | null>(null);
+
+  // Materialized Views state (Milestone 15)
+  const [matviews, setMatviews] = useState<ModbMatViewMeta[]>([]);
+  const [refreshingMatview, setRefreshingMatview] = useState<string | null>(null);
+  const [matRefreshReport, setMatRefreshReport] = useState<ModbMatRefreshReport | null>(null);
+  const [matQueryMinK, setMatQueryMinK] = useState('0');
+  const [queryingMatview, setQueryingMatview] = useState<string | null>(null);
+  const [matQueryResult, setMatQueryResult] = useState<ModbMatQueryResult | null>(null);
+
+  // Sync & Encrypted Off-Host Backups state (Milestone 16)
+  const [syncPeers, setSyncPeers] = useState<ModbSyncPeer[]>([]);
+  const [newPeerId, setNewPeerId] = useState('offsite-backup');
+  const [newPeerIncludeInternal, setNewPeerIncludeInternal] = useState(true);
+  const [newPeerFromEmpty, setNewPeerFromEmpty] = useState(false);
+  const [creatingPeer, setCreatingPeer] = useState(false);
+  const [syncEncrypt, setSyncEncrypt] = useState(true);
+  const [syncKeyId, setSyncKeyId] = useState('motet-backup-v1');
+  const [syncAad, setSyncAad] = useState('motet-prod');
+  const [busyPeerId, setBusyPeerId] = useState<string | null>(null);
+  const [syncPreview, setSyncPreview] = useState<{
+    title: string;
+    payload: unknown;
+    encrypted: boolean;
+  } | null>(null);
+  const [lastPlainDelta, setLastPlainDelta] = useState<Record<string, ModbSyncDelta>>({});
 
   // Governance & Reactive Feeds state (Milestone 12)
   const [policyOverview, setPolicyOverview] = useState<ModbPolicyOverview | null>(null);
@@ -404,12 +438,14 @@ export const AuditReplayView: React.FC<{
         }),
         apiOptional<ModbReadLogEntry[]>('/v1/modb/reads', []),
       ]);
-      const [polOv, gProps, fds, tSess, erRecs] = await Promise.all([
+      const [polOv, gProps, fds, tSess, erRecs, mvs, sPeers] = await Promise.all([
         apiOptional<ModbPolicyOverview | null>('/v1/modb/policy', null),
         apiOptional<ModbGovProposal[]>('/v1/modb/proposals', []),
         apiOptional<ModbFeedSubscription[]>('/v1/modb/feeds', []),
         apiOptional<ModbTaintSession[]>('/v1/modb/taint/sessions', []),
         apiOptional<ModbErasureReceipt[]>('/v1/modb/erasures', []),
+        apiOptional<ModbMatViewMeta[]>('/v1/modb/matviews', []),
+        apiOptional<ModbSyncPeer[]>('/v1/modb/sync/peers', []),
       ]);
       setVerify(v);
       setBaseline(bl);
@@ -426,6 +462,8 @@ export const AuditReplayView: React.FC<{
       setFeeds(fds);
       setTaintSessions(tSess);
       setErasureReceipts(erRecs);
+      setMatviews(mvs);
+      setSyncPeers(sPeers);
       if (gr.length && !clrGrantId) {
         setClrGrantId(gr[0].id);
         setGovPropTargetGrant(gr[0].id);
@@ -670,38 +708,58 @@ export const AuditReplayView: React.FC<{
     }
   }
 
+  function buildReadProgramPayload() {
+    let whereClause: Record<string, unknown> | null = null;
+    if (whereOp !== 'none' && whereField.trim()) {
+      if (whereOp === 'contains') {
+        whereClause = { contains: { field: whereField.trim(), substr: whereValue } };
+      } else if (whereOp === 'starts_with') {
+        whereClause = { starts_with: { field: whereField.trim(), prefix: whereValue } };
+      } else {
+        let parsedVal: unknown = whereValue;
+        if (whereValue === 'true') parsedVal = true;
+        else if (whereValue === 'false') parsedVal = false;
+        else if (whereValue !== '' && !Number.isNaN(Number(whereValue))) {
+          parsedVal = Number(whereValue);
+        }
+        whereClause = { [whereOp]: { field: whereField.trim(), value: parsedVal } };
+      }
+    }
+    const lim = Number(readLimit);
+    return {
+      view: readView,
+      where_clause: whereClause,
+      select: null,
+      group_by: null,
+      aggregates: null,
+      order_by: null,
+      limit: Number.isFinite(lim) && lim > 0 ? lim : 25,
+    };
+  }
+
+  async function explainReadProgram() {
+    setExplainingRead(true);
+    try {
+      const plan = await api<ModbQueryPlan>('/v1/modb/query/explain', {
+        method: 'POST',
+        body: JSON.stringify(buildReadProgramPayload()),
+      });
+      setQueryPlan(plan);
+      toast(`Plan: ${plan.strategy}${plan.field ? ` (${plan.field})` : ''}`);
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setExplainingRead(false);
+    }
+  }
+
   async function runSandboxedRead(e: React.FormEvent) {
     e.preventDefault();
     setRunningRead(true);
     try {
-      let whereClause: Record<string, unknown> | null = null;
-      if (whereOp !== 'none' && whereField.trim()) {
-        if (whereOp === 'contains') {
-          whereClause = { contains: { field: whereField.trim(), substr: whereValue } };
-        } else if (whereOp === 'starts_with') {
-          whereClause = { starts_with: { field: whereField.trim(), prefix: whereValue } };
-        } else {
-          let parsedVal: unknown = whereValue;
-          if (whereValue === 'true') parsedVal = true;
-          else if (whereValue === 'false') parsedVal = false;
-          else if (whereValue !== '' && !Number.isNaN(Number(whereValue))) {
-            parsedVal = Number(whereValue);
-          }
-          whereClause = { [whereOp]: { field: whereField.trim(), value: parsedVal } };
-        }
-      }
-      const lim = Number(readLimit);
       const res = await api<ModbReadResult>('/v1/modb/query', {
         method: 'POST',
-        body: JSON.stringify({
-          view: readView,
-          where_clause: whereClause,
-          select: null,
-          group_by: null,
-          aggregates: null,
-          order_by: null,
-          limit: Number.isFinite(lim) && lim > 0 ? lim : 25,
-        }),
+        body: JSON.stringify(buildReadProgramPayload()),
       });
       setReadResult(res);
       toast(`Read ${res.result_count} row(s) (${res.rows_scanned} scanned, ${res.ops_used} ops)`);
@@ -711,6 +769,184 @@ export const AuditReplayView: React.FC<{
       toast((err as Error).message);
     } finally {
       setRunningRead(false);
+    }
+  }
+
+  async function refreshMatview(name: string) {
+    setRefreshingMatview(name);
+    try {
+      const rep = await api<ModbMatRefreshReport>(
+        `/v1/modb/matviews/${encodeURIComponent(name)}/refresh`,
+        { method: 'POST', body: '{}' }
+      );
+      setMatRefreshReport(rep);
+      const mvs = await apiOptional<ModbMatViewMeta[]>('/v1/modb/matviews', []);
+      setMatviews(mvs);
+      toast(
+        `Refreshed ${rep.name} via ${rep.strategy}: ${rep.diffs_applied} diffs, ${rep.groups_touched} group(s)`
+      );
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setRefreshingMatview(null);
+    }
+  }
+
+  async function queryMatview(name: string) {
+    setQueryingMatview(name);
+    try {
+      const kNum = Number(matQueryMinK);
+      const qs = Number.isFinite(kNum) && kNum > 0 ? `?min_k=${Math.floor(kNum)}` : '';
+      const res = await api<ModbMatQueryResult>(
+        `/v1/modb/matviews/${encodeURIComponent(name)}/query${qs}`
+      );
+      setMatQueryResult(res);
+      toast(
+        `MatView ${res.name}: ${res.returned_groups}/${res.total_groups} group(s)${
+          res.suppressed_groups ? ` (${res.suppressed_groups} suppressed)` : ''
+        }`
+      );
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setQueryingMatview(null);
+    }
+  }
+
+  function downloadJsonArtifact(filename: string, payload: unknown) {
+    if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return;
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(href);
+  }
+
+  function buildSyncQueryString() {
+    if (!syncEncrypt) return '';
+    const params = new URLSearchParams({ encrypt: 'true' });
+    if (syncKeyId.trim()) params.set('key_id', syncKeyId.trim());
+    if (syncAad.trim()) params.set('aad', syncAad.trim());
+    return `?${params.toString()}`;
+  }
+
+  async function createSyncPeer(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newPeerId.trim()) return;
+    setCreatingPeer(true);
+    try {
+      const peer = await api<ModbSyncPeer>('/v1/modb/sync/peers', {
+        method: 'POST',
+        body: JSON.stringify({
+          peer_id: newPeerId.trim(),
+          include_internal: newPeerIncludeInternal,
+          from_empty: newPeerFromEmpty,
+        }),
+      });
+      toast(`Registered sync peer ${peer.peer_id} at txid=${peer.acked_txid}`);
+      const peers = await apiOptional<ModbSyncPeer[]>('/v1/modb/sync/peers', []);
+      setSyncPeers(peers);
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setCreatingPeer(false);
+    }
+  }
+
+  async function downloadPeerSnapshot(peerId: string) {
+    setBusyPeerId(peerId);
+    try {
+      const payload = await api<unknown>(
+        `/v1/modb/sync/peers/${encodeURIComponent(peerId)}/snapshot${buildSyncQueryString()}`,
+        { method: 'POST', body: '{}' }
+      );
+      setSyncPreview({
+        title: `${peerId} base snapshot (${syncEncrypt ? 'AES-256-GCM sealed' : 'plain portable JSON'})`,
+        payload,
+        encrypted: syncEncrypt,
+      });
+      downloadJsonArtifact(
+        `motet-${peerId}-snapshot${syncEncrypt ? '.enc' : ''}.json`,
+        payload
+      );
+      toast(`Downloaded base snapshot for ${peerId}`);
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setBusyPeerId(null);
+    }
+  }
+
+  async function exportPeerDelta(peerId: string) {
+    setBusyPeerId(peerId);
+    try {
+      const payload = await api<unknown>(
+        `/v1/modb/sync/peers/${encodeURIComponent(peerId)}/export${buildSyncQueryString()}`,
+        { method: 'POST', body: '{}' }
+      );
+      setSyncPreview({
+        title: `${peerId} incremental delta (${syncEncrypt ? 'AES-256-GCM sealed' : 'plain SyncDelta'})`,
+        payload,
+        encrypted: syncEncrypt,
+      });
+      if (!syncEncrypt && payload && typeof payload === 'object' && 'delta_hash' in payload) {
+        const d = payload as ModbSyncDelta;
+        setLastPlainDelta((prev) => ({ ...prev, [peerId]: d }));
+      }
+      downloadJsonArtifact(`motet-${peerId}-delta${syncEncrypt ? '.enc' : ''}.json`, payload);
+      const peers = await apiOptional<ModbSyncPeer[]>('/v1/modb/sync/peers', []);
+      setSyncPeers(peers);
+      toast(`Exported CoW delta for ${peerId}`);
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setBusyPeerId(null);
+    }
+  }
+
+  async function ackPeerPending(peer: ModbSyncPeer) {
+    const seq = peer.pending_seq ?? lastPlainDelta[peer.peer_id]?.seq;
+    const hash = peer.pending_hash ?? lastPlainDelta[peer.peer_id]?.delta_hash;
+    if (!seq || !hash) {
+      toast('No pending delta seq/hash recorded for this peer');
+      return;
+    }
+    setBusyPeerId(peer.peer_id);
+    try {
+      const updated = await api<ModbSyncPeer>(
+        `/v1/modb/sync/peers/${encodeURIComponent(peer.peer_id)}/ack`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ seq, delta_hash: hash }),
+        }
+      );
+      toast(`Acked ${updated.peer_id} through seq=${updated.acked_seq} (tx=${updated.acked_txid})`);
+      const peers = await apiOptional<ModbSyncPeer[]>('/v1/modb/sync/peers', []);
+      setSyncPeers(peers);
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setBusyPeerId(null);
+    }
+  }
+
+  async function removeSyncPeer(peerId: string) {
+    setBusyPeerId(peerId);
+    try {
+      await api(`/v1/modb/sync/peers/${encodeURIComponent(peerId)}`, {
+        method: 'DELETE',
+      });
+      toast(`Removed sync peer ${peerId}`);
+      const peers = await apiOptional<ModbSyncPeer[]>('/v1/modb/sync/peers', []);
+      setSyncPeers(peers);
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setBusyPeerId(null);
     }
   }
 
@@ -1312,6 +1548,7 @@ export const AuditReplayView: React.FC<{
             ['grants', 'Grants & Claims', KeyRound],
             ['views', 'Views & Read Explorer', Eye],
             ['governance', 'Governance & Feeds', Lock],
+            ['sync', 'Sync & Backups', HardDrive],
           ] as Array<[SubTab, string, React.ComponentType<{ className?: string }>]>
         ).map(([id, label, Icon]) => {
           const active = subTab === id;
@@ -1334,6 +1571,9 @@ export const AuditReplayView: React.FC<{
               )}
               {id === 'worlds' && openWorldCount > 0 && (
                 <Badge tone="accent">{openWorldCount}</Badge>
+              )}
+              {id === 'sync' && syncPeers.length > 0 && (
+                <Badge tone="info">{syncPeers.length}</Badge>
               )}
               {id === 'governance' &&
                 (pendingGovProposals > 0 || taintedSessionCount > 0 || feeds.length > 0) && (
@@ -2313,7 +2553,33 @@ export const AuditReplayView: React.FC<{
                 <Play className="w-3.5 h-3.5" />
                 <span>{runningRead ? 'Running…' : 'Run Query'}</span>
               </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                disabled={explainingRead}
+                onClick={explainReadProgram}
+              >
+                <Search className="w-3.5 h-3.5" />
+                <span>{explainingRead ? 'Explaining…' : 'Explain Plan'}</span>
+              </Button>
             </form>
+
+            {queryPlan && (
+              <div className="p-2.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex items-center gap-2 flex-wrap text-xs font-mono">
+                <Badge tone={queryPlan.index_used ? 'ok' : 'warn'}>
+                  strategy={queryPlan.strategy}
+                </Badge>
+                <Badge tone={queryPlan.index_used ? 'info' : 'neutral'}>
+                  {queryPlan.index_used ? 'secondary index' : 'full table scan'}
+                </Badge>
+                {queryPlan.field && <span>field={queryPlan.field}</span>}
+                {queryPlan.value !== undefined && <span>value={JSON.stringify(queryPlan.value)}</span>}
+                {queryPlan.reason && (
+                  <span className="text-[var(--fg-muted)]">{queryPlan.reason}</span>
+                )}
+              </div>
+            )}
 
             {readResult && (
               <div className="flex flex-col gap-2">
@@ -2371,6 +2637,109 @@ export const AuditReplayView: React.FC<{
                 </div>
                 <pre className="m-0 p-3 rounded-lg bg-[var(--bg)] border border-[var(--border)] text-xs overflow-x-auto max-h-72">
                   {JSON.stringify(releaseResult.data, null, 2)}
+                </pre>
+              </div>
+            )}
+          </Card>
+
+          <Card>
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <strong className="text-sm">
+                Materialized Views (Modb.Matview · {matviews.length})
+              </strong>
+              <div className="flex items-center gap-2 text-xs">
+                <span className="text-[var(--fg-muted)]">Query min k:</span>
+                <input
+                  className={`${inputCls} w-20`}
+                  aria-label="MatView min_k"
+                  value={matQueryMinK}
+                  onChange={(e) => setMatQueryMinK(e.target.value)}
+                />
+              </div>
+            </div>
+            {matviews.length === 0 ? (
+              <div className="text-xs text-[var(--fg-muted)]">
+                No incremental CoW materialized views configured.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                {matviews.map((mv) => (
+                  <div
+                    key={mv.def.name}
+                    className="p-3 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-2 text-xs"
+                  >
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <strong className="font-mono text-[var(--accent-hover)]">
+                        {mv.def.name}
+                      </strong>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <Badge tone={mv['pin_aligned?'] ? 'ok' : 'warn'}>
+                          {mv['pin_aligned?'] ? 'pin aligned' : 'stale pin'}
+                        </Badge>
+                        <Badge tone="neutral">{mv.group_count} groups</Badge>
+                        <Badge tone="info">tx #{mv.last_txid}</Badge>
+                      </div>
+                    </div>
+                    <div className="text-[var(--fg-muted)]">{mv.def.description}</div>
+                    <div className="font-mono text-[11px] text-[var(--fg-subtle)]">
+                      bucket={mv.def.source_bucket} · group_by={mv.def.group_by} · rebuilds=
+                      {mv.rebuilds} · inc={mv.incremental_refreshes} · recomputes=
+                      {mv.group_recomputes}
+                    </div>
+                    <div className="flex gap-1.5 flex-wrap">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={refreshingMatview === mv.def.name}
+                        onClick={() => refreshMatview(mv.def.name)}
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        <span>
+                          {refreshingMatview === mv.def.name ? 'Refreshing…' : 'Refresh O(diff)'}
+                        </span>
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        disabled={queryingMatview === mv.def.name}
+                        onClick={() => queryMatview(mv.def.name)}
+                      >
+                        <Play className="w-3.5 h-3.5" />
+                        <span>
+                          {queryingMatview === mv.def.name ? 'Querying…' : 'Query MatView'}
+                        </span>
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {matRefreshReport && (
+              <div className="p-2.5 rounded-lg bg-[var(--bg)] border border-[var(--border)] flex gap-2 flex-wrap text-xs font-mono">
+                <Badge tone="ok">{matRefreshReport.name}</Badge>
+                <Badge tone="info">{matRefreshReport.strategy}</Badge>
+                <span>diffs={matRefreshReport.diffs_applied}</span>
+                <span>touched={matRefreshReport.groups_touched}</span>
+                <span>recomputes={matRefreshReport.group_recomputes}</span>
+                <span>tx #{matRefreshReport.last_txid}</span>
+              </div>
+            )}
+
+            {matQueryResult && (
+              <div className="flex flex-col gap-2">
+                <div className="flex gap-2 flex-wrap text-xs">
+                  <Badge tone="ok">
+                    {matQueryResult.name}: {matQueryResult.returned_groups}/
+                    {matQueryResult.total_groups} groups
+                  </Badge>
+                  <Badge tone="neutral">
+                    suppressed={matQueryResult.suppressed_groups}
+                  </Badge>
+                  <Badge tone="info">tx #{matQueryResult.last_txid}</Badge>
+                </div>
+                <pre className="m-0 p-3 rounded-lg bg-[var(--bg)] border border-[var(--border)] text-xs overflow-x-auto max-h-64">
+                  {JSON.stringify(matQueryResult.rows, null, 2)}
                 </pre>
               </div>
             )}
@@ -3069,6 +3438,201 @@ export const AuditReplayView: React.FC<{
               )}
             </Card>
           </div>
+        </div>
+      )}
+
+      {/* TAB 6: INCREMENTAL SYNC PEERS & ENCRYPTED OFF-HOST BACKUPS */}
+      {subTab === 'sync' && (
+        <div className="flex flex-col gap-4">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+            <Card>
+              <strong className="text-sm">Register Incremental Sync Peer (Modb.Sync)</strong>
+              <p className="m-0 text-xs text-[var(--fg-muted)]">
+                Pins a two-phase persistent CoW root cursor (<code>sync:&lt;peer&gt;</code> /{' '}
+                <code>sync_pending:&lt;peer&gt;</code>) for hash-chained O(diff) replication and
+                AES-256-GCM encrypted off-host backups.
+              </p>
+              <form onSubmit={createSyncPeer} className="flex flex-col gap-2.5">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <Field label="Peer ID">
+                    <input
+                      className={inputCls}
+                      value={newPeerId}
+                      onChange={(e) => setNewPeerId(e.target.value)}
+                      placeholder="offsite-backup"
+                    />
+                  </Field>
+                  <div className="flex flex-col justify-end gap-1.5 pb-1 text-xs">
+                    <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={newPeerIncludeInternal}
+                        onChange={(e) => setNewPeerIncludeInternal(e.target.checked)}
+                      />
+                      <span>include _modb_* internal tables</span>
+                    </label>
+                    <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={newPeerFromEmpty}
+                        onChange={(e) => setNewPeerFromEmpty(e.target.checked)}
+                      />
+                      <span>sync from empty genesis root</span>
+                    </label>
+                  </div>
+                </div>
+                <div className="flex justify-end">
+                  <Button type="submit" size="sm" variant="primary" disabled={creatingPeer}>
+                    <Pin className="w-3.5 h-3.5" />
+                    <span>{creatingPeer ? 'Registering…' : 'Register Sync Peer'}</span>
+                  </Button>
+                </div>
+              </form>
+            </Card>
+
+            <Card>
+              <strong className="text-sm">Off-Host Download Sealing (AES-256-GCM)</strong>
+              <p className="m-0 text-xs text-[var(--fg-muted)]">
+                Controls whether downloaded snapshots and incremental deltas are sealed with{' '}
+                <code>MODB_BACKUP_KEY_HEX</code> before leaving the host.
+              </p>
+              <div className="flex flex-col gap-2.5 text-xs">
+                <label className="inline-flex items-center gap-2 cursor-pointer font-semibold">
+                  <input
+                    type="checkbox"
+                    checked={syncEncrypt}
+                    onChange={(e) => setSyncEncrypt(e.target.checked)}
+                  />
+                  <ShieldCheck className="w-3.5 h-3.5 text-[var(--ok)]" />
+                  <span>Encrypt Downloads (AES-256-GCM)</span>
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <Field label="Key ID label">
+                    <input
+                      className={inputCls}
+                      value={syncKeyId}
+                      onChange={(e) => setSyncKeyId(e.target.value)}
+                      disabled={!syncEncrypt}
+                    />
+                  </Field>
+                  <Field label="AAD binding">
+                    <input
+                      className={inputCls}
+                      value={syncAad}
+                      onChange={(e) => setSyncAad(e.target.value)}
+                      disabled={!syncEncrypt}
+                    />
+                  </Field>
+                </div>
+                <div className="p-2.5 rounded-lg bg-[var(--bg)] border border-[var(--border)] font-mono text-[11px] text-[var(--fg-muted)] overflow-x-auto">
+                  motet sync restore restored.modb --base snapshot{syncEncrypt ? '.enc' : ''}.json{' '}
+                  delta1{syncEncrypt ? '.enc' : ''}.json
+                  {syncEncrypt ? ` --decrypt --aad "${syncAad || 'motet-prod'}"` : ''} &amp;&amp;
+                  modb verify restored.modb --json
+                </div>
+              </div>
+            </Card>
+          </div>
+
+          <Card>
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <strong className="text-sm">Registered Sync Peers ({syncPeers.length})</strong>
+              <Badge tone="info">2-phase pin cursors</Badge>
+            </div>
+            {syncPeers.length === 0 ? (
+              <EmptyState
+                title="No sync peers registered"
+                description="Register an off-host backup or read replica peer above, or wait for the scheduled hourly backup timer to initialize auto-backup."
+              />
+            ) : (
+              <div className="flex flex-col gap-2.5">
+                {syncPeers.map((peer) => {
+                  const pendingSeq = peer.pending_seq ?? lastPlainDelta[peer.peer_id]?.seq ?? null;
+                  const pendingHash =
+                    peer.pending_hash ?? lastPlainDelta[peer.peer_id]?.delta_hash ?? null;
+                  const isBusy = busyPeerId === peer.peer_id;
+                  return (
+                    <div
+                      key={peer.peer_id}
+                      className="p-3 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex items-center justify-between gap-3 flex-wrap text-xs"
+                    >
+                      <div className="flex flex-col gap-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <strong className="font-mono text-sm text-[var(--accent-hover)]">
+                            {peer.peer_id}
+                          </strong>
+                          <Badge tone="ok">acked seq #{peer.acked_seq}</Badge>
+                          <Badge tone="info">tx #{peer.acked_txid}</Badge>
+                          <Badge tone={peer['include_internal?'] ? 'accent' : 'neutral'}>
+                            {peer['include_internal?'] ? 'full + internal' : 'app tables only'}
+                          </Badge>
+                          {pendingSeq != null && (
+                            <Badge tone="warn">pending seq #{pendingSeq}</Badge>
+                          )}
+                        </div>
+                        <div className="font-mono text-[11px] text-[var(--fg-muted)] break-all">
+                          acked_hash={peer.acked_hash.slice(0, 16)}…
+                          {pendingHash ? ` · pending_hash=${pendingHash.slice(0, 16)}…` : ''}
+                        </div>
+                      </div>
+                      <div className="flex gap-1.5 flex-wrap">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={isBusy}
+                          onClick={() => downloadPeerSnapshot(peer.peer_id)}
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Base Snapshot</span>
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          disabled={isBusy}
+                          onClick={() => exportPeerDelta(peer.peer_id)}
+                        >
+                          <Database className="w-3.5 h-3.5" />
+                          <span>Export Delta</span>
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ok"
+                          disabled={isBusy || pendingSeq == null || !pendingHash}
+                          onClick={() => ackPeerPending(peer)}
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>Ack Pending</span>
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="bad"
+                          disabled={isBusy}
+                          onClick={() => removeSyncPeer(peer.peer_id)}
+                        >
+                          <XCircle className="w-3.5 h-3.5" />
+                          <span>Remove Peer</span>
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {syncPreview && (
+              <div className="flex flex-col gap-2 mt-2">
+                <div className="flex items-center gap-2 flex-wrap text-xs">
+                  <strong className="font-mono">{syncPreview.title}</strong>
+                  <Badge tone={syncPreview.encrypted ? 'ok' : 'neutral'}>
+                    {syncPreview.encrypted ? 'ciphertext envelope' : 'plaintext'}
+                  </Badge>
+                </div>
+                <pre className="m-0 p-3 rounded-lg bg-[var(--bg)] border border-[var(--border)] text-xs overflow-x-auto max-h-64">
+                  {JSON.stringify(syncPreview.payload, null, 2)}
+                </pre>
+              </div>
+            )}
+          </Card>
         </div>
       )}
 

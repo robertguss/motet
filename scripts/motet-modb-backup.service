@@ -1,0 +1,16 @@
+[Unit]
+Description=Motet Encrypted Incremental MoDB Backup & Restore Verification
+After=network-online.target motet-server.service
+Wants=motet-server.service
+
+[Service]
+Type=oneshot
+User=exedev
+Group=exedev
+Environment="HOME=/home/exedev"
+Environment="PATH=/home/exedev/.local/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=-/home/exedev/.config/motet/env
+ExecStart=/home/exedev/.local/bin/motet-modb-backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

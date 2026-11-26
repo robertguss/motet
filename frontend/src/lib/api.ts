@@ -762,6 +762,98 @@ export interface SearchReindexResult {
   'cleared_stale_neural?': boolean;
 }
 
+export interface ModbQueryPlan {
+  view: string;
+  strategy: 'index_eq' | 'index_in_list' | 'index_range' | 'full_scan' | string;
+  index_used: boolean;
+  field?: string | null;
+  value?: unknown;
+  values?: unknown[];
+  lo?: unknown;
+  hi?: unknown;
+  lo_inclusive?: boolean;
+  hi_inclusive?: boolean;
+  reason?: string;
+}
+
+export interface ModbMatAggSpec {
+  alias: string;
+  op:
+    | 'mat_count'
+    | { mat_sum: { field: string } }
+    | { mat_min: { field: string } }
+    | { mat_max: { field: string } }
+    | Record<string, unknown>;
+}
+
+export interface ModbMatViewDef {
+  name: string;
+  description: string;
+  source_bucket: string;
+  group_by: string;
+  aggregates: ModbMatAggSpec[];
+}
+
+export interface ModbMatViewMeta {
+  def: ModbMatViewDef;
+  last_txid: number;
+  'pin_aligned?': boolean;
+  group_count: number;
+  source_rows_seen: number;
+  rebuilds: number;
+  incremental_refreshes: number;
+  group_recomputes: number;
+}
+
+export interface ModbMatRefreshReport {
+  name: string;
+  strategy: string;
+  diffs_applied: number;
+  groups_touched: number;
+  group_recomputes: number;
+  last_txid: number;
+  group_count: number;
+}
+
+export interface ModbMatQueryResult {
+  name: string;
+  last_txid: number;
+  total_groups: number;
+  returned_groups: number;
+  suppressed_groups: number;
+  rows: Record<string, unknown>[];
+}
+
+export interface ModbSyncPeer {
+  peer_id: string;
+  'include_internal?': boolean;
+  'from_empty?': boolean;
+  acked_seq: number;
+  acked_txid: number;
+  acked_hash: string;
+  pending_seq?: number | null;
+  pending_txid?: number | null;
+  pending_hash?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ModbSyncDelta {
+  format_version: number;
+  peer_id: string;
+  seq: number;
+  prev_hash: string;
+  from_txid: number;
+  target_txid: number;
+  'include_internal?': boolean;
+  created_at: string;
+  bucket_count: number;
+  op_count: number;
+  buckets?: unknown[];
+  payload_hash: string;
+  delta_hash: string;
+}
+
 export function getStoredToken(): string {
   return localStorage.getItem('motet_token') || '';
 }
