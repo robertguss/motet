@@ -70,4 +70,27 @@ motet verify
 ./deploy.sh    # builds SPA, syncs ../modb + motet, runs all tests remotely, installs CLI, restarts systemd & verifies MoDB
 ```
 
+### 7. Disaster Recovery & Encrypted Off-Host Backups
+
+- **Hourly Timer ([`scripts/motet-modb-backup`](scripts/motet-modb-backup)):** `motet-modb-backup.timer` takes a two-phase CoW-pinned snapshot + incremental `SyncDelta`s of `motet.modb` and an encrypted snapshot of `motet-secrets.modb` sealed under `AES-256-GCM` (`MODB_BACKUP_KEY_HEX` + `MODB_BACKUP_KEY_ID`), verifies full chain decryption/restore integrity, pushes **ciphertext only** to a private off-host Git/Rsync mirror, reports live health via `GET /v1/modb/backups/status` and the Dashboard **Sync & Backups** tab, and sends Telegram alerts (`motet alert ...`) on failure.
+- **Keep keys outside the backup repo:** Store `MODB_BACKUP_KEY_HEX` (and any rotated historical `MODB_BACKUP_KEYRING`) plus `MOTET_MASTER_KEY` in `~/.config/motet/env` (`0600`) and a password manager—never in the backup repository.
+
+**Bare-metal restore procedure:**
+
+```sh
+git clone <encrypted-backup-repo-url> motet-backups
+GEN=$(tr -d '[:space:]' < motet-backups/current.txt)
+export MODB_BACKUP_KEY_HEX="..."   # or MODB_BACKUP_KEYRING="k1=...,k2=..." when rotated
+
+# Restore motet.modb + all deltas in order and verify SHA-256 pages & hash-chained ledger:
+modb sync motet.modb restore --base "motet-backups/$GEN/base.enc.json" \
+  motet-backups/$GEN/*.delta.enc.json --decrypt --aad "motet-auto-backup" --json
+modb verify motet.modb --json
+
+# Restore isolated AES-256-GCM Vault & OAuth secrets DB:
+modb sync motet-secrets.modb restore --base "motet-backups/$GEN/secrets.enc.json" \
+  --decrypt --aad "motet-secrets-auto" --json
+modb verify motet-secrets.modb --json
+```
+
 See [DESIGN.md](DESIGN.md) for the full architecture and security boundaries.
