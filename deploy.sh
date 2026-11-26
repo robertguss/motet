@@ -39,6 +39,7 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 cd "$HOME/motet"
 mo test store.mo
+mo test memory.mo
 mo test tools.mo
 mo test brain.mo
 mo test telegram.mo

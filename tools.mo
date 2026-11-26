@@ -9,13 +9,15 @@ core_tool_defs,
 classify_tool_effect,
 extract_connector_name,
 execute_tool,
-execute_tool_in_context
+execute_tool_in_context,
+execute_tool_with_grant
 use Command
 use Connectors
 use Json
 use Llm{ToolDef}
 use Mcp
 use Memory
+use Modb.Views
 use Oauth
 use Policy
 use Skills
@@ -243,6 +245,27 @@ fn core_tool_defs() : List(ToolDef)
         },
         ["bot", "task"]
       )
+    ),
+    ToolDef(
+      name: "modb_describe",
+      description: "Inspect your active MoDB grant capabilities, visible narrowed Views, allowed Releases, active Claims, open Worlds, invariants, and read limits.",
+      schema: obj_schema({}, [])
+    ),
+    ToolDef(
+      name: "modb_query",
+      description: "Run a zero-approval sandboxed read query against a permitted MoDB View (with optional filter and row limit). Statically gated to exposed fields.",
+      schema: obj_schema(
+        {
+          "view": str_prop(
+            "Permitted view name from modb_describe (e.g. 'bots_public', 'memories_shared', 'artifacts')"
+          ),
+          "where_field": str_prop("Optional field name exposed by the view"),
+          "where_op": str_prop("Optional operator: eq, neq, contains, starts_with"),
+          "where_value": str_prop("Optional comparison value"),
+          "limit": int_prop("Max rows to return (default 25)")
+        },
+        ["view"]
+      )
     )
   ]
 end
@@ -314,7 +337,9 @@ fn classify_tool_effect(tool_name: Text, arguments_json: Text, connectors: List(
     tool_name == "connector_tools" or
     tool_name == "web_search" or
     tool_name == "web_fetch" or
-    tool_name == "bot_list"
+    tool_name == "bot_list" or
+    tool_name == "modb_describe" or
+    tool_name == "modb_query"
     return (Read, tool_name)
   end
 
@@ -466,7 +491,7 @@ fn execute_tool(
   tool_name: Text,
   arguments_json: Text
 ) : Result(Text, MotetError)
-  execute_tool_in_context(rt, db, bot, session_id, Owner, false, tool_name, arguments_json)
+  execute_tool_with_grant(rt, db, bot, session_id, Owner, false, None, tool_name, arguments_json)
 end
 
 ## Executes an already-authorized tool call with host-stamped TrustLevel provenance.
@@ -477,6 +502,31 @@ fn execute_tool_in_context(
   session_id: Text,
   trust: TrustLevel,
   routine_read_only?: Bool,
+  tool_name: Text,
+  arguments_json: Text
+) : Result(Text, MotetError)
+  execute_tool_with_grant(
+    rt,
+    db,
+    bot,
+    session_id,
+    trust,
+    routine_read_only?,
+    None,
+    tool_name,
+    arguments_json
+  )
+end
+
+## Executes an already-authorized tool call under host TrustLevel and optional MoDB Grant scope.
+fn execute_tool_with_grant(
+  rt: ToolRuntime,
+  db: Store.DbHandle,
+  bot: BotConfig,
+  session_id: Text,
+  trust: TrustLevel,
+  routine_read_only?: Bool,
+  grant_id_opt: Option(Text),
   tool_name: Text,
   arguments_json: Text
 ) : Result(Text, MotetError)
@@ -765,6 +815,74 @@ fn execute_tool_in_context(
     return Ok(if lines.empty?: "no active bots" else: lines.join("\n"))
   end
 
+  if tool_name == "modb_describe"
+    eff_gid = case grant_id_opt
+      Some(gid): gid
+      None:
+        _rg = try Store.ensure_bot_root_grant(db, bot.name, now_time)
+        Store.bot_root_grant_id(bot.name)
+    end
+    return case Store.describe_for_caller(db, "bot:#{bot.name}", Some(eff_gid), now_time)
+      Ok(manifest): Ok(Json.encode(manifest))
+      Error(err): Ok("modb_describe_error: #{err}")
+    end
+  end
+
+  if tool_name == "modb_query"
+    eff_gid = case grant_id_opt
+      Some(gid): gid
+      None:
+        _rg = try Store.ensure_bot_root_grant(db, bot.name, now_time)
+        Store.bot_root_grant_id(bot.name)
+    end
+    view_name = (args.text_at("view") or "").trim
+    return Ok("modb_query_error: view is required") if view_name.empty?
+    wf = (args.text_at("where_field") or "").trim
+    wop = (args.text_at("where_op") or "").trim.ascii_lowercase
+    wval_opt = args.get("where_value")
+    where_clause = if not wf.empty? and not wop.empty?
+      wval_json = wval_opt or Json.Null
+      if wop == "eq"
+        Some(Views.Eq(field: wf, value: wval_json))
+      else if wop == "neq"
+        Some(Views.Neq(field: wf, value: wval_json))
+      else if wop == "contains"
+        sv = case wval_json
+          Json.String(s): s
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): wval_json
+            .to_text
+        end
+        Some(Views.Contains(field: wf, substr: sv))
+      else if wop == "starts_with"
+        sv = case wval_json
+          Json.String(s): s
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): wval_json
+            .to_text
+        end
+        Some(Views.StartsWith(field: wf, prefix: sv))
+      else
+        return Ok("modb_query_error: unsupported where_op '#{wop}'")
+      end
+    else
+      None
+    end
+    lim = args.int_at("limit") or 25
+    capped_lim = if lim > 0 and lim <= 200: lim else: 25
+    prog = Views.ReadProgram(
+      view: view_name,
+      where_clause: where_clause,
+      select: None,
+      group_by: None,
+      aggregates: None,
+      order_by: None,
+      limit: Some(capped_lim)
+    )
+    return case Store.run_read_program(db, "bot:#{bot.name}", Some(eff_gid), prog, now_time)
+      Ok(res): Ok(Json.encode(res))
+      Error(err): Ok("modb_query_error: #{err}")
+    end
+  end
+
   if tool_name == "bot_delegate"
     return Ok("delegation_error: bot_delegate must execute via Brain")
   end
@@ -867,4 +985,117 @@ test "local hand confines file escapes, database files, disallowed commands, and
     wr_err.starts_with?("file_error:")
   assert execute_tool(rt, db, root_bot, "s2", "file_list", "{\"folder\":\".\"}") is Ok(listing)
   assert not listing.contains?("motet.modb") and not listing.contains?("motet-secrets.modb")
+end
+
+test "modb_describe and modb_query enforce delegated grant view narrowing and record read provenance"
+  files = Files.in_memory({})
+  cmd = Command.fake({})
+  net = Network.fake({})
+  t0 = Time.parse("2026-11-26T00:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  db = Store.open(files, clock)
+  assert Store.seed_defaults(db, t0.to_text) is Ok(Unit)
+  assert Store.save_memory(db, "shared", "profile", "Owner likes concise briefs", "user", t0.to_text) is
+    Ok(_)
+  assert Store.save_memory(
+    db,
+    "finance",
+    "fact",
+    "Private finance note",
+    "bot:finance",
+    t0.to_text
+  ) is
+    Ok(_)
+
+  rt = ToolRuntime(files: files, command: cmd, network: net, env: Env.of({}), clock: clock)
+  assert Store.get_bot(db, "finance") is Ok(Some(fin_bot))
+
+  # Delegated read-only grant automatically narrows Views to bots_public / memories_shared / artifacts
+  assert Store.delegate_bot_grant(
+    db,
+    "chief",
+    "bot:chief",
+    "del:tool-ro",
+    "finance",
+    true,
+    8,
+    t0
+  ) is
+    Ok(_)
+
+  # modb_describe returns narrowed manifest omitting `bots`
+  assert execute_tool_with_grant(
+    rt,
+    db,
+    fin_bot,
+    "s-del",
+    Owner,
+    true,
+    Some("del:tool-ro"),
+    "modb_describe",
+    "{}"
+  ) is
+    Ok(desc_txt)
+  assert desc_txt.contains?("bots_public") and not desc_txt.contains?("daily_budget_usd")
+
+  # Querying permitted narrowed view succeeds and leaves provenance row
+  assert execute_tool_with_grant(
+    rt,
+    db,
+    fin_bot,
+    "s-del",
+    Owner,
+    true,
+    Some("del:tool-ro"),
+    "modb_query",
+    "{\"view\":\"bots_public\",\"where_field\":\"name\",\"where_op\":\"eq\",\"where_value\":\"finance\",\"limit\":5}"
+  ) is
+    Ok(q_ok)
+  assert q_ok.contains?("\"result_count\":1") and q_ok.contains?("\"finance\"")
+
+  # Querying non-shared memory or forbidden field fails statically / by grant
+  assert execute_tool_with_grant(
+    rt,
+    db,
+    fin_bot,
+    "s-del",
+    Owner,
+    true,
+    Some("del:tool-ro"),
+    "modb_query",
+    "{\"view\":\"bots_public\",\"where_field\":\"daily_budget_usd\",\"where_op\":\"eq\",\"where_value\":\"5.00\"}"
+  ) is
+    Ok(q_field_err) and
+    q_field_err.starts_with?("modb_query_error:")
+
+  assert execute_tool_with_grant(
+    rt,
+    db,
+    fin_bot,
+    "s-del",
+    Owner,
+    true,
+    Some("del:tool-ro"),
+    "modb_query",
+    "{\"view\":\"bots\",\"limit\":5}"
+  ) is
+    Ok(q_view_err) and
+    q_view_err.starts_with?("modb_query_error:")
+
+  assert execute_tool_with_grant(
+    rt,
+    db,
+    fin_bot,
+    "s-del",
+    Owner,
+    true,
+    Some("del:tool-ro"),
+    "modb_query",
+    "{\"view\":\"memories_shared\",\"limit\":10}"
+  ) is
+    Ok(q_mem) and
+    q_mem.contains?("Owner likes concise briefs") and
+    not q_mem.contains?("Private finance note")
+
+  assert Store.list_read_log(db, 10) is Ok(rlogs) and rlogs.size == 2
 end

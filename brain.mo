@@ -30,7 +30,7 @@ use Tools{
   classify_tool_effect,
   core_tool_defs,
   execute_tool,
-  execute_tool_in_context,
+  execute_tool_with_grant,
   extract_connector_name
 }
 use Types{
@@ -590,13 +590,14 @@ fn run_turn_internal(
                 end
                 del_obs
               else
-                try execute_tool_in_context(
+                try execute_tool_with_grant(
                   rt,
                   db,
                   bot,
                   session_id,
                   trust,
                   routine_read_only?,
+                  grant_id_opt,
                   tc.name,
                   tc.arguments_json
                 )

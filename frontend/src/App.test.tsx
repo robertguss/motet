@@ -6,6 +6,8 @@ function mockFetch() {
   let simRun = false;
   let acceptedRun = false;
   let grantRevoked = false;
+  let worldLanded = false;
+  let dreamLanded = false;
 
   return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     const url = String(input);
@@ -339,10 +341,112 @@ function mockFetch() {
             ],
           },
         ],
-        allowed_releases: [],
+        allowed_releases: [
+          {
+            name: 'memory_scope_summary',
+            description: 'k-anonymous counts per memory scope',
+            min_group_size: 2,
+            args_description: 'none',
+          },
+        ],
         allowed_actions: [],
         invariants: [{ name: 'bots_valid', description: 'Valid bots' }],
         read_limits: { max_rows_scanned: 10000, max_ops: 100000, max_result_rows: 500 },
+      });
+    }
+    if (url.includes('/v1/modb/releases/memory_scope_summary')) {
+      return json({
+        release: 'memory_scope_summary',
+        txid: 43,
+        cohort_size: 3,
+        min_group_size: 2,
+        answer_hash: 'aa11bb22cc33dd44',
+        data: { shared: 2, finance: 1 },
+      });
+    }
+    if (url.includes('/v1/modb/reads')) {
+      return json([
+        {
+          seq: 1,
+          txid: 42,
+          principal: 'local',
+          grant_id: null,
+          kind: 'ad_hoc_program',
+          target: 'bots',
+          request_json: {},
+          rows_scanned: 2,
+          result_count: 2,
+          answer_hash: '1122334455667788',
+          at: '2026-11-25T19:00:00Z',
+        },
+      ]);
+    }
+    if (url.includes('/v1/modb/worlds/dream-preview-1/land')) {
+      dreamLanded = true;
+      worldLanded = true;
+      return json({
+        world_id: 'dream-preview-1',
+        commit_txid: 45,
+        calls_replayed: 1,
+        reads_verified: 0,
+        reads_skipped: 2,
+        replies: [{}],
+        grant_chain: ['system:motet', 'system:dreaming'],
+      });
+    }
+    if (url.includes('/v1/modb/worlds/dream-preview-1/diff')) {
+      return json([{ bucket: 'memories', added: 1, removed: 1, modified: 0 }]);
+    }
+    if (url.includes('/v1/modb/worlds')) {
+      return json({
+        metrics: {
+          total_landed: worldLanded ? 2 : 1,
+          stale_read_rejections: 0,
+          invariant_rejections: 0,
+          action_rejections: 0,
+          grant_rejections: 0,
+          needless_send_backs: 0,
+          total_reads_verified: 0,
+          total_reads_skipped: worldLanded ? 4 : 2,
+        },
+        worlds: [
+          {
+            id: 'dream-landed-0',
+            grant_id: 'system:dreaming',
+            principal: 'system:dreaming',
+            base_txid: 40,
+            base_pin_id: 'world:dream-landed-0',
+            steps: [{ read_step: { query: 'list_active_memories' } }, { call_step: { action: 'dream_consolidate' } }],
+            status: { landed: { commit_txid: 41 } },
+            created_at: '2026-11-25T18:00:00Z',
+            expires_at: '2026-11-25T19:00:00Z',
+          },
+          ...(dreamLanded
+            ? [
+                {
+                  id: 'dream-preview-1',
+                  grant_id: 'system:dreaming',
+                  principal: 'system:dreaming',
+                  base_txid: 42,
+                  base_pin_id: 'world:dream-preview-1',
+                  steps: [{ read_step: { query: 'list_active_memories' } }],
+                  status: { landed: { commit_txid: 45 } },
+                  created_at: '2026-11-25T19:10:00Z',
+                  expires_at: '2026-11-25T20:10:00Z',
+                },
+              ]
+            : []),
+        ],
+      });
+    }
+    if (url.includes('/v1/memory/dream/preview')) {
+      return json({
+        world_id: 'dream-preview-1',
+        base_txid: 42,
+        pruned_ids: [9],
+        promoted_contents: ['Always confirm wire transfers'],
+        summary: 'Preview staged 1 promotion and 1 duplicate prune',
+        bucket_diffs: [{ bucket: 'memories', added: 1, removed: 1, modified: 0 }],
       });
     }
     if (url.includes('/v1/modb/query')) {
@@ -474,11 +578,20 @@ describe('Motet Control Plane Dashboard', () => {
       expect(screen.getByText('personal:watch-permit')).toBeInTheDocument();
     });
 
-    // Switch to Memory & Dreaming and verify Dreaming Rollback renders
+    // Switch to Memory & Dreaming and verify Dreaming Rollback + Preview in World render
     fireEvent.click(screen.getByText('Memory & Dreaming'));
     await waitFor(() => {
       expect(screen.getByText('Dreaming History & Rollback')).toBeInTheDocument();
       expect(screen.getByText('Rollback')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Preview in World'));
+    await waitFor(() => {
+      expect(screen.getByText('Speculative World Preview: dream-preview-1')).toBeInTheDocument();
+      expect(screen.getByText('memories: +1 / ~0 / -1')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Land Atomically'));
+    await waitFor(() => {
+      expect(screen.queryByText('Speculative World Preview: dream-preview-1')).not.toBeInTheDocument();
     });
   });
 
@@ -534,14 +647,31 @@ describe('Motet Control Plane Dashboard', () => {
       expect(screen.getByText('revoked')).toBeInTheDocument();
     });
 
-    // Views & Read Explorer tab
+    // Views & Read Explorer tab + k-anonymous Release + Read Provenance Log
     fireEvent.click(screen.getByText('Views & Read Explorer'));
     await waitFor(() => {
       expect(screen.getByText('Zero-Approval Sandboxed ReadProgram Explorer')).toBeInTheDocument();
+      expect(screen.getByText(/Read Provenance Log/)).toBeInTheDocument();
+      expect(screen.getByText('#1')).toBeInTheDocument();
     });
     fireEvent.click(screen.getByText('Run Query'));
     await waitFor(() => {
       expect(screen.getByText('2 rows returned')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Run Release'));
+    await waitFor(() => {
+      expect(screen.getByText('cohort=3 (min k=2)')).toBeInTheDocument();
+    });
+
+    // Speculative Worlds tab + Exclude World in Replay Studio
+    fireEvent.click(screen.getByText('Speculative Worlds'));
+    await waitFor(() => {
+      expect(screen.getByText('O(1) CoW Reads Skipped')).toBeInTheDocument();
+      expect(screen.getByText('dream-landed-0')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getAllByText('Exclude World in Replay →')[0]);
+    await waitFor(() => {
+      expect(screen.getByText('Exclude World ID')).toBeInTheDocument();
     });
   });
 });

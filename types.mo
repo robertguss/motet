@@ -67,6 +67,10 @@ WeeklyAuditReport(..),
 ModbVerifySummary(..),
 ReplaySimulateRequest(..),
 RevokeGrantRequest(..),
+OpenWorldRequest(..),
+WorldQueryRequest(..),
+WorldCallRequest(..),
+WorldLandRequest(..),
 provider_to_text,
 provider_from_text,
 effect_to_text,
@@ -77,6 +81,7 @@ decision_to_text,
 decision_from_text,
 approval_status_to_text,
 approval_status_from_text
+use Json
 
 enum ProviderKind
   OpenAiCompat
@@ -627,10 +632,32 @@ struct ReplaySimulateRequest
   exclude_principal: Option(Text)
   exclude_grant: Option(Text)
   exclude_seqs: Option(List(Int))
+  exclude_world: Option(Text)
   stop_before_seq: Option(Int)
 end
 
 struct RevokeGrantRequest
+  reason: Option(Text)
+end
+
+struct OpenWorldRequest
+  id: Option(Text)
+  grant_id: Option(Text)
+  ttl_seconds: Option(Int)
+end
+
+struct WorldQueryRequest
+  query: Text
+  args: Option(Json)
+end
+
+struct WorldCallRequest
+  action: Text
+  args: Json
+  reason: Option(Text)
+end
+
+struct WorldLandRequest
   reason: Option(Text)
 end
 

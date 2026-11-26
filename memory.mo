@@ -12,11 +12,14 @@ render_capped_memory_block,
 save_with_taint_gate,
 patch_memory,
 run_dreaming,
+DreamingWorldPreview(..),
+preview_dreaming_world,
 list_dreaming_history,
 rollback_dreaming,
 has_dreamed_today,
 generate_weekly_audit
 use Json
+use Modb.World{BucketDiffSummary}
 use Skills
 use Store
 use Types{DreamingDigest, MemoryEntry, MotetError, TrustLevel, WeeklyAuditReport}
@@ -191,12 +194,52 @@ fn extract_owner_signal?(text: Text) : Bool
     text.trim.char_count <= 220
 end
 
-## Overnight Dreaming Consolidation (Light -> REM -> Deep) with pre-image rollback snapshot:
-## - Light: deduplicates redundant memories and archives excess stale `work_log` entries.
-## - REM: extracts crisp owner-trust preference signals from recent Owner sessions (NEVER External).
-## - Deep: commits a transactional rollback snapshot (`archived_ids`, `created_ids`) and logs a Digest.
-fn run_dreaming(db: Store.DbHandle, now_text: Text) : Result(DreamingDigest, MotetError)
-  all_active = try Store.list_memories(db, None, 200)
+struct DreamingWorldPreview
+  world_id: Text
+  base_txid: Int
+  pruned_ids: List(Int)
+  promoted_contents: List(Text)
+  summary: Text
+  bucket_diffs: List(BucketDiffSummary)
+end
+
+## Speculatively stages Overnight Dreaming consolidation inside an isolated MoDB CoW World
+## under the least-privilege `system:dreaming` grant, leaving live memories untouched for preview
+## or atomic all-or-nothing landing.
+fn preview_dreaming_world(db: Store.DbHandle, now_text: Text) : Result(
+  DreamingWorldPreview,
+  MotetError
+)
+  overview = try Store.list_worlds_overview(db)
+  ts_slug = now_text.replace(":", "").replace("-", "").replace(".", "")
+  wid = "dream-#{overview.worlds.size + 1}-#{ts_slug}"
+  now = db.clock.now
+  _wrec = try Store.open_world(db, wid, "system:dreaming", 3600, now)
+
+  # Run both scoped reads BEFORE any world_call so CoW-diff landing validation can skip them
+  # in O(1) whenever neither `memories` nor `sessions`/`events` changed on the main line!
+  act_json = try Store.world_query(
+    db,
+    wid,
+    "list_active_memories",
+    Json.Object({"limit": Json.int(200)}),
+    now
+  )
+  all_active = case Json.decode[List(MemoryEntry)](Json.encode(act_json).bytes)
+    Ok(ms): ms
+    Error(e): return Error(StorageFailed(message: "dreaming memories decode: #{e}"))
+  end
+  msg_json = try Store.world_query(
+    db,
+    wid,
+    "list_recent_owner_messages",
+    Json.Object({"limit": Json.int(40)}),
+    now
+  )
+  ev_msgs = case Json.decode[List(Text)](Json.encode(msg_json).bytes)
+    Ok(xs): xs
+    Error(e): return Error(StorageFailed(message: "dreaming messages decode: #{e}"))
+  end
 
   # LIGHT PHASE: identify redundant duplicates (keep newest/highest id) & overflow work_log entries
   var kept_by_scope = []
@@ -219,34 +262,51 @@ fn run_dreaming(db: Store.DbHandle, now_text: Text) : Result(DreamingDigest, Mot
   end
 
   for aid in archived_ids
-    try Store.archive_memory(db, aid)
+    _arc = try Store.world_call(
+      db,
+      wid,
+      "archive_memory",
+      Json.Object({"id": Json.int(aid)}),
+      "dreaming light pass prune memory ##{aid}",
+      now
+    )
   end
 
   # REM PHASE: scan recent Owner-only direct user messages for explicit durable preference signals
-  ev_msgs = try Store.list_recent_owner_user_messages(db, 40)
-
   var created_ids = []
+  var promoted_contents = []
   var active_now = kept_by_scope
   for raw_msg in ev_msgs
     msg = raw_msg.trim
     if extract_owner_signal?(msg) and not is_duplicate_memory?(active_now, msg)
-      saved = try Store.save_memory_full(
+      saved_json = try Store.world_call(
         db,
-        "shared",
-        "profile",
-        msg,
-        "dreaming:rem",
-        "owner",
-        "direct",
-        false,
-        now_text
+        wid,
+        "save_memory",
+        Json.Object({
+          "scope": Json.String("shared"),
+          "kind": Json.String("profile"),
+          "content": Json.String(msg),
+          "provenance": Json.String("dreaming:rem"),
+          "origin": Json.String("owner"),
+          "session_kind": Json.String("direct"),
+          "staged": Json.Boolean(false),
+          "now_text": Json.String(now_text)
+        }),
+        "dreaming rem pass promote verified owner signal",
+        now
       )
+      saved = case Json.decode[MemoryEntry](Json.encode(saved_json).bytes)
+        Ok(entry): entry
+        Error(e): return Error(StorageFailed(message: "dreaming saved memory decode: #{e}"))
+      end
       created_ids = created_ids.append(saved.id)
+      promoted_contents = promoted_contents.append(saved.content)
       active_now = active_now.append(saved)
     end
   end
 
-  # DEEP PHASE: persist pre-image rollback snapshot & human-readable digest
+  # DEEP PHASE: stage pre-image rollback snapshot & human-readable digest inside the World
   snap_json = Json.Object({
     "archived_ids": Json.Array(archived_ids.map(fn(i) Json.int(i) end)),
     "created_ids": Json.Array(created_ids.map(fn(i) Json.int(i) end))
@@ -255,7 +315,53 @@ fn run_dreaming(db: Store.DbHandle, now_text: Text) : Result(DreamingDigest, Mot
   summary = "Light pass pruned #{archived_ids.size} redundant/stale entries; REM pass promoted #{created_ids
     .size} verified owner signal(s) from recent direct sessions; Deep pass saved rollback snapshot."
 
-  Store.record_dreaming_run(db, now_text, summary, created_ids.size, archived_ids.size, snap_json)
+  _rec = try Store.world_call(
+    db,
+    wid,
+    "record_dreaming_run",
+    Json.Object({
+      "run_at": Json.String(now_text),
+      "summary": Json.String(summary),
+      "promoted_count": Json.int(created_ids.size),
+      "pruned_count": Json.int(archived_ids.size),
+      "rollback_snapshot_json": Json.String(snap_json)
+    }),
+    "dreaming deep pass record digest",
+    now
+  )
+
+  diffs = try Store.world_diff(db, wid)
+  world_rec = try (try Store.get_world(db, wid)).or_fail(
+    StorageFailed(message: "missing newly opened dreaming world '#{wid}'")
+  )
+  Ok(
+    DreamingWorldPreview(
+      world_id: wid,
+      base_txid: world_rec.base_txid,
+      pruned_ids: archived_ids,
+      promoted_contents: promoted_contents,
+      summary: summary,
+      bucket_diffs: diffs
+    )
+  )
+end
+
+## Overnight Dreaming Consolidation (Light -> REM -> Deep) executed inside a speculative CoW
+## World and landed atomically onto the main line (verifying read currency & invariants).
+fn run_dreaming(db: Store.DbHandle, now_text: Text) : Result(DreamingDigest, MotetError)
+  prev = try preview_dreaming_world(db, now_text)
+  landed = try Store.land_world(
+    db,
+    prev.world_id,
+    "atomic overnight dreaming consolidation",
+    db.clock.now
+  )
+  last_rep = try landed.replies.last.or_fail(
+    StorageFailed(message: "dreaming world '#{prev.world_id}' produced no digest reply")
+  )
+  Json.decode[DreamingDigest](Json.encode(last_rep).bytes).map_error(
+    fn(e) StorageFailed(message: "dreaming digest decode: #{e}") end
+  )
 end
 
 ## 1-click Dreaming Rollback: restores archived pre-image memories and deletes REM-created entries.
@@ -477,4 +583,50 @@ test "Memory Core 2.0 enforces taint gate, recall-loop dedup, Dreaming Light->RE
     Ok(_)
   assert generate_weekly_audit(db, files.read_only, t0) is Ok(audit)
   assert audit.unused_bot_skills.size == 1
+end
+
+test "Dreaming World previews without mutation, lands with O(1) CoW read skip, and rejects stale memories"
+  files = Files.in_memory({})
+  t0_time = Time.parse("2026-11-26T01:00:00Z") or stop "time"
+  t0 = t0_time.to_text
+  db = Store.open(files, Clock.fixed(t0_time))
+  assert Store.seed_defaults(db, t0) is Ok(Unit)
+
+  # Duplicate memory + verified owner signal
+  assert Store.save_memory(db, "shared", "profile", "Prefers concise tables", "user", t0) is Ok(_)
+  assert Store.save_memory(db, "shared", "profile", "Prefers concise tables", "legacy", t0) is Ok(_)
+  assert Store.create_session(db, "chief-main", "chief", "Main", Owner, t0) is Ok(_)
+  assert Store.append_event(
+    db,
+    "chief-main",
+    "message",
+    "user",
+    "Always keep action items crisp and dated.",
+    None,
+    None,
+    0.0,
+    t0
+  ) is
+    Ok(_)
+
+  # Preview creates open World without changing live memories
+  assert preview_dreaming_world(db, t0) is Ok(prev1)
+  assert prev1.pruned_ids.size == 1 and prev1.promoted_contents.size == 1
+  assert not prev1.bucket_diffs.empty?
+  assert Store.list_memories(db, Some("shared"), 50) is Ok(live_before) and live_before.size == 2
+
+  # Unrelated write (artifacts) leaves `memories`/`sessions`/`events` CoW roots identical -> reads_skipped == 2!
+  assert Store.save_artifact(db, "chief", "chief-main", "note", "Side note", "unrelated", t0) is Ok(_)
+  assert Store.land_world(db, prev1.world_id, "land dream 1", t0_time) is Ok(land1)
+  assert land1.reads_verified == 2 and land1.reads_skipped == 2
+  assert Store.list_memories(db, Some("shared"), 50) is Ok(live_after)
+  assert live_after.any?(fn(m) m.content.contains?("Always keep action items crisp") end)
+  assert live_after.size == 2
+
+  # Concurrent memory write while another Dreaming World is open forces StaleRead conflict!
+  assert Store.save_memory(db, "shared", "profile", "Third note", "legacy2", t0) is Ok(_)
+  assert Store.save_memory(db, "shared", "profile", "Third note", "legacy3", t0) is Ok(_)
+  assert preview_dreaming_world(db, t0) is Ok(prev2)
+  assert Store.save_memory(db, "shared", "fact", "Concurrent edit", "user", t0) is Ok(_)
+  assert Store.land_world(db, prev2.world_id, "stale dream", t0_time) is Error(Conflict(message: _))
 end

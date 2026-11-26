@@ -21,14 +21,21 @@ import {
   api,
   apiOptional,
   ModbAuditEntry,
+  ModbBucketRowDiff,
   ModbCallRecord,
   ModbClaim,
   ModbDescribeManifest,
   ModbGrant,
+  ModbLandingMetrics,
+  ModbReadLogEntry,
   ModbReadResult,
+  ModbReleaseResult,
   ModbReplayBaselineStatus,
   ModbReplayProposal,
   ModbVerifySummary,
+  ModbWorldLandResult,
+  ModbWorldRecord,
+  ModbWorldsOverview,
 } from '../lib/api';
 import {
   Badge,
@@ -41,14 +48,26 @@ import {
   SectionHeader,
 } from '../components/ui';
 
-type SubTab = 'audit' | 'replay' | 'grants' | 'views';
+type SubTab = 'audit' | 'replay' | 'worlds' | 'grants' | 'views';
 type ReplayFilterMode =
   | 'exclude_principal'
   | 'exclude_seqs'
   | 'stop_before_seq'
   | 'exclude_grant'
+  | 'exclude_world'
   | 'replay_all';
 type WhereOp = 'none' | 'eq' | 'neq' | 'contains' | 'starts_with';
+
+const EMPTY_LANDING_METRICS: ModbLandingMetrics = {
+  total_landed: 0,
+  stale_read_rejections: 0,
+  invariant_rejections: 0,
+  action_rejections: 0,
+  grant_rejections: 0,
+  needless_send_backs: 0,
+  total_reads_verified: 0,
+  total_reads_skipped: 0,
+};
 
 function enumTag(v: unknown): string {
   if (typeof v === 'string') return v;
@@ -208,9 +227,17 @@ export const AuditReplayView: React.FC<{
   const [audit, setAudit] = useState<ModbAuditEntry[]>([]);
   const [calls, setCalls] = useState<ModbCallRecord[]>([]);
   const [proposals, setProposals] = useState<ModbReplayProposal[]>([]);
+  const [worldsOverview, setWorldsOverview] = useState<ModbWorldsOverview>({
+    metrics: EMPTY_LANDING_METRICS,
+    worlds: [],
+  });
+  const [worldDiffs, setWorldDiffs] = useState<Record<string, ModbBucketRowDiff[]>>({});
+  const [landingWorldId, setLandingWorldId] = useState<string | null>(null);
+  const [droppingWorldId, setDroppingWorldId] = useState<string | null>(null);
   const [grants, setGrants] = useState<ModbGrant[]>([]);
   const [claims, setClaims] = useState<ModbClaim[]>([]);
   const [manifest, setManifest] = useState<ModbDescribeManifest | null>(null);
+  const [readLog, setReadLog] = useState<ModbReadLogEntry[]>([]);
 
   // Audit filter state
   const [auditPrincipal, setAuditPrincipal] = useState('');
@@ -227,6 +254,7 @@ export const AuditReplayView: React.FC<{
   const [simSeqs, setSimSeqs] = useState<string>('');
   const [simStopSeq, setSimStopSeq] = useState<string>('');
   const [simGrant, setSimGrant] = useState<string>('');
+  const [simWorld, setSimWorld] = useState<string>('');
   const [simId, setSimId] = useState('replay-1');
   const [simDesc, setSimDesc] = useState('Selective undo simulation');
   const [simulating, setSimulating] = useState(false);
@@ -245,6 +273,8 @@ export const AuditReplayView: React.FC<{
   const [readLimit, setReadLimit] = useState('25');
   const [readResult, setReadResult] = useState<ModbReadResult | null>(null);
   const [runningRead, setRunningRead] = useState(false);
+  const [releaseResult, setReleaseResult] = useState<ModbReleaseResult | null>(null);
+  const [runningRelease, setRunningRelease] = useState<string | null>(null);
 
   const buildAuditPath = useCallback(
     (p = auditPrincipal, a = auditAction, lim = auditLimit) => {
@@ -276,11 +306,16 @@ export const AuditReplayView: React.FC<{
         apiOptional<ModbAuditEntry[]>(buildAuditPath(), []),
         apiOptional<ModbCallRecord[]>(buildCallsPath(), []),
       ]);
-      const [pr, gr, cl, mf] = await Promise.all([
+      const [pr, gr, cl, mf, wo, rl] = await Promise.all([
         apiOptional<ModbReplayProposal[]>('/v1/modb/replay/proposals', []),
         apiOptional<ModbGrant[]>('/v1/modb/grants', []),
         apiOptional<ModbClaim[]>('/v1/modb/claims', []),
         apiOptional<ModbDescribeManifest | null>('/v1/modb/describe', null),
+        apiOptional<ModbWorldsOverview>('/v1/modb/worlds', {
+          metrics: EMPTY_LANDING_METRICS,
+          worlds: [],
+        }),
+        apiOptional<ModbReadLogEntry[]>('/v1/modb/reads', []),
       ]);
       setVerify(v);
       setBaseline(bl);
@@ -290,6 +325,8 @@ export const AuditReplayView: React.FC<{
       setGrants(gr);
       setClaims(cl);
       setManifest(mf);
+      setWorldsOverview(wo);
+      setReadLog(rl);
       if (mf?.allowed_views?.length && !mf.allowed_views.some((vw) => vw.name === readView)) {
         setReadView(mf.allowed_views[0].name);
       }
@@ -407,6 +444,13 @@ export const AuditReplayView: React.FC<{
     setSubTab('replay');
   }
 
+  function jumpToReplayExcludeWorld(worldId: string) {
+    setFilterMode('exclude_world');
+    setSimWorld(worldId);
+    setSimDesc(`Exclude writes from world ${worldId}`);
+    setSubTab('replay');
+  }
+
   async function simulateReplay(e: React.FormEvent) {
     e.preventDefault();
     if (!simId.trim()) {
@@ -419,6 +463,7 @@ export const AuditReplayView: React.FC<{
       exclude_principal: null,
       exclude_grant: null,
       exclude_seqs: null,
+      exclude_world: null,
       stop_before_seq: null,
     };
     if (filterMode === 'exclude_principal') {
@@ -433,6 +478,12 @@ export const AuditReplayView: React.FC<{
         return;
       }
       body.exclude_grant = simGrant.trim();
+    } else if (filterMode === 'exclude_world') {
+      if (!simWorld.trim()) {
+        toast('Enter a world ID to exclude');
+        return;
+      }
+      body.exclude_world = simWorld.trim();
     } else if (filterMode === 'exclude_seqs') {
       const seqList = Array.from(selectedSeqSet);
       if (!seqList.length) {
@@ -551,10 +602,76 @@ export const AuditReplayView: React.FC<{
       });
       setReadResult(res);
       toast(`Read ${res.result_count} row(s) (${res.rows_scanned} scanned, ${res.ops_used} ops)`);
+      const rl = await apiOptional<ModbReadLogEntry[]>('/v1/modb/reads', []);
+      setReadLog(rl);
     } catch (err) {
       toast((err as Error).message);
     } finally {
       setRunningRead(false);
+    }
+  }
+
+  async function runRelease(name: string) {
+    setRunningRelease(name);
+    try {
+      const res = await api<ModbReleaseResult>(
+        `/v1/modb/releases/${encodeURIComponent(name)}`,
+        { method: 'POST', body: '{}' }
+      );
+      setReleaseResult(res);
+      toast(`Release ${res.release}: cohort ${res.cohort_size} (k>=${res.min_group_size})`);
+      const rl = await apiOptional<ModbReadLogEntry[]>('/v1/modb/reads', []);
+      setReadLog(rl);
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setRunningRelease(null);
+    }
+  }
+
+  async function inspectWorldDiff(worldId: string) {
+    try {
+      const diffs = await api<ModbBucketRowDiff[]>(
+        `/v1/modb/worlds/${encodeURIComponent(worldId)}/diff`
+      );
+      setWorldDiffs((prev) => ({ ...prev, [worldId]: diffs }));
+    } catch (err) {
+      toast((err as Error).message);
+    }
+  }
+
+  async function handleLandWorld(worldId: string) {
+    setLandingWorldId(worldId);
+    try {
+      const res = await api<ModbWorldLandResult>(
+        `/v1/modb/worlds/${encodeURIComponent(worldId)}/land`,
+        { method: 'POST', body: JSON.stringify({ reason: 'Landed via Worlds Inspector' }) }
+      );
+      toast(
+        `Landed ${res.world_id} @tx#${res.commit_txid} (${res.reads_skipped} reads skipped O(1), ${res.reads_verified} re-verified)`
+      );
+      await loadAll();
+      await onRefresh();
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setLandingWorldId(null);
+    }
+  }
+
+  async function handleDropWorld(worldId: string) {
+    setDroppingWorldId(worldId);
+    try {
+      await api(`/v1/modb/worlds/${encodeURIComponent(worldId)}/drop`, {
+        method: 'POST',
+        body: '{}',
+      });
+      toast(`Dropped speculative world ${worldId}`);
+      await loadAll();
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setDroppingWorldId(null);
     }
   }
 
@@ -719,11 +836,13 @@ export const AuditReplayView: React.FC<{
           [
             ['audit', 'Audit Ledger', History],
             ['replay', 'Replay Studio', RotateCcw],
+            ['worlds', 'Speculative Worlds', GitBranch],
             ['grants', 'Grants & Claims', KeyRound],
             ['views', 'Views & Read Explorer', Eye],
           ] as Array<[SubTab, string, React.ComponentType<{ className?: string }>]>
         ).map(([id, label, Icon]) => {
           const active = subTab === id;
+          const openWorldCount = worldsOverview.worlds.filter((w) => enumTag(w.status) === 'open').length;
           return (
             <button
               key={id}
@@ -739,6 +858,9 @@ export const AuditReplayView: React.FC<{
               <span>{label}</span>
               {id === 'replay' && pendingProposals > 0 && (
                 <Badge tone="warn">{pendingProposals}</Badge>
+              )}
+              {id === 'worlds' && openWorldCount > 0 && (
+                <Badge tone="accent">{openWorldCount}</Badge>
               )}
             </button>
           );
@@ -897,6 +1019,7 @@ export const AuditReplayView: React.FC<{
                   ['exclude_seqs', 'Exclude Call Seqs'],
                   ['stop_before_seq', 'Rewind Before Seq'],
                   ['exclude_grant', 'Exclude Grant Subtree'],
+                  ['exclude_world', 'Exclude World'],
                   ['replay_all', 'Dry-Run All Calls'],
                 ] as Array<[ReplayFilterMode, string]>
               ).map(([mode, label]) => (
@@ -980,6 +1103,17 @@ export const AuditReplayView: React.FC<{
                         </option>
                       ))}
                     </select>
+                  </Field>
+                )}
+
+                {filterMode === 'exclude_world' && (
+                  <Field label="Exclude World ID">
+                    <input
+                      className={inputCls}
+                      value={simWorld}
+                      onChange={(e) => setSimWorld(e.target.value)}
+                      placeholder="e.g. dream-1-..."
+                    />
                   </Field>
                 )}
               </div>
@@ -1254,6 +1388,162 @@ export const AuditReplayView: React.FC<{
         </div>
       )}
 
+      {/* TAB 2B: SPECULATIVE WORLDS */}
+      {subTab === 'worlds' && (
+        <div className="flex flex-col gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+            <Card>
+              <span className="text-xs text-[var(--fg-muted)]">Landed Worlds</span>
+              <strong className="text-base font-mono">{worldsOverview.metrics.total_landed}</strong>
+              <span className="text-xs text-[var(--fg-subtle)]">Atomic CoW commit landings</span>
+            </Card>
+            <Card>
+              <span className="text-xs text-[var(--fg-muted)]">O(1) CoW Reads Skipped</span>
+              <strong className="text-base font-mono text-[var(--ok)]">
+                {worldsOverview.metrics.total_reads_skipped}
+              </strong>
+              <span className="text-xs text-[var(--fg-subtle)]">Unchanged bucket root hashes</span>
+            </Card>
+            <Card>
+              <span className="text-xs text-[var(--fg-muted)]">Reads Re-Verified</span>
+              <strong className="text-base font-mono">
+                {worldsOverview.metrics.total_reads_verified}
+              </strong>
+              <span className="text-xs text-[var(--fg-subtle)]">Re-run on bucket change</span>
+            </Card>
+            <Card>
+              <span className="text-xs text-[var(--fg-muted)]">Stale Read Rejections</span>
+              <strong className="text-base font-mono">
+                {worldsOverview.metrics.stale_read_rejections}
+              </strong>
+              <span className="text-xs text-[var(--fg-subtle)]">Concurrent write conflicts</span>
+            </Card>
+            <Card>
+              <span className="text-xs text-[var(--fg-muted)]">Needless Send-Backs</span>
+              <strong className="text-base font-mono">
+                {worldsOverview.metrics.needless_send_backs}
+              </strong>
+              <span className="text-xs text-[var(--fg-subtle)]">Coarse read contention metric</span>
+            </Card>
+          </div>
+
+          <Card>
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <strong className="text-sm">
+                Speculative CoW Worlds ({worldsOverview.worlds.length})
+              </strong>
+              <span className="text-xs text-[var(--fg-muted)]">
+                Isolated read+write sandboxes with structural diff and atomic OCC landing
+              </span>
+            </div>
+            {worldsOverview.worlds.length === 0 ? (
+              <EmptyState
+                title="No speculative CoW Worlds yet"
+                description="Use Preview in World under Memory & Dreaming, or run world workflows via MCP/API."
+              />
+            ) : (
+              <div className="flex flex-col gap-2.5">
+                {worldsOverview.worlds.map((w: ModbWorldRecord) => {
+                  const st = enumTag(w.status);
+                  const stPayload = enumPayload(w.status);
+                  const stLabel =
+                    st === 'landed'
+                      ? `landed @tx#${String(stPayload.commit_txid ?? '?')}`
+                      : st === 'rejected'
+                      ? `rejected: ${String(stPayload.reason ?? '')}`
+                      : st;
+                  const tone =
+                    st === 'landed'
+                      ? 'ok'
+                      : st === 'open'
+                      ? 'warn'
+                      : st === 'rejected'
+                      ? 'bad'
+                      : 'neutral';
+                  const readCount = w.steps.filter((s) => enumTag(s) === 'read_step').length;
+                  const callCount = w.steps.filter((s) => enumTag(s) === 'call_step').length;
+                  const diffs = worldDiffs[w.id];
+                  return (
+                    <div
+                      key={w.id}
+                      className="p-3 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-2 text-xs"
+                    >
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <strong className="font-mono text-sm">{w.id}</strong>
+                          <Badge tone={tone}>{stLabel}</Badge>
+                          <Badge tone="neutral">base tx #{w.base_txid}</Badge>
+                          <Badge tone="info">
+                            {readCount} reads · {callCount} calls
+                          </Badge>
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          {st === 'open' && (
+                            <>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => inspectWorldDiff(w.id)}
+                              >
+                                Inspect Diff
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ok"
+                                disabled={landingWorldId === w.id}
+                                onClick={() => handleLandWorld(w.id)}
+                              >
+                                {landingWorldId === w.id ? 'Landing…' : 'Land Atomically'}
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                disabled={droppingWorldId === w.id}
+                                onClick={() => handleDropWorld(w.id)}
+                              >
+                                Drop
+                              </Button>
+                            </>
+                          )}
+                          {st === 'landed' && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => jumpToReplayExcludeWorld(w.id)}
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              <span>Exclude World in Replay →</span>
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="font-mono text-[var(--fg-muted)] flex gap-x-4 gap-y-1 flex-wrap">
+                        <span>principal: {w.principal}</span>
+                        <span>grant: {w.grant_id}</span>
+                        <span>created: {w.created_at}</span>
+                      </div>
+                      {diffs && (
+                        <div className="flex gap-1.5 flex-wrap">
+                          {diffs.length === 0 ? (
+                            <Badge tone="neutral">No bucket changes</Badge>
+                          ) : (
+                            diffs.map((d) => (
+                              <Badge key={d.bucket} tone="accent">
+                                {d.bucket}: +{d.added} / ~{d.modified} / -{d.removed}
+                              </Badge>
+                            ))
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </Card>
+        </div>
+      )}
+
       {/* TAB 3: GRANTS & CLAIMS */}
       {subTab === 'grants' && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
@@ -1432,6 +1722,80 @@ export const AuditReplayView: React.FC<{
                 <pre className="m-0 p-3 rounded-lg bg-[var(--bg)] border border-[var(--border)] text-xs overflow-x-auto max-h-80">
                   {JSON.stringify(readResult.rows, null, 2)}
                 </pre>
+              </div>
+            )}
+          </Card>
+
+          <Card>
+            <strong className="text-sm">k-Anonymous Approved Releases</strong>
+            {manifest?.allowed_releases?.length ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                {manifest.allowed_releases.map((rel) => (
+                  <div
+                    key={rel.name}
+                    className="p-3 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-2 text-xs"
+                  >
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <strong className="font-mono text-[var(--accent-hover)]">{rel.name}</strong>
+                      <div className="flex items-center gap-1.5">
+                        <Badge tone="ok">k &gt;= {rel.min_group_size}</Badge>
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          disabled={runningRelease === rel.name}
+                          onClick={() => runRelease(rel.name)}
+                        >
+                          {runningRelease === rel.name ? 'Running…' : `Run Release`}
+                        </Button>
+                      </div>
+                    </div>
+                    <div className="text-[var(--fg-muted)]">{rel.description}</div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-xs text-[var(--fg-muted)]">No releases configured.</div>
+            )}
+
+            {releaseResult && (
+              <div className="flex flex-col gap-2 mt-2">
+                <div className="flex gap-2 flex-wrap">
+                  <Badge tone="ok">
+                    cohort={releaseResult.cohort_size} (min k={releaseResult.min_group_size})
+                  </Badge>
+                  <Badge tone="info">sha256: {releaseResult.answer_hash.slice(0, 12)}…</Badge>
+                </div>
+                <pre className="m-0 p-3 rounded-lg bg-[var(--bg)] border border-[var(--border)] text-xs overflow-x-auto max-h-72">
+                  {JSON.stringify(releaseResult.data, null, 2)}
+                </pre>
+              </div>
+            )}
+          </Card>
+
+          <Card>
+            <strong className="text-sm">
+              Read Provenance Log (_modb_read_log · {readLog.length})
+            </strong>
+            {readLog.length === 0 ? (
+              <div className="text-xs text-[var(--fg-muted)]">No read provenance entries yet.</div>
+            ) : (
+              <div className="flex flex-col gap-1.5 max-h-80 overflow-y-auto text-xs">
+                {readLog.map((rl) => (
+                  <div
+                    key={rl.seq}
+                    className="p-2 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex items-center justify-between gap-2 flex-wrap font-mono"
+                  >
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span>#{rl.seq}</span>
+                      <Badge tone="info">{enumTag(rl.kind)}</Badge>
+                      <strong>{rl.target}</strong>
+                      <span className="text-[var(--fg-muted)]">{rl.principal}</span>
+                    </div>
+                    <span className="text-[var(--fg-subtle)]">
+                      scanned={rl.rows_scanned} rows={rl.result_count} hash={rl.answer_hash.slice(0, 10)}…
+                    </span>
+                  </div>
+                ))}
               </div>
             )}
           </Card>

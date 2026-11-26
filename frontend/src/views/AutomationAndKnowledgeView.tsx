@@ -21,6 +21,8 @@ import {
   BotConfig,
   DreamingDigest,
   MemoryEntry,
+  ModbDreamingWorldPreview,
+  ModbWorldLandResult,
   RoutineSpec,
   SkillDoc,
   SkillSummary,
@@ -731,6 +733,9 @@ export const MemoryView: React.FC<{
   const [content, setContent] = useState('');
   const [staged, setStaged] = useState<MemoryEntry[]>([]);
   const [digests, setDigests] = useState<DreamingDigest[]>([]);
+  const [dreamPreview, setDreamPreview] = useState<ModbDreamingWorldPreview | null>(null);
+  const [previewingDream, setPreviewingDream] = useState(false);
+  const [landingDream, setLandingDream] = useState(false);
 
   async function loadAdvanced() {
     const [st, dg] = await Promise.all([
@@ -764,9 +769,61 @@ export const MemoryView: React.FC<{
   async function runDreamNow() {
     try {
       await api('/v1/memory/dream', { method: 'POST' });
+      setDreamPreview(null);
       toast('Dreaming consolidation complete');
       await onRefresh();
       await loadAdvanced();
+    } catch (err) {
+      toast((err as Error).message);
+    }
+  }
+
+  async function previewDreamInWorld() {
+    setPreviewingDream(true);
+    try {
+      const prev = await api<ModbDreamingWorldPreview>('/v1/memory/dream/preview', {
+        method: 'POST',
+        body: '{}',
+      });
+      setDreamPreview(prev);
+      toast(`Staged Dreaming World ${prev.world_id}`);
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setPreviewingDream(false);
+    }
+  }
+
+  async function landDreamPreview() {
+    if (!dreamPreview) return;
+    setLandingDream(true);
+    try {
+      const res = await api<ModbWorldLandResult>(
+        `/v1/modb/worlds/${encodeURIComponent(dreamPreview.world_id)}/land`,
+        { method: 'POST', body: JSON.stringify({ reason: 'Landed Dreaming preview from UI' }) }
+      );
+      setDreamPreview(null);
+      toast(
+        `Landed ${res.world_id} @tx#${res.commit_txid} (${res.reads_skipped} reads skipped O(1))`
+      );
+      await onRefresh();
+      await loadAdvanced();
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setLandingDream(false);
+    }
+  }
+
+  async function dropDreamPreview() {
+    if (!dreamPreview) return;
+    try {
+      await api(`/v1/modb/worlds/${encodeURIComponent(dreamPreview.world_id)}/drop`, {
+        method: 'POST',
+        body: '{}',
+      });
+      setDreamPreview(null);
+      toast('Dropped speculative Dreaming preview');
     } catch (err) {
       toast((err as Error).message);
     }
@@ -776,14 +833,51 @@ export const MemoryView: React.FC<{
     <div className="flex flex-col gap-4">
       <SectionHeader
         title="Memory & Overnight Dreaming"
-        subtitle="Shared 'About You' profile, per-bot curated memory, provenance taint gate, and 1-click Dreaming rollback."
+        subtitle="Shared 'About You' profile, per-bot curated memory, provenance taint gate, and speculative World preview + rollback."
         actions={
-          <Button variant="ghost" size="sm" onClick={runDreamNow}>
-            <Sparkles className="w-3.5 h-3.5" />
-            <span>Run Dreaming Now</span>
-          </Button>
+          <div className="flex items-center gap-2 flex-wrap">
+            <Button variant="ghost" size="sm" onClick={previewDreamInWorld} disabled={previewingDream}>
+              <GitBranch className="w-3.5 h-3.5" />
+              <span>{previewingDream ? 'Previewing…' : 'Preview in World'}</span>
+            </Button>
+            <Button variant="ghost" size="sm" onClick={runDreamNow}>
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Run Dreaming Now</span>
+            </Button>
+          </div>
         }
       />
+
+      {dreamPreview && (
+        <Card className="border-[var(--accent)]">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <div className="flex items-center gap-2 flex-wrap">
+              <strong className="text-sm font-mono">
+                Speculative World Preview: {dreamPreview.world_id}
+              </strong>
+              <Badge tone="accent">base tx #{dreamPreview.base_txid}</Badge>
+            </div>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <Button variant="ok" size="sm" onClick={landDreamPreview} disabled={landingDream}>
+                {landingDream ? 'Landing…' : 'Land Atomically'}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={dropDreamPreview}>
+                Drop World
+              </Button>
+            </div>
+          </div>
+          <div className="text-xs text-[var(--fg-muted)]">{dreamPreview.summary}</div>
+          <div className="flex gap-1.5 flex-wrap">
+            {dreamPreview.bucket_diffs.map((d) => (
+              <Badge key={d.bucket} tone="info">
+                {d.bucket}: +{d.added} / ~{d.modified} / -{d.removed}
+              </Badge>
+            ))}
+            <Badge tone="neutral">promoted: {dreamPreview.promoted_contents.length}</Badge>
+            <Badge tone="neutral">pruned: {dreamPreview.pruned_ids.length}</Badge>
+          </div>
+        </Card>
+      )}
 
       <Card>
         <strong className="text-sm">Add Owner-Verified Memory</strong>

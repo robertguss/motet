@@ -436,6 +436,76 @@ export interface ModbReadResult {
   rows: unknown[];
 }
 
+export interface ModbWorldRecord {
+  id: string;
+  grant_id: string;
+  principal: string;
+  base_txid: number;
+  base_pin_id: string;
+  steps: unknown[];
+  status: unknown;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface ModbLandingMetrics {
+  total_landed: number;
+  stale_read_rejections: number;
+  invariant_rejections: number;
+  action_rejections: number;
+  grant_rejections: number;
+  needless_send_backs: number;
+  total_reads_verified: number;
+  total_reads_skipped: number;
+}
+
+export interface ModbWorldsOverview {
+  metrics: ModbLandingMetrics;
+  worlds: ModbWorldRecord[];
+}
+
+export interface ModbWorldLandResult {
+  world_id: string;
+  commit_txid: number;
+  calls_replayed: number;
+  reads_verified: number;
+  reads_skipped: number;
+  replies: unknown[];
+  grant_chain: string[];
+}
+
+export interface ModbDreamingWorldPreview {
+  world_id: string;
+  base_txid: number;
+  pruned_ids: number[];
+  promoted_contents: string[];
+  summary: string;
+  bucket_diffs: ModbBucketRowDiff[];
+}
+
+export interface ModbReleaseResult {
+  release: string;
+  txid: number;
+  cohort_size: number;
+  min_group_size: number;
+  answer_hash: string;
+  data: unknown;
+}
+
+export interface ModbReadLogEntry {
+  seq: number;
+  txid: number;
+  principal: string;
+  grant_id?: string | null;
+  kind: unknown;
+  target: string;
+  request_json: unknown;
+  rows_scanned: number;
+  result_count: number;
+  answer_hash: string;
+  at: string;
+}
+
 export function getStoredToken(): string {
   return localStorage.getItem('motet_token') || '';
 }

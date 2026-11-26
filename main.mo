@@ -53,11 +53,13 @@ fn print_usage(console: Console)
       "  motet search <query...>                          Full-text search across all session logs",
       "  motet budget                                     Show exact Decimal USD spend per bot",
       "  motet verify                                     Full MoDB verify + refresh verification checkpoint",
-      "  motet compact                                    Rebuild motet.modb cleanly without internal log bloat",
+      "  motet compact                                    Rebuild motet.modb cleanly with CoW replay baseline",
+      "  motet backup <path> [--include-internal]         Take consistent online MoDB snapshot backup",
       "  motet audit [limit]                              Print recent SHA-256 hash-chained audit entries",
       "  motet export                                     Export SHA-256 verified portable JSON snapshot (no secrets)",
       "  motet grants                                     List attenuated bot grants",
-      "  motet claims                                     List active routine leases"
+      "  motet claims                                     List active routine leases",
+      "  motet worlds                                     List speculative CoW Worlds & landing metrics"
     ].join("\n")
   )
 end
@@ -571,6 +573,49 @@ fn cmd_claims(db: Store.DbHandle, clock: Clock, console: Console) : Int
   end
 end
 
+fn cmd_backup(db: Store.DbHandle, console: Console, rest: List(Text)) : Int
+  pos = rest.filter(fn(a) not a.starts_with?("--") end)
+  target = (pos.first or "").trim
+  if target.empty?
+    console.error("usage: motet backup <path> [--include-internal]")
+    return 2
+  end
+  inc? = rest.contains?("--include-internal")
+  case Store.backup_to_file(db, target, inc?)
+    Ok(rep):
+      console.print(
+        "MoDB backup ok path=#{target} txid=#{rep.source_txid} schema=v#{rep.schema_version} buckets=#{rep
+          .bucket_count} entries=#{rep.entry_count} pages=#{rep.page_count} sha256=#{rep.sha256}"
+      )
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
+fn cmd_worlds(db: Store.DbHandle, console: Console) : Int
+  case Store.list_worlds_overview(db)
+    Ok(ov):
+      m = ov.metrics
+      console.print(
+        "LandingMetrics landed=#{m.total_landed} reads_verified=#{m.total_reads_verified} reads_skipped=#{m
+          .total_reads_skipped} stale=#{m.stale_read_rejections} invariant=#{m
+          .invariant_rejections} needless_send_backs=#{m.needless_send_backs}"
+      )
+      if ov.worlds.empty?
+        console.print("No speculative CoW Worlds recorded.")
+      else
+        for w in ov.worlds
+          console.print(
+            "#{w.id} status=#{w.status} principal=#{w.principal} base_tx=#{w.base_txid} steps=#{w
+              .steps.size} grant=#{w.grant_id}"
+          )
+        end
+      end
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
 fn main(
   args: Args,
   env: Env,
@@ -612,10 +657,12 @@ fn main(
   return cmd_watch(rt, db, console, rest) if head == "watch"
   return cmd_verify(db, console) if head == "verify"
   return cmd_compact(db, console) if head == "compact"
+  return cmd_backup(db, console, rest) if head == "backup"
   return cmd_audit(db, console, rest) if head == "audit"
   return cmd_export(db, clock, console) if head == "export"
   return cmd_grants(db, console) if head == "grants"
   return cmd_claims(db, clock, console) if head == "claims"
+  return cmd_worlds(db, console) if head == "worlds"
 
   if head == "tick"
     _drained = Brain.drain_queued_runs(rt, db, 10)
@@ -749,4 +796,25 @@ test "motet CLI initializes specialist roster, seals Vault API key, runs canonic
   assert main(Args.of(["compact"]), env, c6, files, cmd, Network.fake({}), clock, srng) == 0
   assert (c6.printed.first or "").contains?("MoDB compact ok=true") and
     (c6.printed.first or "").contains?("secrets_ok=true")
+
+  c7 = Console.fake()
+  assert main(
+    Args.of(["backup", "motet-backup.json", "--include-internal"]),
+    env,
+    c7,
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) ==
+    0
+  assert (c7.printed.first or "").contains?("MoDB backup ok path=motet-backup.json") and
+    (c7.printed.first or "").contains?("sha256=") and
+    files.read_only.exists?("motet-backup.json")
+
+  c8 = Console.fake()
+  assert main(Args.of(["worlds"]), env, c8, files, cmd, Network.fake({}), clock, srng) == 0
+  assert (c8.printed.first or "").contains?("LandingMetrics landed=") and
+    (c8.printed.join("\n")).contains?("No speculative CoW Worlds recorded.")
 end

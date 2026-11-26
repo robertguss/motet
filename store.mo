@@ -151,10 +151,24 @@ release_routine_claim,
 list_active_claims,
 describe_for_caller,
 run_read_program,
+run_release,
+list_read_log,
+motet_world_catalog,
+WorldsOverview(..),
+list_worlds_overview,
+get_world,
+ensure_world_grant,
+open_world,
+world_query,
+world_call,
+world_diff,
+land_world,
+drop_world,
 verify_all,
 verify_fast,
 verify_and_checkpoint,
 compact,
+backup_to_file,
 audit_tail,
 audit_query,
 export_snapshot,
@@ -173,20 +187,23 @@ use Json
 use Modb{WriteTx}
 use Modb.Claims
 use Modb.Errors{ModbError}
-use Modb.Export{PortableSnapshot}
+use Modb.Export{BackupReport, PortableSnapshot}
 use Modb.Grants{GrantSpec}
 use Modb.Ledger{AuditEntry, LedgerError, Schema, WriteMeta}
 use Modb.Replay{ReplayCatalog, ReplayFilter, ReplayProposal}
 use Modb.Table{Index, Table, TableError}
 use Modb.Views{
   OnboardingManifest,
+  ReadLogEntry,
   ReadProgram,
   ReadResult,
   ReleaseDef,
+  ReleaseResult,
   ViewCatalog,
   ViewDef,
   ViewField
 }
+use Modb.World{BucketDiffSummary, LandResult, LandingMetrics, WorldError, WorldRecord}
 use Types{
   AnalyticsSummary,
   AppSettings,
@@ -654,8 +671,27 @@ fn export_err(e: Export.ExportError) : MotetError
     Export.LedgerFailure(le): ledger_err(le)
     Export.StorageFailure(me): modb_err(me)
     Export.UnsupportedFormat(found: _, supported: _) | Export.InvalidEncoding(bucket: _, detail: _) | Export
-      .ChecksumMismatch(expected: _, actual: _): StorageFailed(message: e.to_text)
+      .ChecksumMismatch(expected: _, actual: _) | Export.PostImportFailed(detail: _): StorageFailed(
+      message: e.to_text
+    )
     Export.TargetNotEmpty(path: _): Conflict(message: e.to_text)
+  end
+end
+
+fn world_err(e: WorldError) : MotetError
+  case e
+    World.LedgerFailure(le): ledger_err(le)
+    World.GrantFailure(ge): grant_err(ge)
+    World.WorldNotFound(id: _) | World.UnknownQuery(name: _) | World.UnknownAction(name: _): ItemNotFound(
+      message: e.to_text
+    )
+    World.WorldAlreadyExists(id: _) | World.WorldNotOpen(id: _, status: _) | World.WorldExpired(
+      id: _
+    ) | World.StaleRead(query: _, args: _, expected: _, actual: _): Conflict(message: e.to_text)
+    World.QueryFailed(query: _, detail: _): StorageFailed(message: e.to_text)
+    World.ActionRejected(action: _, detail: _) | World.InvariantRejected(name: _, detail: _): BadInput(
+      message: e.to_text
+    )
   end
 end
 
@@ -2809,6 +2845,64 @@ fn motet_view_catalog() : ViewCatalog
         )
       end
     )
+  ).with_view(
+    ViewDef(
+      name: "bots_public",
+      description: "Narrowed public view of bots (omits workspace paths and USD budgets)",
+      source_buckets: ["bots"],
+      fields: [
+        ViewField(name: "name", field_type: "text", description: "Unique bot slug"),
+        ViewField(name: "role", field_type: "text", description: "Role title"),
+        ViewField(name: "model_tier", field_type: "text", description: "Pricing/capability tier"),
+        ViewField(name: "active", field_type: "bool", description: "Whether bot is enabled")
+      ],
+      narrows: Some("bots"),
+      load: fn(st)
+        rows = try Table.all(st, bots_table()).map_error(fn(e) e.to_text end)
+        Ok(
+          rows.map(fn(p)
+            b = p.1
+            {
+              "name": Json.String(b.name),
+              "role": Json.String(b.role),
+              "model_tier": Json.String(b.model_tier),
+              "active": Json.Boolean(b.active?)
+            }
+          end)
+        )
+      end
+    )
+  ).with_view(
+    ViewDef(
+      name: "memories_shared",
+      description: "Narrowed shared-only view of persistent memories (omits provenance and private scopes)",
+      source_buckets: ["memories"],
+      fields: [
+        ViewField(name: "id", field_type: "int", description: "Memory ID"),
+        ViewField(name: "scope", field_type: "text", description: "Always 'shared'"),
+        ViewField(name: "kind", field_type: "text", description: "profile | rule | fact | work_log"),
+        ViewField(name: "content", field_type: "text", description: "Memory text"),
+        ViewField(name: "staged", field_type: "bool", description: "Whether awaiting owner approval"),
+        ViewField(name: "created_at", field_type: "text", description: "Creation timestamp")
+      ],
+      narrows: Some("memories"),
+      load: fn(st)
+        rows = try Table.all(st, memories_table()).map_error(fn(e) e.to_text end)
+        Ok(
+          rows.filter(fn(p) not p.1.archived? and p.1.scope == "shared" end).map(fn(p)
+            m = p.1
+            {
+              "id": Json.int(m.id),
+              "scope": Json.String(m.scope),
+              "kind": Json.String(m.kind),
+              "content": Json.String(m.content),
+              "staged": Json.Boolean(m.staged),
+              "created_at": Json.String(m.created_at)
+            }
+          end)
+        )
+      end
+    )
   ).with_release(
     ReleaseDef(
       name: "bot_activity_summary",
@@ -2838,6 +2932,47 @@ fn motet_view_catalog() : ViewCatalog
         ))
       end
     )
+  ).with_release(
+    ReleaseDef(
+      name: "memory_scope_summary",
+      description: "k-anonymous aggregate counts of active memories by scope and kind (min_group_size=2)",
+      source_buckets: ["memories"],
+      min_group_size: 2,
+      args_description: "{}",
+      run: fn(st, _args)
+        rows = try Table.all(st, memories_table()).map_error(fn(e) e.to_text end)
+        active = rows.filter(fn(p) not p.1.archived? end)
+        var staged_cnt = 0
+        var by_scope = {}
+        var by_kind = {}
+        for (_id, m) in active
+          if m.staged
+            staged_cnt += 1
+          end
+          prev_s = by_scope.get(m.scope) or 0
+          by_scope = by_scope.set(m.scope, prev_s + 1)
+          prev_k = by_kind.get(m.kind) or 0
+          by_kind = by_kind.set(m.kind, prev_k + 1)
+        end
+        var scope_json = {}
+        for (k, v) in by_scope.entries
+          scope_json = scope_json.set(k, Json.int(v))
+        end
+        var kind_json = {}
+        for (k, v) in by_kind.entries
+          kind_json = kind_json.set(k, Json.int(v))
+        end
+        Ok((
+          active.size,
+          Json.Object({
+            "total_active": Json.int(active.size),
+            "staged": Json.int(staged_cnt),
+            "by_scope": Json.Object(scope_json),
+            "by_kind": Json.Object(kind_json)
+          })
+        ))
+      end
+    )
   ).with_action_doc(
     "save_memory",
     "Save a durable shared or bot-scoped memory entry",
@@ -2858,6 +2993,72 @@ fn motet_view_catalog() : ViewCatalog
       "budget_ledger_non_negative",
       "Every recorded spend ledger row has cost_usd >= 0 and non-negative token counts"
     ).with_invariant_doc("memories_non_empty", "Every memory entry has non-empty scope and content")
+end
+
+## Scoped speculative queries and approved actions for MoDB Layer 4 Worlds.
+fn world_query_active_memories(tx: WriteTx, args: Json) : Result(Json, Text)
+  raw_lim = args.int_at("limit") or 200
+  cap = if raw_lim > 0 and raw_lim <= 500: raw_lim else: 200
+  rows = try wrap_t(Table.tx_scan(tx, memories_table(), None, None, 0))
+  active = rows.map(fn(p) p.1 end).filter(fn(m) not m.staged and not m.archived? end).reverse
+    .take(cap)
+  Ok(active.map(mem_row_to_entry).to_json)
+end
+
+fn world_query_recent_owner_messages(tx: WriteTx, args: Json) : Result(Json, Text)
+  raw_lim = args.int_at("limit") or 40
+  cap = if raw_lim > 0 and raw_lim <= 200: raw_lim else: 40
+  srows = try wrap_t(Table.tx_scan(tx, sessions_table(), None, None, 0))
+  var owner_sessions = {}
+  for (sid, s) in srows
+    if s.trust == Owner
+      owner_sessions = owner_sessions.set(sid, true)
+    end
+  end
+  erows = try wrap_t(Table.tx_scan(tx, events_table(), None, None, 0))
+  var out = []
+  for (_id, ev) in erows.reverse
+    break if out.size >= cap
+    if ev.kind == "message" and ev.role == "user" and (owner_sessions.get(ev.session_id) or false)
+      out = out.append(ev.content)
+    end
+  end
+  Ok(out.to_json)
+end
+
+fn world_query_bots(tx: WriteTx, _args: Json) : Result(Json, Text)
+  rows = try wrap_t(Table.tx_scan(tx, bots_table(), None, None, 0))
+  Ok(rows.map(fn(p) p.1 end).to_json)
+end
+
+fn world_query_rules(tx: WriteTx, _args: Json) : Result(Json, Text)
+  rows = try wrap_t(Table.tx_scan(tx, policy_rules_table(), None, None, 0))
+  Ok(rows.map(fn(p) p.1 end).to_json)
+end
+
+fn motet_world_catalog() : World.Catalog
+  World.catalog().with_scoped_query("list_active_memories", ["memories"], world_query_active_memories)
+    .with_scoped_query(
+      "list_recent_owner_messages",
+      ["sessions", "events"],
+      world_query_recent_owner_messages
+    ).with_scoped_query("list_bots", ["bots"], world_query_bots).with_scoped_query(
+      "list_rules",
+      ["policy_rules"],
+      world_query_rules
+    ).with_action("save_memory", action_save_memory).with_action(
+      "update_memory_content",
+      action_update_memory_content
+    ).with_action("archive_memory", action_archive_memory).with_action(
+      "restore_memory",
+      action_restore_memory
+    ).with_action("delete_memory", action_delete_memory).with_action(
+      "promote_staged_memory",
+      action_promote_staged_memory
+    ).with_action("record_dreaming_run", action_record_dreaming_run).with_action(
+      "add_rule",
+      action_add_rule
+    ).with_action("save_artifact", action_save_artifact)
 end
 
 ## Execution wrappers for `motet.modb`.
@@ -2925,10 +3126,92 @@ fn ensure_bot_root_grant_on(ldb: Ledger.Db, bot_name: Text, now: Time) : Result(
         ldb,
         meta,
         spec,
-        Some(["bots", "memories", "sessions", "artifacts"]),
-        Some(["bot_activity_summary"])
+        Some(["bots", "bots_public", "memories", "memories_shared", "sessions", "artifacts"]),
+        Some(["bot_activity_summary", "memory_scope_summary"])
       ).map_error(grant_err)
   end
+end
+
+fn ensure_world_grant_on(ldb: Ledger.Db, grant_id: Text, now: Time) : Result(
+  (Ledger.Db, Grants.Grant),
+  MotetError
+)
+  st = Ledger.store(ldb)
+  case try Grants.get(st, grant_id).map_error(grant_err)
+    Some(existing) if not existing.revoked and now <= existing.expires_at: return Ok((
+      ldb,
+      existing
+    ))
+    Some(_) | None: Unit
+  end
+  (principal, actions, views, releases, max_c, reason) = if grant_id == "system:dreaming"
+    (
+      "system:dreaming",
+      [
+        "save_memory",
+        "update_memory_content",
+        "archive_memory",
+        "restore_memory",
+        "delete_memory",
+        "promote_staged_memory",
+        "record_dreaming_run"
+      ],
+      ["memories", "memories_shared"],
+      ["memory_scope_summary"],
+      50000,
+      "provision least-privilege dreaming world grant"
+    )
+  else if grant_id == "operator:worlds"
+    (
+      "operator",
+      [
+        "save_memory",
+        "update_memory_content",
+        "archive_memory",
+        "restore_memory",
+        "delete_memory",
+        "promote_staged_memory",
+        "record_dreaming_run",
+        "add_rule",
+        "save_artifact"
+      ],
+      ["bots", "bots_public", "memories", "memories_shared", "sessions", "artifacts"],
+      ["bot_activity_summary", "memory_scope_summary"],
+      50000,
+      "provision operator sandbox worlds grant"
+    )
+  else
+    return Error(ItemNotFound(message: "unknown grant '#{grant_id}'"))
+  end
+  meta = WriteMeta(principal: "system:motet", action: "issue_world_grant", reason: reason, at: now)
+  spec = GrantSpec(
+    id: grant_id,
+    principal: principal,
+    allowed_actions: actions,
+    max_calls: max_c,
+    expires_at: now + (365 * 86400).seconds
+  )
+  Grants.issue_root_scoped(ldb, meta, spec, Some(views), Some(releases)).map_error(grant_err)
+end
+
+fn ensure_world_grant(db: DbHandle, grant_id: Text, now: Time) : Result(Grants.Grant, MotetError)
+  if db.files.read_only.exists?(db.path)
+    case with_db_read(db, fn(ldb) Grants.get(Ledger.store(ldb), grant_id).map_error(grant_err) end)
+      Ok(Some(existing)) if not existing.revoked and now <= existing.expires_at: return Ok(existing)
+      Ok(_) | Error(_): Unit
+    end
+  end
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      (_next, g) = try ensure_world_grant_on(ldb, grant_id, now)
+      Ok(g)
+    end
+  )
 end
 
 fn ensure_bot_root_grant(db: DbHandle, bot_name: Text, now: Time) : Result(Grants.Grant, MotetError)
@@ -2968,6 +3251,11 @@ fn delegate_bot_grant(
   else
     ["read", "write_local", "write_external", "delegate"]
   end
+  del_views = if read_only?
+    Some(["bots_public", "memories_shared", "artifacts"])
+  else
+    Some(["bots", "bots_public", "memories", "memories_shared", "sessions", "artifacts"])
+  end
   exp = now + 3600.seconds
   meta = WriteMeta(
     principal: "bot:#{caller_bot}",
@@ -2995,8 +3283,8 @@ fn delegate_bot_grant(
         meta,
         parent_grant_id,
         spec,
-        Some(["bots", "memories", "sessions", "artifacts"]),
-        Some(["bot_activity_summary"]),
+        del_views,
+        Some(["bot_activity_summary", "memory_scope_summary"]),
         Views.view_narrows_map(motet_view_catalog())
       ).map_error(grant_err)
       Ok(child)
@@ -5442,7 +5730,158 @@ fn run_read_program(
   ).map_error(views_err)
 end
 
-## Layer 3/4 Verification, Audit Tail, Export, Compaction, and Replay APIs.
+fn run_release(
+  db: DbHandle,
+  principal: Text,
+  grant_id_opt: Option(Text),
+  release_name: Text,
+  args: Json,
+  now: Time
+) : Result(ReleaseResult, MotetError)
+  is_admin = grant_id_opt == None
+  Views.execute_release_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    motet_view_catalog(),
+    release_name,
+    args,
+    principal,
+    grant_id_opt,
+    is_admin,
+    now
+  ).map_error(views_err)
+end
+
+fn list_read_log(db: DbHandle, limit: Int) : Result(List(ReadLogEntry), MotetError)
+  cap = if limit > 0 and limit <= 200: limit else: 50
+  with_db_read(
+    db,
+    fn(ldb)
+      entries = try Views.list_read_log(Ledger.store(ldb), cap).map_error(views_err)
+      Ok(entries.reverse)
+    end
+  )
+end
+
+## Speculative CoW Worlds (metrics, list, open, scoped query, call, diff, land, drop).
+struct WorldsOverview
+  metrics: LandingMetrics
+  worlds: List(WorldRecord)
+end
+
+fn list_worlds_overview(db: DbHandle) : Result(WorldsOverview, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      m = try World.metrics(st).map_error(world_err)
+      ws = try World.list_worlds(st).map_error(world_err)
+      Ok(WorldsOverview(metrics: m, worlds: ws))
+    end
+  )
+end
+
+fn get_world(db: DbHandle, world_id: Text) : Result(Option(WorldRecord), MotetError)
+  with_db_read(db, fn(ldb) World.get_world(Ledger.store(ldb), world_id).map_error(world_err) end)
+end
+
+fn open_world(db: DbHandle, world_id: Text, grant_id: Text, ttl_seconds: Int, now: Time) : Result(
+  WorldRecord,
+  MotetError
+)
+  ttl = if ttl_seconds > 0 and ttl_seconds <= 86400: ttl_seconds else: 3600
+  exp = now + ttl.seconds
+  Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      ldb1 = if grant_id == "system:dreaming" or grant_id == "operator:worlds"
+        (next_ldb, _g) = try ensure_world_grant_on(ldb, grant_id, now)
+        next_ldb
+      else
+        ldb
+      end
+      (_next, w) = try World.open_world(ldb1, world_id, grant_id, now, exp).map_error(world_err)
+      Ok(w)
+    end
+  )
+end
+
+fn world_query(db: DbHandle, world_id: Text, query_name: Text, args: Json, now: Time) : Result(
+  Json,
+  MotetError
+)
+  World.world_query_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    motet_world_catalog(),
+    world_id,
+    query_name,
+    args,
+    now
+  ).map_error(world_err)
+end
+
+fn world_call(
+  db: DbHandle,
+  world_id: Text,
+  action_name: Text,
+  args: Json,
+  reason: Text,
+  now: Time
+) : Result(Json, MotetError)
+  eff_reason = if reason.trim.empty?: "world call #{action_name}" else: reason.trim
+  World.world_call_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    motet_world_catalog(),
+    world_id,
+    action_name,
+    args,
+    eff_reason,
+    now
+  ).map_error(world_err)
+end
+
+fn world_diff(db: DbHandle, world_id: Text) : Result(List(BucketDiffSummary), MotetError)
+  World.world_diff_locked(
+    db.files.read_only,
+    db.path,
+    motet_schema(),
+    motet_world_catalog(),
+    world_id
+  ).map_error(world_err)
+end
+
+fn land_world(db: DbHandle, world_id: Text, reason: Text, now: Time) : Result(
+  LandResult,
+  MotetError
+)
+  eff_reason = if reason.trim.empty?: "land world #{world_id}" else: reason.trim
+  World.land_world_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    motet_world_catalog(),
+    world_id,
+    eff_reason,
+    now
+  ).map_error(world_err)
+end
+
+fn drop_world(db: DbHandle, world_id: Text) : Result(Unit, MotetError)
+  World.drop_world_locked(db.files, db.path, motet_schema(), world_id, db.clock.now).map_error(
+    world_err
+  )
+end
+
+## Layer 3/4 Verification, Audit Tail, Export, Backup, Compaction, and Replay APIs.
 fn check_secrets_verify(db: DbHandle) : Bool
   if not db.files.read_only.exists?(db.secrets_path)
     true
@@ -5532,29 +5971,53 @@ fn verify_and_checkpoint(db: DbHandle) : Result(ModbVerifySummary, MotetError)
   Ok(summary_from_report(rep, txid_val, sc_ver, last_hash, calls, secrets_ok))
 end
 
-## Rebuilds `motet.modb` cleanly from a portable SHA-256 snapshot of all application tables,
-## removing accumulated internal audit/freelist bloat while preserving every record and FTS index.
+## Rebuilds `motet.modb` cleanly via `Replay.compact_with_baseline`, removing accumulated internal
+## bloat while re-provisioning bot & world grants, pinning `_modb_replay_baseline`, and recording a checkpoint.
 ## Caller must ensure no concurrent writers (`motet-server` / `motet-watch`) are active.
 fn compact(db: DbHandle) : Result(ModbVerifySummary, MotetError)
   now = db.clock.now
-  snap = try Export.export_locked(db.files.read_only, db.path, motet_schema(), false, now).map_error(
-    export_err
-  )
-  tmp_path = "#{db.path}.compact.tmp"
-  _rm = db.files.remove(tmp_path)
-  ldb0 = try Export.import_db(db.files, tmp_path, motet_schema(), snap, now).map_error(export_err)
-  bots = try Table.all(Ledger.store(ldb0), bots_table()).map_error(table_err)
-  var cur_ldb = ldb0
-  for (_k, b) in bots
-    (next_ldb, _g) = try ensure_bot_root_grant_on(cur_ldb, b.name, now)
-    cur_ldb = next_ldb
-  end
-  (bl_ldb, _bl) = try Replay.pin_baseline(cur_ldb, now).map_error(replay_err)
-  (_cp_ldb, _cp) = try Ledger.record_verify_checkpoint(bl_ldb, now).map_error(ledger_err)
-  try db.files.rename(tmp_path, db.path).map_error(fn(e)
-    StorageFailed(message: "compact swap failed: #{e}")
-  end)
+  _creport = try Replay.compact_with_baseline(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    fn(ldb0)
+      bots = try Table.all(Ledger.store(ldb0), bots_table()).map_error(
+        fn(te) Replay.LedgerFailure(Ledger.TableFailure(te)) end
+      )
+      var cur_ldb = ldb0
+      for (_k, b) in bots
+        (next_ldb, _g) = try ensure_bot_root_grant_on(cur_ldb, b.name, now).map_error(
+          fn(me) Replay.ReplayFailed(detail: "#{me}") end
+        )
+        cur_ldb = next_ldb
+      end
+      (cur2, _dg) = try ensure_world_grant_on(cur_ldb, "system:dreaming", now).map_error(
+        fn(me) Replay.ReplayFailed(detail: "#{me}") end
+      )
+      (cur3, _og) = try ensure_world_grant_on(cur2, "operator:worlds", now).map_error(
+        fn(me) Replay.ReplayFailed(detail: "#{me}") end
+      )
+      Ok(cur3)
+    end
+  ).map_error(replay_err)
   verify_all(db)
+end
+
+## Takes a consistent lock-coordinated online backup of `motet.modb` at `dst_path`.
+fn backup_to_file(db: DbHandle, dst_path: Text, include_internal?: Bool) : Result(
+  BackupReport,
+  MotetError
+)
+  Export.backup_db(
+    db.files.read_only,
+    db.path,
+    db.files,
+    dst_path,
+    motet_schema(),
+    include_internal?,
+    db.clock.now
+  ).map_error(export_err)
 end
 
 ## Lightweight status of the CoW replay baseline pin and replayable call count.
@@ -5991,7 +6454,8 @@ test "Modb Store enforces invariants, supports lossless selective-undo Replay, G
   assert release_routine_claim(db, 1, "worker-1", t0) == Ok(Unit)
   assert try_claim_routine(db, 1, "worker-2", t0, 300) == Ok(true)
   assert describe_for_caller(db, "operator", None, t0) is Ok(manifest) and
-    manifest.allowed_views.size == 4
+    manifest.allowed_views.size == 6 and
+    manifest.allowed_releases.size == 2
   assert verify_all(db) is Ok(v) and v.ok?
 
   # 5. Fast verify, verify_and_checkpoint, and compact preserve all tables & FTS indexes cleanly
@@ -6050,4 +6514,60 @@ test "Modb Store enforces invariants, supports lossless selective-undo Replay, G
   assert list_routines(db) is Ok(r_final) and r_final.size == r_before.size
   assert routine_slot_claimed(db, 1, "2026-11-25") == Ok(true)
   assert search_memories(db, Some("researcher"), "Post-compact") == Ok([])
+
+  # 7. Narrowed read-only delegation views, k-anonymous Release, Read Log, Worlds, and online Backup
+  assert delegate_bot_grant(db, "chief", "bot:chief", "del:ro-narrow", "finance", true, 5, t0) is
+    Ok(ro_del)
+  assert ro_del.allowed_views == Some(["artifacts", "bots_public", "memories_shared"])
+  assert describe_for_caller(db, "bot:finance", Some("del:ro-narrow"), t0) is Ok(ro_manifest)
+  assert ro_manifest.allowed_views.any?(fn(vw) vw.name == "bots_public" end)
+  assert not ro_manifest.allowed_views.any?(fn(vw) vw.name == "bots" end)
+  assert run_read_program(
+    db,
+    "bot:finance",
+    Some("del:ro-narrow"),
+    ReadProgram(
+      view: "bots_public",
+      where_clause: None,
+      select: None,
+      group_by: None,
+      aggregates: None,
+      order_by: None,
+      limit: Some(10)
+    ),
+    t0
+  ) is
+    Ok(pub_res) and
+    pub_res.result_count == 7
+  assert save_memory(db, "shared", "fact", "Shared item two", "user", t0.to_text) is Ok(_)
+  assert run_release(db, "operator", None, "memory_scope_summary", Json.Object({}), t0) is Ok(rel_m)
+  assert rel_m.cohort_size >= 2
+  assert list_read_log(db, 10) is Ok(rlog) and rlog.size >= 2
+
+  assert open_world(db, "w-store-1", "operator:worlds", 600, t0) is Ok(_)
+  assert world_call(
+    db,
+    "w-store-1",
+    "save_memory",
+    Json.Object({
+      "scope": Json.String("shared"),
+      "kind": Json.String("fact"),
+      "content": Json.String("World staged memory"),
+      "provenance": Json.String("operator"),
+      "origin": Json.String("owner"),
+      "session_kind": Json.String("direct"),
+      "staged": Json.Boolean(false),
+      "now_text": Json.String(t0.to_text)
+    }),
+    "test world stage",
+    t0
+  ) is
+    Ok(_)
+  assert world_diff(db, "w-store-1") is Ok(wdiffs) and not wdiffs.empty?
+  assert land_world(db, "w-store-1", "land store test world", t0) is Ok(_)
+  assert list_worlds_overview(db) is Ok(wov) and wov.metrics.total_landed >= 1
+
+  assert backup_to_file(db, "motet-online-backup.modb", true) is Ok(bak_rep)
+  assert bak_rep.include_internal and bak_rep.free_page_count == 0
+  assert backup_to_file(db, "motet-online-backup.modb", false) is Error(Conflict(message: _))
 end

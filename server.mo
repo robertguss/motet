@@ -21,6 +21,7 @@ use Modb.Grants
 use Modb.Ledger
 use Modb.Replay
 use Modb.Views
+use Modb.World{BucketDiffSummary, LandResult, WorldRecord}
 use Oauth
 use Scheduler
 use Skills
@@ -55,6 +56,7 @@ use Types{
   MemoryEntry,
   ModbVerifySummary,
   MotetError,
+  OpenWorldRequest,
   PolicyRule,
   ProviderKind,
   PublishGdocRequest,
@@ -87,7 +89,10 @@ use Types{
   VaultSecretMeta,
   WebhookConfig,
   WebhookReceipt,
-  WeeklyAuditReport
+  WeeklyAuditReport,
+  WorldCallRequest,
+  WorldLandRequest,
+  WorldQueryRequest
 }
 use Vault
 use VaultFs{VaultFileEntry, VaultGitStatus}
@@ -159,6 +164,7 @@ api
   get "/v1/memory/staged" get_staged_memory
   post "/v1/memory/staged/:id/promote" post_promote_staged_memory
   post "/v1/memory/dream" post_run_dreaming
+  post "/v1/memory/dream/preview" post_preview_dreaming
   get "/v1/memory/dream/history" get_dreaming_history
   post "/v1/memory/dream/:id/rollback" post_rollback_dreaming
   delete "/v1/memory/:id" delete_memory_by_id
@@ -208,6 +214,16 @@ api
   get "/v1/modb/export" get_modb_export
   get "/v1/modb/describe" get_modb_describe
   post "/v1/modb/query" post_modb_query
+  post "/v1/modb/releases/:name" post_modb_release
+  get "/v1/modb/reads" get_modb_reads
+  get "/v1/modb/worlds" get_modb_worlds
+  post "/v1/modb/worlds" post_modb_worlds
+  get "/v1/modb/worlds/:id" get_modb_world
+  get "/v1/modb/worlds/:id/diff" get_modb_world_diff
+  post "/v1/modb/worlds/:id/query" post_modb_world_query
+  post "/v1/modb/worlds/:id/call" post_modb_world_call
+  post "/v1/modb/worlds/:id/land" post_modb_world_land
+  post "/v1/modb/worlds/:id/drop" post_modb_world_drop
   get "/v1/modb/grants" get_modb_grants
   post "/v1/modb/grants/:id/revoke" post_modb_revoke_grant
   get "/v1/modb/claims" get_modb_claims
@@ -932,6 +948,15 @@ fn post_run_dreaming(_op: Operator, files: Files, clock: Clock) : Result(
 )
   db = try ensure_ready(files, clock)
   Memory.run_dreaming(db, clock.now.to_text)
+end
+
+## Previews Overnight Dreaming inside an isolated speculative CoW World without mutating main state.
+fn post_preview_dreaming(_op: Operator, files: Files, clock: Clock) : Result(
+  Memory.DreamingWorldPreview,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Memory.preview_dreaming_world(db, clock.now.to_text)
 end
 
 ## Lists recent Overnight Dreaming digests and rollback state.
@@ -1730,6 +1755,151 @@ fn post_modb_query(
   Store.run_read_program(db, op.subject, grant_id, body, clock.now)
 end
 
+fn parse_optional_json(req: Api.Request) : Result(Json, MotetError)
+  raw = (req.text or "").trim
+  return Ok(Json.Object({})) if raw.empty?
+  Json.parse(raw).map_error(fn(e) BadInput(message: "invalid JSON body: #{e}") end)
+end
+
+fn post_modb_release(
+  op: Operator,
+  files: Files,
+  clock: Clock,
+  name: Text,
+  grant_id: Option(Text),
+  req: Api.Request
+) : Result(Views.ReleaseResult, MotetError)
+  db = try ensure_ready(files, clock)
+  args = try parse_optional_json(req)
+  gid_opt = case grant_id
+    Some(g) if not g.trim.empty?: Some(g.trim)
+    Some(_) | None: None
+  end
+  Store.run_release(db, op.subject, gid_opt, name.trim, args, clock.now)
+end
+
+fn get_modb_reads(_op: Operator, files: Files, clock: Clock, limit: Option(Int)) : Result(
+  List(Views.ReadLogEntry),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_read_log(db, limit or 50)
+end
+
+fn get_modb_worlds(_op: Operator, files: Files, clock: Clock) : Result(
+  Store.WorldsOverview,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_worlds_overview(db)
+end
+
+fn get_modb_world(_op: Operator, files: Files, clock: Clock, id: Text) : Result(
+  WorldRecord,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  case try Store.get_world(db, id)
+    Some(w): Ok(w)
+    None: Error(ItemNotFound(message: "world '#{id}' not found"))
+  end
+end
+
+fn post_modb_worlds(_op: Operator, files: Files, clock: Clock, req: Api.Request) : Result(
+  WorldRecord,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  raw = (req.text or "").trim
+  body = if raw.empty?
+    OpenWorldRequest(id: None, grant_id: None, ttl_seconds: None)
+  else
+    try Json.decode[OpenWorldRequest](raw).map_error(fn(e)
+      BadInput(message: "invalid open world payload: #{e}")
+    end)
+  end
+  wid = case body.id
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None:
+      ov = try Store.list_worlds_overview(db)
+      slug = clock.now.to_text.replace(":", "-").replace(".", "-")
+      "world-#{ov.worlds.size + 1}-#{slug}"
+  end
+  gid = case body.grant_id
+    Some(g) if not g.trim.empty?: g.trim
+    Some(_) | None: "operator:worlds"
+  end
+  Store.open_world(db, wid, gid, body.ttl_seconds or 3600, clock.now)
+end
+
+fn get_modb_world_diff(_op: Operator, files: Files, clock: Clock, id: Text) : Result(
+  List(BucketDiffSummary),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.world_diff(db, id)
+end
+
+fn post_modb_world_query(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  body: WorldQueryRequest
+) : Result(Json, MotetError)
+  db = try ensure_ready(files, clock)
+  return Error(BadInput(message: "query name required")) if body.query.trim.empty?
+  Store.world_query(db, id, body.query.trim, body.args or Json.Object({}), clock.now)
+end
+
+fn post_modb_world_call(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  body: WorldCallRequest
+) : Result(Json, MotetError)
+  db = try ensure_ready(files, clock)
+  return Error(BadInput(message: "action name required")) if body.action.trim.empty?
+  Store.world_call(
+    db,
+    id,
+    body.action.trim,
+    body.args,
+    body.reason or "world call via API",
+    clock.now
+  )
+end
+
+fn post_modb_world_land(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  req: Api.Request
+) : Result(LandResult, MotetError)
+  db = try ensure_ready(files, clock)
+  raw = (req.text or "").trim
+  reason = if raw.empty?
+    "land world #{id} via API"
+  else
+    wl = try Json.decode[WorldLandRequest](raw).map_error(fn(e)
+      BadInput(message: "invalid land world payload: #{e}")
+    end)
+    wl.reason or "land world #{id} via API"
+  end
+  Store.land_world(db, id, reason, clock.now)
+end
+
+fn post_modb_world_drop(_op: Operator, files: Files, clock: Clock, id: Text) : Result(
+  Json,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  _u = try Store.drop_world(db, id)
+  Ok(Json.Object({"id": id.to_json, "status": "dropped".to_json}))
+end
+
 fn get_modb_grants(_op: Operator, files: Files, clock: Clock) : Result(
   List(Grants.Grant),
   MotetError
@@ -1796,9 +1966,13 @@ fn post_modb_replay_simulate(op: Operator, files: Files, clock: Clock, body: Rep
           case body.exclude_seqs
             Some(seqs) if not seqs.empty?: Replay.ExcludeSeqs(seqs: seqs)
             Some(_) | None:
-              case body.stop_before_seq
-                Some(s): Replay.StopBeforeSeq(seq: s)
-                None: Replay.ReplayAll
+              case body.exclude_world
+                Some(w) if not w.trim.empty?: Replay.ExcludeWorld(world_id: w.trim)
+                Some(_) | None:
+                  case body.stop_before_seq
+                    Some(s): Replay.StopBeforeSeq(seq: s)
+                    None: Replay.ReplayAll
+                  end
               end
           end
       end
@@ -2032,6 +2206,46 @@ fn post_mcp(
           "type": Json.String("object"),
           "properties": Json.Object({"limit": Json.Object({"type": Json.String("integer")})})
         })
+      }),
+      Json.Object({
+        "name": Json.String("motet_worlds"),
+        "description": Json.String(
+          "Inspect speculative CoW Worlds and LandingMetrics, or diff/land/drop a specific World"
+        ),
+        "inputSchema": Json.Object({
+          "type": Json.String("object"),
+          "properties": Json.Object({
+            "action": Json.Object({"type": Json.String("string")}),
+            "world_id": Json.Object({"type": Json.String("string")}),
+            "grant_id": Json.Object({"type": Json.String("string")}),
+            "reason": Json.Object({"type": Json.String("string")})
+          })
+        })
+      }),
+      Json.Object({
+        "name": Json.String("motet_describe"),
+        "description": Json.String(
+          "Return stateless MoDB OnboardingManifest listing allowed Views, Releases, actions, and read quotas"
+        ),
+        "inputSchema": Json.Object({
+          "type": Json.String("object"),
+          "properties": Json.Object({"grant_id": Json.Object({"type": Json.String("string")})})
+        })
+      }),
+      Json.Object({
+        "name": Json.String("motet_query"),
+        "description": Json.String(
+          "Execute a zero-approval read-only Views.ReadProgram against a Grant-scoped Motet view"
+        ),
+        "inputSchema": Json.Object({
+          "type": Json.String("object"),
+          "properties": Json.Object({
+            "grant_id": Json.Object({"type": Json.String("string")}),
+            "view": Json.Object({"type": Json.String("string")}),
+            "limit": Json.Object({"type": Json.String("integer")}),
+            "program": Json.Object({"type": Json.String("object")})
+          })
+        })
       })
     ])
     return Ok(mcp_ok(id, Json.Object({"tools": tool_list})))
@@ -2068,6 +2282,60 @@ fn post_mcp(
       lim = args.int_at("limit") or 20
       entries = try Store.audit_tail(db, lim)
       return Ok(mcp_ok(id, mcp_text_result(Json.encode(entries), entries.to_json)))
+    end
+    if tname == "motet_worlds"
+      act = (args.text_at("action") or "list").trim
+      wid = (args.text_at("world_id") or "").trim
+      if act == "diff" and not wid.empty?
+        diffs = try Store.world_diff(db, wid)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(diffs), diffs.to_json)))
+      end
+      if act == "land" and not wid.empty?
+        rsn = args.text_at("reason") or "landed via MCP"
+        res = try Store.land_world(db, wid, rsn, clock.now)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(res), res.to_json)))
+      end
+      if act == "drop" and not wid.empty?
+        _u = try Store.drop_world(db, wid)
+        out = Json.Object({"id": wid.to_json, "status": "dropped".to_json})
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(out), out)))
+      end
+      ov = try Store.list_worlds_overview(db)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(ov), ov.to_json)))
+    end
+    if tname == "motet_describe"
+      gid_opt = case args.text_at("grant_id")
+        Some(g) if not g.trim.empty?: Some(g.trim)
+        Some(_) | None: None
+      end
+      manifest = try Store.describe_for_caller(db, "mcp", gid_opt, clock.now)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(manifest), manifest.to_json)))
+    end
+    if tname == "motet_query"
+      gid_opt = case args.text_at("grant_id")
+        Some(g) if not g.trim.empty?: Some(g.trim)
+        Some(_) | None: None
+      end
+      prog = case args.path("program")
+        Some(pj):
+          try Json.decode[Views.ReadProgram](pj.to_text).map_error(fn(e)
+            BadInput(message: "invalid ReadProgram: #{e}")
+          end)
+        None:
+          vname = (args.text_at("view") or "").trim
+          return Error(BadInput(message: "view or program required")) if vname.empty?
+          Views.ReadProgram(
+            view: vname,
+            where_clause: None,
+            select: None,
+            group_by: None,
+            aggregates: None,
+            order_by: None,
+            limit: args.int_at("limit")
+          )
+      end
+      qres = try Store.run_read_program(db, "mcp", gid_opt, prog, clock.now)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(qres), qres.to_json)))
     end
     if tname == "motet_ask"
       bot_name = args.text_at("bot") or "chief"
@@ -2554,6 +2822,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
         exclude_principal: None,
         exclude_grant: None,
         exclude_seqs: Some([target_seq]),
+        exclude_world: None,
         stop_before_seq: None
       )
     ),
@@ -2606,6 +2875,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
         exclude_principal: None,
         exclude_grant: None,
         exclude_seqs: None,
+        exclude_world: None,
         stop_before_seq: None
       )
     ),
@@ -2624,4 +2894,205 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     srng
   )
   assert disc_resp.status == 200 and disc_resp.text.contains?("discarded")
+
+  # Milestone 9: Dreaming World preview -> diff -> atomic land (O(1) read skip), Releases, Read Log,
+  # Replay exclude_world, and MCP Worlds/Describe/Query tools
+  dup1 = ApiTest.send(
+    Server,
+    Api.post("/v1/memory").with_bearer("secret-op").with_json(
+      SaveMemoryRequest(
+        scope: "shared",
+        kind: "fact",
+        content: "World duplicate test",
+        provenance: Some("user")
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert dup1.status == 200
+  dup2 = ApiTest.send(
+    Server,
+    Api.post("/v1/memory").with_bearer("secret-op").with_json(
+      SaveMemoryRequest(
+        scope: "shared",
+        kind: "fact",
+        content: "World duplicate test",
+        provenance: Some("legacy")
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert dup2.status == 200
+
+  dp_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/memory/dream/preview").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert dp_resp.status == 200 and
+    Json.decode[Memory.DreamingWorldPreview](dp_resp.text) is Ok(dp) and
+    dp.world_id.starts_with?("dream-") and
+    dp.pruned_ids.size >= 1
+
+  # Preview must NOT mutate live dreaming history prior to atomic landing
+  dh_before = ApiTest.send(
+    Server,
+    Api.get("/v1/memory/dream/history").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert dh_before.status == 200
+
+  w_diff = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/worlds/#{dp.world_id}/diff").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert w_diff.status == 200 and w_diff.text.contains?("memories")
+
+  w_land = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/worlds/#{dp.world_id}/land").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert w_land.status == 200 and
+    Json.decode[LandResult](w_land.text) is Ok(lres) and
+    lres.reads_skipped == 2
+
+  w_ov = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/worlds").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert w_ov.status == 200 and
+    Json.decode[Store.WorldsOverview](w_ov.text) is Ok(ov) and
+    ov.metrics.total_landed >= 1 and
+    ov.metrics.total_reads_skipped >= 2
+
+  rel_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/releases/memory_scope_summary").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert rel_resp.status == 200 and
+    Json.decode[Views.ReleaseResult](rel_resp.text) is Ok(rr) and
+    rr.release == "memory_scope_summary"
+
+  mcp_desc = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_json(
+      Json.Object({
+        "jsonrpc": "2.0".to_json,
+        "id": 91.to_json,
+        "method": "tools/call".to_json,
+        "params": Json.Object({
+          "name": "motet_describe".to_json,
+          "arguments": Json.Object({})
+        })
+      })
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_desc.status == 200 and mcp_desc.text.contains?("memories_shared")
+
+  mcp_q = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_json(
+      Json.Object({
+        "jsonrpc": "2.0".to_json,
+        "id": 92.to_json,
+        "method": "tools/call".to_json,
+        "params": Json.Object({
+          "name": "motet_query".to_json,
+          "arguments": Json.Object({"view": "bots_public".to_json, "limit": 10.to_json})
+        })
+      })
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_q.status == 200 and mcp_q.text.contains?("bots_public")
+
+  mcp_w = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_json(
+      Json.Object({
+        "jsonrpc": "2.0".to_json,
+        "id": 93.to_json,
+        "method": "tools/call".to_json,
+        "params": Json.Object({
+          "name": "motet_worlds".to_json,
+          "arguments": Json.Object({})
+        })
+      })
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_w.status == 200 and mcp_w.text.contains?(dp.world_id)
+
+  reads_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/reads").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert reads_resp.status == 200 and
+    Json.decode[List(Views.ReadLogEntry)](reads_resp.text) is Ok(rlogs) and
+    not rlogs.empty?
+
+  # Replay simulate excluding the landed Dream World
+  sim_w = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/replay/simulate").with_bearer("secret-op").with_json(
+      ReplaySimulateRequest(
+        id: "http-exclude-dream-world",
+        description: "Exclude landed dreaming world",
+        exclude_principal: None,
+        exclude_grant: None,
+        exclude_seqs: None,
+        exclude_world: Some(dp.world_id),
+        stop_before_seq: None
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert sim_w.status == 200 and
+    Json.decode[Store.ReplayProposalView](sim_w.text) is Ok(wspv) and
+    wspv.summary.excluded >= 1
 end
