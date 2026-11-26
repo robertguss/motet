@@ -673,6 +673,41 @@ export interface ModbGovernedExport {
   snapshot: { sha256?: string; bucket_count?: number; entry_count?: number } | null;
 }
 
+export interface ModbTaintSession {
+  id: string;
+  principal: string;
+  grant_id?: string | null;
+  parent_session_id?: string | null;
+  untrusted_tainted: boolean;
+  untrusted_sources: string[];
+  max_sensitivity_read: unknown;
+  sensitive_sources: string[];
+  blocked_attempts: number;
+  opened_at: string;
+  updated_at: string;
+  cleared_at?: string | null;
+  cleared_by?: string | null;
+  closed: boolean;
+}
+
+export interface ModbErasureReceipt {
+  id: string;
+  subject_id_sha256: string;
+  erased_by: string;
+  reason: string;
+  at: string;
+  'key_shredded?': boolean;
+  rows_deleted: number;
+  fts_docs_deleted: number;
+  vec_docs_deleted: number;
+  replay_calls_scrubbed: number;
+  read_logs_scrubbed: number;
+  audit_entries_redacted: number;
+  pre_erasure_tip_hash: string;
+  post_erasure_tip_hash: string;
+  'compacted?': boolean;
+}
+
 export interface MemorySearchHit {
   memory: MemoryEntry;
   score: number;

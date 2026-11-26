@@ -214,12 +214,26 @@ poll_feed,
 ack_feed,
 consume_feed,
 resync_feed,
-unsubscribe_feed
+unsubscribe_feed,
+motet_taint_policy,
+taint_err,
+erasure_err,
+ensure_taint_session,
+fork_taint_session,
+record_session_untrusted,
+record_session_sensitive,
+record_session_sensitivity_text,
+authorize_session_action,
+list_taint_sessions,
+clear_taint_session,
+list_erasure_receipts,
+erase_subject_data
 use Http
 use Json
 use Llm
 use Modb{WriteTx}
 use Modb.Claims
+use Modb.Erasure
 use Modb.Errors{ModbError}
 use Modb.Export{BackupReport, PortableSnapshot}
 use Modb.Feeds
@@ -230,6 +244,7 @@ use Modb.Policy
 use Modb.Proposals
 use Modb.Replay{ReplayCatalog, ReplayFilter, ReplayProposal}
 use Modb.Table{Index, Table, TableError}
+use Modb.Taint
 use Modb.Vec
 use Modb.Views{
   OnboardingManifest,
@@ -268,6 +283,7 @@ use Types{
   ConnectorSpec,
   DreamingDigest,
   EffectClass,
+  EraseSubjectRequest,
   EventSearchHit,
   EventSearchResponse,
   HealthSummary,
@@ -885,6 +901,59 @@ fn feed_err(e: Feeds.FeedError) : MotetError
     ): Conflict(message: Feeds.to_text(e))
     Feeds.InvalidFeed(reason: _): BadInput(message: Feeds.to_text(e))
   end
+end
+
+fn taint_err(e: Taint.TaintError) : MotetError
+  case e
+    Taint.LedgerFailure(le): ledger_err(le)
+    Taint.GrantFailure(ge): grant_err(ge)
+    Taint.PolicyFailure(pe): policy_err(pe)
+    Taint.ViewsFailure(ve): views_err(ve)
+    Taint.FtsFailure(fe): fts_err(fe)
+    Taint.VecFailure(ve): vec_err(ve)
+    Taint.InvalidSession(reason: _) | Taint.SessionAlreadyExists(id: _) | Taint.SessionClosed(
+      id: _
+    ): BadInput(message: Taint.to_text(e))
+    Taint.SessionNotFound(id: _): ItemNotFound(message: Taint.to_text(e))
+    Taint.ClearDenied(reason: _) | Taint.TaintedReadEscalationBlocked(
+      session_id: _,
+      subject: _,
+      required: _,
+      capped_clearance: _,
+      untrusted_sources: _
+    ) | Taint.LethalTrifectaBlocked(
+      session_id: _,
+      target: _,
+      max_sensitivity_read: _,
+      untrusted_sources: _,
+      reason: _
+    ): PolicyDenied(message: Taint.to_text(e))
+  end
+end
+
+fn erasure_err(e: Erasure.ErasureError) : MotetError
+  case e
+    Erasure.LedgerFailure(le): ledger_err(le)
+    Erasure.ExportFailure(ee): export_err(ee)
+    Erasure.FtsFailure(fe): fts_err(fe)
+    Erasure.VecFailure(ve): vec_err(ve)
+    Erasure.InvalidRequest(reason: _) | Erasure.KeyNotFound(subject_id: _) | Erasure
+      .ReceiptNotFound(id: _): BadInput(message: Erasure.to_text(e))
+    Erasure.ReceiptAlreadyExists(id: _): Conflict(message: Erasure.to_text(e))
+    Erasure.KeyShredded(subject_id: _) | Erasure.ErasureDenied(reason: _): PolicyDenied(
+      message: Erasure.to_text(e)
+    )
+    Erasure.CryptoFailure(detail: _): StorageFailed(message: Erasure.to_text(e))
+  end
+end
+
+fn motet_taint_policy() : Taint.TaintPolicy
+  Taint.taint_policy()
+    .with_scope_trust("external", Taint.Untrusted)
+    .with_scope_trust("web", Taint.Untrusted)
+    .with_max_sensitivity_when_tainted(Policy.Public)
+    .with_external_action("write_external")
+    .with_external_action("irreversible")
 end
 
 fn parse_time(ts: Text) : Time
@@ -8085,6 +8154,275 @@ fn unsubscribe_feed(db: DbHandle, feed_id: Text, principal: Text, reason: Text, 
   Feeds.unsubscribe_locked(db.files, db.path, motet_schema(), feed_id.trim, meta).map_error(feed_err)
 end
 
+## ---------------------------------------------------------------------------
+## Milestone 13: Lethal Trifecta Session Taint (`Modb.Taint`) & Erasure (`Modb.Erasure`)
+## ---------------------------------------------------------------------------
+fn ensure_taint_session(
+  db: DbHandle,
+  session_id: Text,
+  principal: Text,
+  grant_id_opt: Option(Text)
+) : Result(Taint.TaintSession, MotetError)
+  Taint.ensure_session_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    session_id,
+    principal,
+    grant_id_opt,
+    db.clock.now
+  ).map_error(taint_err)
+end
+
+fn fork_taint_session(
+  db: DbHandle,
+  parent_session_id: Text,
+  child_session_id: Text,
+  child_principal: Text,
+  child_grant_opt: Option(Text)
+) : Result(Taint.TaintSession, MotetError)
+  Taint.fork_session_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    parent_session_id,
+    child_session_id,
+    child_principal,
+    child_grant_opt,
+    db.clock.now
+  ).map_error(taint_err)
+end
+
+fn record_session_untrusted(
+  db: DbHandle,
+  session_id: Text,
+  source: Text
+) : Result(Taint.TaintSession, MotetError)
+  Taint.record_untrusted_read_locked(db.files, db.path, motet_schema(), session_id, source, db.clock.now)
+    .map_error(taint_err)
+end
+
+fn record_session_sensitive(
+  db: DbHandle,
+  session_id: Text,
+  sensitivity: Policy.Sensitivity,
+  source: Text
+) : Result(Taint.TaintSession, MotetError)
+  Taint.record_sensitive_read_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    session_id,
+    sensitivity,
+    source,
+    db.clock.now
+  ).map_error(taint_err)
+end
+
+fn record_session_sensitivity_text(
+  db: DbHandle,
+  session_id: Text,
+  level: Text,
+  source: Text
+) : Result(Taint.TaintSession, MotetError)
+  sens = Policy.sensitivity_from_text(level) or Policy.Internal
+  record_session_sensitive(db, session_id, sens, source)
+end
+
+## Evaluates Gate 3 Lethal Trifecta policy on an external/irreversible action.
+## Returns `Ok(None)` if allowed, `Ok(Some(reason))` if blocked (already durably audited).
+fn authorize_session_action(
+  db: DbHandle,
+  session_id: Text,
+  action_name: Text
+) : Result(Option(Text), MotetError)
+  res = Taint.authorize_action_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    motet_policy(),
+    motet_taint_policy(),
+    session_id,
+    action_name,
+    db.clock.now
+  )
+  case res
+    Ok(_sess): Ok(None)
+    Error(Taint.LethalTrifectaBlocked(
+      session_id: _,
+      target: _,
+      max_sensitivity_read: _,
+      untrusted_sources: _,
+      reason: r
+    )): Ok(Some(r))
+    Error(e): Error(taint_err(e))
+  end
+end
+
+fn list_taint_sessions(db: DbHandle) : Result(List(Taint.TaintSession), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) Taint.list_sessions(Ledger.store(ldb)).map_error(taint_err) end
+  )
+end
+
+fn clear_taint_session(
+  db: DbHandle,
+  session_id: Text,
+  reviewer: Text,
+  reason: Text
+) : Result(Taint.TaintSession, MotetError)
+  Taint.clear_session_taint_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    session_id,
+    reviewer,
+    true,
+    reason,
+    db.clock.now
+  ).map_error(taint_err)
+end
+
+fn list_erasure_receipts(db: DbHandle) : Result(List(Erasure.ErasureReceipt), MotetError)
+  with_db_read(
+    db,
+    fn(ldb) Erasure.list_erasure_receipts(Ledger.store(ldb)).map_error(erasure_err) end
+  )
+end
+
+fn any_token_match?(haystack: Text, tokens: List(Text)) : Bool
+  not haystack.empty? and tokens.any?(fn(tok) not tok.empty? and haystack.contains?(tok) end)
+end
+
+fn erase_subject_data(db: DbHandle, req: EraseSubjectRequest) : Result(
+  Erasure.ErasureReceipt,
+  MotetError
+)
+  rid = req.receipt_id.trim
+  sid = req.subject_id.trim
+  return Error(BadInput(message: "receipt_id cannot be empty")) if rid.empty?
+  return Error(BadInput(message: "subject_id cannot be empty")) if sid.empty?
+  var tokens = [sid]
+  for raw_tok in (req.match_tokens or [])
+    t = raw_tok.trim
+    if not t.empty? and not tokens.any?(fn(x) x == t end)
+      tokens = tokens.append(t)
+    end
+  end
+
+  # Delete matching `memories` via `delete_memory` first so `memories_by_scope` + FTS/Vec/Neural stay indexed cleanly
+  mem_ids = try with_db_read(
+    db,
+    fn(ldb)
+      mrows = try Table.all(Ledger.store(ldb), memories_table()).map_error(table_err)
+      var ids = []
+      for (mid, m) in mrows
+        if any_token_match?(m.content, tokens) or
+          any_token_match?(m.provenance, tokens) or
+          any_token_match?(m.origin, tokens) or
+          any_token_match?(m.scope, tokens)
+          ids = ids.append(mid)
+        end
+      end
+      Ok(ids)
+    end
+  )
+  for mid in mem_ids
+    _dm = try delete_memory(db, mid)
+  end
+
+  # Delete matching `events` atomically alongside `events_by_session` + FTS/Vec/Neural indexes
+  ev_ids = try with_db_read(
+    db,
+    fn(ldb)
+      erows = try Table.all(Ledger.store(ldb), events_table()).map_error(table_err)
+      var eids = []
+      for (eid, ev) in erows
+        if any_token_match?(ev.content, tokens) or any_token_match?(ev.session_id, tokens)
+          eids = eids.append(eid)
+        end
+      end
+      Ok(eids)
+    end
+  )
+  now = db.clock.now
+  eff_reviewer = case req.reviewer
+    Some(r) if not r.trim.empty?: r.trim
+    Some(_) | None: "operator"
+  end
+  eff_reason = case req.reason
+    Some(r) if not r.trim.empty?: r.trim
+    Some(_) | None: "GDPR right-to-be-forgotten erasure for #{sid}"
+  end
+  if not ev_ids.empty?
+    meta_ev = WriteMeta(
+      principal: eff_reviewer,
+      action: "erase_subject_events",
+      reason: eff_reason,
+      at: now
+    )
+    _u = try Ledger.locked(
+      db.files,
+      db.path,
+      motet_schema(),
+      now,
+      ledger_err,
+      fn(ldb)
+        (_ndb, u) = try Ledger.transact(
+          ldb,
+          meta_ev,
+          "remove subject events before audit erasure",
+          Json.Null,
+          fn(le) ledger_err(le) end,
+          fn(tx)
+            var cur = tx
+            for eid in ev_ids
+              if (try Table.tx_get(cur, events_table(), eid).map_error(table_err)) is Some(_)
+                cur = try Fts.tx_remove_document(cur, events_fts_index(), "#{eid}").map_error(
+                  fts_err
+                )
+                cur = try Vec.tx_remove_vector(cur, events_vec_index(), "#{eid}").map_error(vec_err)
+                cur = try Vec.tx_remove_vector(cur, events_neural_index(), "#{eid}").map_error(
+                  vec_err
+                )
+                cur = try Table.delete(cur, events_table(), eid).map_error(table_err)
+              end
+            end
+            Ok((cur, Unit))
+          end
+        )
+        Ok(u)
+      end
+    )
+  end
+
+  var ereq = Erasure.erasure_request(rid, sid)
+  ereq.match_tokens = tokens
+  rec = try Erasure.erase_subject_locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    ereq,
+    eff_reviewer,
+    true,
+    eff_reason,
+    now
+  ).map_error(erasure_err)
+  if req.compact or false
+    (_crep, rec2) = try Erasure.compact_after_erasure(
+      db.files,
+      db.path,
+      motet_schema(),
+      rec.id,
+      now
+    ).map_error(erasure_err)
+    Ok(rec2)
+  else
+    Ok(rec)
+  end
+end
+
 test "store seeds specialist roster, seals vault secrets & OAuth tokens, supports canonical chats and async runs"
   files = Files.in_memory({})
   t0 = Time.parse("2026-11-25T00:00:00Z") or stop "time"
@@ -9003,4 +9341,43 @@ test "Milestone 12: sensitivity policy, governed export, agent proposals & react
   assert unsubscribe_feed(db, "feed-pub", "operator", "done", t0) is Ok(Unit)
   assert unsubscribe_feed(db, "feed-op", "operator", "done", t0) is Ok(Unit)
   assert verify_all(db) is Ok(vrep) and vrep.ok? and vrep.secrets_ok?
+
+  # 4. Milestone 13: Dynamic Session Taint, Child Fork Inheritance, Lethal Trifecta Block & Erasure
+  assert ensure_taint_session(db, "taint-s1", "bot:researcher", None) is Ok(ts0) and
+    not ts0.untrusted_tainted
+  assert record_session_sensitive(db, "taint-s1", Policy.Confidential, "memory:personal") is
+    Ok(ts1) and
+    ts1.max_sensitivity_read is Policy.Confidential
+  assert authorize_session_action(db, "taint-s1", "write_external") == Ok(None)
+  assert record_session_untrusted(db, "taint-s1", "web_fetch:https://untrusted.example") is
+    Ok(ts2) and
+    ts2.untrusted_tainted
+  assert authorize_session_action(db, "taint-s1", "write_external") is Ok(Some(_))
+  assert fork_taint_session(db, "taint-s1", "taint-child", "bot:writer", None) is Ok(ts_child) and
+    ts_child.untrusted_tainted and
+    ts_child.max_sensitivity_read is Policy.Confidential
+  assert authorize_session_action(db, "taint-child", "irreversible") is Ok(Some(_))
+  assert clear_taint_session(db, "taint-s1", "operator", "owner cleared") is Ok(ts_clr) and
+    not ts_clr.untrusted_tainted
+  assert list_taint_sessions(db) is Ok(ts_all) and ts_all.size >= 2
+
+  assert save_memory(db, "personal", "fact", "GDPR user token alice.gdpr@example.com", "user:alice.gdpr@example.com", t0.to_text) is
+    Ok(_)
+  assert erase_subject_data(
+    db,
+    EraseSubjectRequest(
+      receipt_id: "motet-gdpr-1",
+      subject_id: "user:alice.gdpr@example.com",
+      match_tokens: Some(["alice.gdpr@example.com"]),
+      reviewer: Some("operator"),
+      reason: Some("GDPR test erasure"),
+      compact: Some(true)
+    )
+  ) is
+    Ok(erec) and
+    erec.compacted? and
+    erec.audit_entries_redacted >= 1
+  assert list_erasure_receipts(db) is Ok(recs) and recs.any?(fn(r) r.id == "motet-gdpr-1" end)
+  assert search_memories(db, Some("personal"), "alice.gdpr@example.com") == Ok([])
+  assert verify_all(db) is Ok(vrep2) and vrep2.ok? and vrep2.secrets_ok?
 end

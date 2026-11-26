@@ -27,6 +27,7 @@ import {
   ModbCallRecord,
   ModbClaim,
   ModbDescribeManifest,
+  ModbErasureReceipt,
   ModbFeedBatch,
   ModbFeedConsumeResult,
   ModbFeedSubscription,
@@ -42,6 +43,7 @@ import {
   ModbReleaseResult,
   ModbReplayBaselineStatus,
   ModbReplayProposal,
+  ModbTaintSession,
   ModbVerifySummary,
   ModbWorldLandResult,
   ModbChildLandResult,
@@ -337,6 +339,16 @@ export const AuditReplayView: React.FC<{
   const [subscribingFeed, setSubscribingFeed] = useState(false);
   const [feedBatch, setFeedBatch] = useState<ModbFeedBatch | null>(null);
 
+  // Lethal Trifecta Taint & Erasure state (Milestone 13)
+  const [taintSessions, setTaintSessions] = useState<ModbTaintSession[]>([]);
+  const [erasureReceipts, setErasureReceipts] = useState<ModbErasureReceipt[]>([]);
+  const [eraseReceiptId, setEraseReceiptId] = useState('');
+  const [eraseSubjectId, setEraseSubjectId] = useState('');
+  const [eraseTokens, setEraseTokens] = useState('');
+  const [eraseReason, setEraseReason] = useState('GDPR Art. 17 right-to-be-forgotten erasure');
+  const [eraseCompact, setEraseCompact] = useState(true);
+  const [submittingErase, setSubmittingErase] = useState(false);
+
   const buildAuditPath = useCallback(
     (p = auditPrincipal, a = auditAction, lim = auditLimit) => {
       const qs = new URLSearchParams();
@@ -381,10 +393,12 @@ export const AuditReplayView: React.FC<{
         }),
         apiOptional<ModbReadLogEntry[]>('/v1/modb/reads', []),
       ]);
-      const [polOv, gProps, fds] = await Promise.all([
+      const [polOv, gProps, fds, tSess, erRecs] = await Promise.all([
         apiOptional<ModbPolicyOverview | null>('/v1/modb/policy', null),
         apiOptional<ModbGovProposal[]>('/v1/modb/proposals', []),
         apiOptional<ModbFeedSubscription[]>('/v1/modb/feeds', []),
+        apiOptional<ModbTaintSession[]>('/v1/modb/taint/sessions', []),
+        apiOptional<ModbErasureReceipt[]>('/v1/modb/erasures', []),
       ]);
       setVerify(v);
       setBaseline(bl);
@@ -399,6 +413,8 @@ export const AuditReplayView: React.FC<{
       setPolicyOverview(polOv);
       setGovProposals(gProps);
       setFeeds(fds);
+      setTaintSessions(tSess);
+      setErasureReceipts(erRecs);
       if (gr.length && !clrGrantId) {
         setClrGrantId(gr[0].id);
         setGovPropTargetGrant(gr[0].id);
@@ -1022,6 +1038,55 @@ export const AuditReplayView: React.FC<{
     }
   }
 
+  async function handleClearTaint(sessionId: string) {
+    try {
+      await api(`/v1/modb/taint/sessions/${encodeURIComponent(sessionId)}/clear`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: 'Operator cleared taint via Inspector' }),
+      });
+      toast(`Cleared untrusted taint on session ${sessionId}`);
+      await loadAll();
+    } catch (err) {
+      toast((err as Error).message);
+    }
+  }
+
+  async function handleEraseSubject(e: React.FormEvent) {
+    e.preventDefault();
+    const sid = eraseSubjectId.trim();
+    const rid = eraseReceiptId.trim() || `gdpr-${Date.now()}`;
+    if (!sid) {
+      toast('Enter a subject_id to erase');
+      return;
+    }
+    setSubmittingErase(true);
+    try {
+      const tokens = eraseTokens
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const rec = await api<ModbErasureReceipt>('/v1/modb/erasures', {
+        method: 'POST',
+        body: JSON.stringify({
+          receipt_id: rid,
+          subject_id: sid,
+          match_tokens: tokens.length ? tokens : undefined,
+          reason: eraseReason.trim() || undefined,
+          compact: eraseCompact,
+        }),
+      });
+      toast(`Erased subject -> receipt ${rec.id} (${rec.audit_entries_redacted} audit redacted)`);
+      setEraseReceiptId('');
+      setEraseSubjectId('');
+      setEraseTokens('');
+      await loadAll();
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setSubmittingErase(false);
+    }
+  }
+
   const auditPrincipals = useMemo(
     () => Array.from(new Set(audit.map((a) => a.principal))).slice(0, 6),
     [audit]
@@ -1033,6 +1098,7 @@ export const AuditReplayView: React.FC<{
   const activeGrantCount = grants.filter((g) => !g.revoked).length;
   const pendingProposals = proposals.filter((p) => enumTag(p.status) === 'pending').length;
   const pendingGovProposals = govProposals.filter((p) => enumTag(p.status) === 'pending').length;
+  const taintedSessionCount = taintSessions.filter((s) => s.untrusted_tainted).length;
 
   const grantsByParent = useMemo(() => {
     const m = new Map<string, ModbGrant[]>();
@@ -1211,11 +1277,20 @@ export const AuditReplayView: React.FC<{
               {id === 'worlds' && openWorldCount > 0 && (
                 <Badge tone="accent">{openWorldCount}</Badge>
               )}
-              {id === 'governance' && (pendingGovProposals > 0 || feeds.length > 0) && (
-                <Badge tone={pendingGovProposals > 0 ? 'warn' : 'info'}>
-                  {pendingGovProposals > 0 ? pendingGovProposals : feeds.length}
-                </Badge>
-              )}
+              {id === 'governance' &&
+                (pendingGovProposals > 0 || taintedSessionCount > 0 || feeds.length > 0) && (
+                  <Badge
+                    tone={
+                      taintedSessionCount > 0 || pendingGovProposals > 0 ? 'warn' : 'info'
+                    }
+                  >
+                    {taintedSessionCount > 0
+                      ? taintedSessionCount
+                      : pendingGovProposals > 0
+                        ? pendingGovProposals
+                        : feeds.length}
+                  </Badge>
+                )}
             </button>
           );
         })}
@@ -2075,498 +2150,6 @@ export const AuditReplayView: React.FC<{
         </div>
       )}
 
-      {/* TAB 5: GOVERNANCE POLICY, PROPOSALS & REACTIVE FEEDS */}
-      {subTab === 'governance' && (
-        <div className="flex flex-col gap-4">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
-            <Card>
-              <div className="flex items-center justify-between gap-2 flex-wrap">
-                <div className="flex items-center gap-2 font-bold text-sm">
-                  <Lock className="w-4 h-4 text-[var(--accent-hover)]" />
-                  <span>Sensitivity Policy &amp; Clearances</span>
-                </div>
-                {policyOverview && (
-                  <div className="flex gap-1.5 flex-wrap">
-                    <Badge tone="info">default grant: {policyOverview.default_clearance}</Badge>
-                    <Badge tone="neutral">default bucket: {policyOverview.default_bucket_sensitivity}</Badge>
-                  </div>
-                )}
-              </div>
-
-              {policyOverview && (
-                <div className="flex flex-col gap-2 text-xs">
-                  <div className="flex gap-1.5 flex-wrap">
-                    {Object.entries(policyOverview.bucket_sensitivities).map(([b, s]) => (
-                      <Badge key={`bkt-${b}`} tone={s === 'confidential' || s === 'secret' ? 'warn' : 'neutral'}>
-                        bucket:{b} = {s}
-                      </Badge>
-                    ))}
-                    {Object.entries(policyOverview.scope_sensitivities).map(([sc, s]) => (
-                      <Badge key={`scp-${sc}`} tone={s === 'confidential' || s === 'secret' ? 'warn' : 'ok'}>
-                        scope:{sc} = {s}
-                      </Badge>
-                    ))}
-                  </div>
-                  <div className="text-[var(--fg-muted)] font-mono">
-                    dynamic materializations: {policyOverview.dynamic_views.length} view(s) ·{' '}
-                    {policyOverview.dynamic_releases.length} release policy ·{' '}
-                    {policyOverview.dynamic_invariants.length} invariant(s)
-                  </div>
-                </div>
-              )}
-
-              <form onSubmit={handleSetClearance} className="flex gap-2 flex-wrap items-end pt-1">
-                <Field label="Grant ID">
-                  <input
-                    className={inputCls}
-                    list="modb-grant-options"
-                    value={clrGrantId}
-                    onChange={(e) => setClrGrantId(e.target.value)}
-                    placeholder="bot:chief or del:..."
-                  />
-                  <datalist id="modb-grant-options">
-                    {grants.map((g) => (
-                      <option key={g.id} value={g.id} />
-                    ))}
-                  </datalist>
-                </Field>
-                <Field label="Max Sensitivity" className="max-w-[150px]">
-                  <select
-                    className={inputCls}
-                    value={clrLevel}
-                    onChange={(e) => setClrLevel(e.target.value)}
-                  >
-                    <option value="public">public</option>
-                    <option value="internal">internal</option>
-                    <option value="confidential">confidential</option>
-                    <option value="secret">secret</option>
-                  </select>
-                </Field>
-                <Field label="Reason">
-                  <input
-                    className={inputCls}
-                    value={clrReason}
-                    onChange={(e) => setClrReason(e.target.value)}
-                  />
-                </Field>
-                <Button type="submit" size="sm" variant="primary" disabled={settingClr}>
-                  {settingClr ? 'Saving…' : 'Set Clearance'}
-                </Button>
-              </form>
-
-              {policyOverview?.clearances?.length ? (
-                <div className="flex flex-col gap-1.5 text-xs">
-                  {policyOverview.clearances.map((c) => (
-                    <div
-                      key={c.grant_id}
-                      className="p-2 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex items-center justify-between gap-2 flex-wrap font-mono"
-                    >
-                      <div className="flex items-center gap-2">
-                        <strong>{c.grant_id}</strong>
-                        <Badge tone={enumTag(c.max_sensitivity) === 'public' ? 'ok' : 'warn'}>
-                          {enumTag(c.max_sensitivity)}
-                        </Badge>
-                      </div>
-                      <span className="text-[var(--fg-muted)]">
-                        by {c.granted_by} ({c.reason})
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-xs text-[var(--fg-muted)]">
-                  No explicit per-grant clearances set yet (using default clearance).
-                </div>
-              )}
-            </Card>
-
-            <Card>
-              <div className="flex items-center justify-between gap-2 flex-wrap">
-                <div className="flex items-center gap-2 font-bold text-sm">
-                  <Download className="w-4 h-4 text-[var(--accent-hover)]" />
-                  <span>Governed Redacted / Strict SHA-256 Export</span>
-                </div>
-                <Badge tone="info">Vault stays isolated</Badge>
-              </div>
-              <div className="flex gap-2.5 flex-wrap items-end">
-                <Field label="Caller Grant ID (blank = operator)">
-                  <input
-                    className={inputCls}
-                    list="modb-grant-options"
-                    value={govExpGrantId}
-                    onChange={(e) => setGovExpGrantId(e.target.value)}
-                    placeholder="e.g. bot:chief"
-                  />
-                </Field>
-                <Field label="Export Mode" className="max-w-[170px]">
-                  <select
-                    className={inputCls}
-                    value={govExpMode}
-                    onChange={(e) => setGovExpMode(e.target.value)}
-                  >
-                    <option value="redact">redact_restricted</option>
-                    <option value="strict">strict_fail_closed</option>
-                  </select>
-                </Field>
-                <Button size="sm" variant="ghost" onClick={() => handleRunGovernedExport(false)}>
-                  Preview Export
-                </Button>
-                <Button size="sm" variant="primary" onClick={() => handleRunGovernedExport(true)}>
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Download JSON</span>
-                </Button>
-              </div>
-              {govExpResult && (
-                <div className="p-3 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-2 text-xs">
-                  <div className="flex gap-1.5 flex-wrap">
-                    <Badge tone="info">clearance: {govExpResult.clearance}</Badge>
-                    <Badge tone="ok">{govExpResult.exported_buckets.length} exported</Badge>
-                    <Badge tone={govExpResult.redacted_buckets.length ? 'warn' : 'neutral'}>
-                      {govExpResult.redacted_buckets.length} redacted
-                    </Badge>
-                  </div>
-                  {govExpResult.redacted_buckets.length > 0 && (
-                    <div className="font-mono text-[var(--fg-muted)]">
-                      redacted_buckets: [{govExpResult.redacted_buckets.join(', ')}]
-                    </div>
-                  )}
-                </div>
-              )}
-            </Card>
-          </div>
-
-          <Card>
-            <div className="flex items-center justify-between gap-2 flex-wrap">
-              <strong className="text-sm">
-                Human-Reviewed Agent Governance Proposals ({govProposals.length})
-              </strong>
-              {pendingGovProposals > 0 && (
-                <Badge tone="warn">{pendingGovProposals} pending review</Badge>
-              )}
-            </div>
-
-            <form onSubmit={handleSubmitGovProposal} className="grid grid-cols-1 md:grid-cols-4 gap-2.5 items-end">
-              <Field label="Proposal ID">
-                <input
-                  className={inputCls}
-                  value={govPropId}
-                  onChange={(e) => setGovPropId(e.target.value)}
-                />
-              </Field>
-              <Field label="Kind">
-                <select
-                  className={inputCls}
-                  value={govPropKind}
-                  onChange={(e) => setGovPropKind(e.target.value as 'view' | 'clearance' | 'invariant')}
-                >
-                  <option value="view">ProposeView (narrowed)</option>
-                  <option value="clearance">ProposeClearance</option>
-                  <option value="invariant">ProposeInvariant</option>
-                </select>
-              </Field>
-              {govPropKind === 'view' && (
-                <>
-                  <Field label="New View Name">
-                    <input
-                      className={inputCls}
-                      value={govPropViewName}
-                      onChange={(e) => setGovPropViewName(e.target.value)}
-                    />
-                  </Field>
-                  <Field label="Base View">
-                    <input
-                      className={inputCls}
-                      value={govPropBaseView}
-                      onChange={(e) => setGovPropBaseView(e.target.value)}
-                    />
-                  </Field>
-                  <Field label="Fields (comma-separated)" className="md:col-span-2">
-                    <input
-                      className={inputCls}
-                      value={govPropFields}
-                      onChange={(e) => setGovPropFields(e.target.value)}
-                    />
-                  </Field>
-                </>
-              )}
-              {govPropKind === 'clearance' && (
-                <>
-                  <Field label="Target Grant ID">
-                    <input
-                      className={inputCls}
-                      list="modb-grant-options"
-                      value={govPropTargetGrant}
-                      onChange={(e) => setGovPropTargetGrant(e.target.value)}
-                    />
-                  </Field>
-                  <Field label="Target Clearance">
-                    <select
-                      className={inputCls}
-                      value={govPropTargetLevel}
-                      onChange={(e) => setGovPropTargetLevel(e.target.value)}
-                    >
-                      <option value="public">public</option>
-                      <option value="internal">internal</option>
-                      <option value="confidential">confidential</option>
-                      <option value="secret">secret</option>
-                    </select>
-                  </Field>
-                </>
-              )}
-              {govPropKind === 'invariant' && (
-                <>
-                  <Field label="Invariant Name">
-                    <input
-                      className={inputCls}
-                      value={govPropInvName}
-                      onChange={(e) => setGovPropInvName(e.target.value)}
-                    />
-                  </Field>
-                  <Field label="Bucket &amp; Field">
-                    <div className="flex gap-1.5">
-                      <input
-                        className={inputCls}
-                        value={govPropBucket}
-                        onChange={(e) => setGovPropBucket(e.target.value)}
-                        placeholder="bucket"
-                      />
-                      <input
-                        className={inputCls}
-                        value={govPropRuleField}
-                        onChange={(e) => setGovPropRuleField(e.target.value)}
-                        placeholder="field"
-                      />
-                    </div>
-                  </Field>
-                  <Field label="Rule">
-                    <select
-                      className={inputCls}
-                      value={govPropRuleKind}
-                      onChange={(e) =>
-                        setGovPropRuleKind(e.target.value as 'non_empty' | 'allowed_values')
-                      }
-                    >
-                      <option value="non_empty">FieldNonEmpty</option>
-                      <option value="allowed_values">AllowedValues</option>
-                    </select>
-                  </Field>
-                  {govPropRuleKind === 'allowed_values' && (
-                    <Field label="Allowed Values">
-                      <input
-                        className={inputCls}
-                        value={govPropAllowedVals}
-                        onChange={(e) => setGovPropAllowedVals(e.target.value)}
-                      />
-                    </Field>
-                  )}
-                </>
-              )}
-              <Field label="Description">
-                <input
-                  className={inputCls}
-                  value={govPropDesc}
-                  onChange={(e) => setGovPropDesc(e.target.value)}
-                />
-              </Field>
-              <Button type="submit" size="sm" variant="primary" disabled={submittingGovProp}>
-                {submittingGovProp ? 'Submitting…' : 'Submit Proposal'}
-              </Button>
-            </form>
-
-            {govProposals.length === 0 ? (
-              <div className="text-xs text-[var(--fg-muted)]">No governance proposals submitted yet.</div>
-            ) : (
-              <div className="flex flex-col gap-2">
-                {govProposals.map((p) => {
-                  const st = enumTag(p.status);
-                  const tone = st === 'approved' ? 'ok' : st === 'pending' ? 'warn' : 'neutral';
-                  const riskTone =
-                    p.diff.risk_level === 'low'
-                      ? 'ok'
-                      : p.diff.risk_level === 'medium'
-                        ? 'warn'
-                        : 'bad';
-                  return (
-                    <div
-                      key={p.id}
-                      className="p-3 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-1.5 text-xs"
-                    >
-                      <div className="flex items-center justify-between gap-2 flex-wrap">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <strong className="font-mono">{p.id}</strong>
-                          <Badge tone={tone}>{st}</Badge>
-                          <Badge tone={riskTone}>risk: {p.diff.risk_level}</Badge>
-                          {p.diff.narrows_only && <Badge tone="ok">narrows_only</Badge>}
-                          {p.diff.widens_access && <Badge tone="bad">widens_access</Badge>}
-                          {p.diff.declassifies && <Badge tone="warn">declassifies</Badge>}
-                          <span className="font-mono text-[var(--fg-muted)]">by {p.proposer}</span>
-                        </div>
-                        {st === 'pending' && (
-                          <div className="flex gap-1.5">
-                            <Button
-                              size="sm"
-                              variant="ok"
-                              onClick={() => handleDecideGovProposal(p.id, true)}
-                            >
-                              Approve
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              onClick={() => handleDecideGovProposal(p.id, false)}
-                            >
-                              Reject
-                            </Button>
-                          </div>
-                        )}
-                      </div>
-                      <div className="text-[var(--fg-muted)]">{p.diff.summary}</div>
-                      <div className="font-mono text-[11px] text-[var(--fg-subtle)]">
-                        targets: [{p.diff.affected_targets.join(', ')}]
-                        {p.reviewed_by ? ` · reviewed by ${p.reviewed_by}` : ''}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </Card>
-
-          <Card>
-            <div className="flex items-center justify-between gap-2 flex-wrap">
-              <div className="flex items-center gap-2 font-bold text-sm">
-                <Radio className="w-4 h-4 text-[var(--accent-hover)]" />
-                <span>CoW-Pinned Reactive Change Feeds ({feeds.length})</span>
-              </div>
-              <Badge tone="info">O(diff) txid-cursor streaming</Badge>
-            </div>
-
-            <form onSubmit={handleSubscribeFeed} className="flex gap-2.5 flex-wrap items-end">
-              <Field label="Feed ID">
-                <input
-                  className={inputCls}
-                  value={feedSubId}
-                  onChange={(e) => setFeedSubId(e.target.value)}
-                />
-              </Field>
-              <Field label="Buckets (comma-separated, blank=all)">
-                <input
-                  className={inputCls}
-                  value={feedSubBuckets}
-                  onChange={(e) => setFeedSubBuckets(e.target.value)}
-                />
-              </Field>
-              <Field label="Grant ID (optional sensitivity cap)">
-                <input
-                  className={inputCls}
-                  list="modb-grant-options"
-                  value={feedSubGrant}
-                  onChange={(e) => setFeedSubGrant(e.target.value)}
-                  placeholder="blank = operator"
-                />
-              </Field>
-              <label className="inline-flex items-center gap-1.5 text-xs pb-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={feedSubFromBeg}
-                  onChange={(e) => setFeedSubFromBeg(e.target.checked)}
-                />
-                <span>from beginning</span>
-              </label>
-              <Button type="submit" size="sm" variant="primary" disabled={subscribingFeed}>
-                {subscribingFeed ? 'Subscribing…' : 'Subscribe Feed'}
-              </Button>
-            </form>
-
-            {feeds.length === 0 ? (
-              <div className="text-xs text-[var(--fg-muted)]">No reactive change feeds registered yet.</div>
-            ) : (
-              <div className="flex flex-col gap-2">
-                {feeds.map((f) => {
-                  const isAdminFeed = !f.grant_id;
-                  return (
-                    <div
-                      key={f.id}
-                      className="p-3 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex items-center justify-between gap-2 flex-wrap text-xs"
-                    >
-                      <div className="flex flex-col gap-1">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <strong className="font-mono">{f.id}</strong>
-                          <Badge tone="info">cursor tx#{f.cursor_txid}</Badge>
-                          <Badge tone="neutral">{f.events_delivered} delivered</Badge>
-                          {f.grant_id && <Badge tone="warn">grant: {f.grant_id}</Badge>}
-                        </div>
-                        <div className="font-mono text-[11px] text-[var(--fg-muted)]">
-                          buckets: [{f.buckets.length ? f.buckets.join(', ') : '*'}] · pin: {f.pin_id}
-                        </div>
-                      </div>
-                      <div className="flex gap-1.5 flex-wrap">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => handlePollOrConsumeFeed(f.id, false, isAdminFeed)}
-                        >
-                          Poll O(diff)
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="primary"
-                          onClick={() => handlePollOrConsumeFeed(f.id, true, isAdminFeed)}
-                        >
-                          Consume &amp; Ack
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => handleUnsubscribeFeed(f.id)}
-                        >
-                          Unsubscribe
-                        </Button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {feedBatch && (
-              <div className="p-3 rounded-lg bg-[var(--bg)] border border-[var(--border)] flex flex-col gap-2 text-xs">
-                <div className="flex gap-1.5 flex-wrap items-center">
-                  <strong className="font-mono">{feedBatch.feed_id}</strong>
-                  <Badge tone="info">
-                    tx #{feedBatch.from_txid} → #{feedBatch.to_txid}
-                  </Badge>
-                  <Badge tone="ok">{feedBatch.events.length} events</Badge>
-                  <Badge tone="neutral">
-                    pages={feedBatch.pages_read} · skipped_subtrees={feedBatch.subtrees_skipped}
-                  </Badge>
-                  <Badge tone="neutral">clearance: {enumTag(feedBatch.clearance)}</Badge>
-                  {feedBatch.filtered_buckets.length > 0 && (
-                    <Badge tone="warn">
-                      filtered: [{feedBatch.filtered_buckets.join(', ')}]
-                    </Badge>
-                  )}
-                </div>
-                {feedBatch.events.length > 0 && (
-                  <pre className="m-0 p-2 rounded bg-[var(--bg-elev)] border border-[var(--border)] text-[11px] overflow-x-auto max-h-64">
-                    {JSON.stringify(
-                      feedBatch.events.map((ev) => ({
-                        bucket: ev.bucket,
-                        op: enumTag(ev.op),
-                        key: ev.key_text ?? ev.key_hex,
-                        new_value: ev.new_value_text ?? undefined,
-                      })),
-                      null,
-                      2
-                    )}
-                  </pre>
-                )}
-              </div>
-            )}
-          </Card>
-        </div>
-      )}
-
       {/* TAB 4: VIEWS & READ EXPLORER */}
       {subTab === 'views' && (
         <div className="flex flex-col gap-4">
@@ -3254,6 +2837,170 @@ export const AuditReplayView: React.FC<{
               </div>
             )}
           </Card>
+
+          {/* Session Taint Monitor (Lethal Trifecta Defense) & Crypto-Verifiable Erasure */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+            <Card>
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2 font-bold text-sm">
+                  <AlertTriangle className="w-4 h-4 text-[var(--warn)]" />
+                  <span>Session Taint Monitor ({taintSessions.length})</span>
+                </div>
+                <Badge tone={taintedSessionCount > 0 ? 'warn' : 'ok'}>
+                  {taintedSessionCount} tainted
+                </Badge>
+              </div>
+              {taintSessions.length === 0 ? (
+                <div className="text-xs text-[var(--fg-muted)]">
+                  No tracked agent taint sessions yet. Sessions automatically record untrusted
+                  external reads and sensitive data exposure for Gate 3 enforcement.
+                </div>
+              ) : (
+                <div className="overflow-x-auto text-xs max-h-80 overflow-y-auto">
+                  <table className="w-full border-collapse">
+                    <thead>
+                      <tr className="text-left text-[11px] uppercase text-[var(--fg-subtle)] border-b border-[var(--border)]">
+                        <th className="py-1.5 pr-3">Session</th>
+                        <th className="py-1.5 pr-3">Status</th>
+                        <th className="py-1.5 pr-3">Max Read</th>
+                        <th className="py-1.5 pr-3">Sources</th>
+                        <th className="py-1.5">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {taintSessions.map((s) => (
+                        <tr key={s.id} className="border-b border-[var(--border)]">
+                          <td className="py-1.5 pr-3 font-mono">
+                            <div>{s.id}</div>
+                            <div className="text-[11px] text-[var(--fg-muted)]">{s.principal}</div>
+                          </td>
+                          <td className="py-1.5 pr-3">
+                            {s.untrusted_tainted ? (
+                              <Badge tone="bad">TAINTED</Badge>
+                            ) : (
+                              <Badge tone="ok">clean</Badge>
+                            )}
+                          </td>
+                          <td className="py-1.5 pr-3">
+                            <Badge tone="info">{enumTag(s.max_sensitivity_read)}</Badge>
+                          </td>
+                          <td className="py-1.5 pr-3 font-mono text-[11px] text-[var(--fg-muted)]">
+                            {s.untrusted_sources.join(', ') || '-'}
+                          </td>
+                          <td className="py-1.5">
+                            {s.untrusted_tainted ? (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => handleClearTaint(s.id)}
+                              >
+                                Clear
+                              </Button>
+                            ) : (
+                              <span className="text-[var(--fg-subtle)]">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </Card>
+
+            <Card>
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2 font-bold text-sm">
+                  <ShieldCheck className="w-4 h-4 text-[var(--ok)]" />
+                  <span>Verifiable Erasure Receipts ({erasureReceipts.length})</span>
+                </div>
+                <Badge tone="neutral">AES-GCM Shred + Re-Chain</Badge>
+              </div>
+              <form
+                onSubmit={(e) => handleEraseSubject(e)}
+                className="flex flex-col gap-2 border-b border-[var(--border)] pb-3"
+              >
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                  <Field label="Subject ID">
+                    <input
+                      className={inputCls}
+                      value={eraseSubjectId}
+                      onChange={(e) => setEraseSubjectId(e.target.value)}
+                      placeholder="user:alice@example.com"
+                    />
+                  </Field>
+                  <Field label="Receipt ID (optional)">
+                    <input
+                      className={inputCls}
+                      value={eraseReceiptId}
+                      onChange={(e) => setEraseReceiptId(e.target.value)}
+                      placeholder="gdpr-erase-1"
+                    />
+                  </Field>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                  <Field label="Additional Match Tokens (csv)">
+                    <input
+                      className={inputCls}
+                      value={eraseTokens}
+                      onChange={(e) => setEraseTokens(e.target.value)}
+                      placeholder="alice@example.com, Alice"
+                    />
+                  </Field>
+                  <Field label="Audit Reason">
+                    <input
+                      className={inputCls}
+                      value={eraseReason}
+                      onChange={(e) => setEraseReason(e.target.value)}
+                    />
+                  </Field>
+                </div>
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <label className="inline-flex items-center gap-1.5 text-xs text-[var(--fg-muted)] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={eraseCompact}
+                      onChange={(e) => setEraseCompact(e.target.checked)}
+                    />
+                    Physical CoW compaction after erasure
+                  </label>
+                  <Button type="submit" variant="bad" size="sm" disabled={submittingErase}>
+                    {submittingErase ? 'Erasing…' : 'Erase Subject'}
+                  </Button>
+                </div>
+              </form>
+              {erasureReceipts.length === 0 ? (
+                <div className="text-xs text-[var(--fg-muted)]">
+                  No GDPR / right-to-be-forgotten erasure receipts recorded yet.
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2 max-h-64 overflow-y-auto text-xs">
+                  {erasureReceipts
+                    .slice()
+                    .reverse()
+                    .map((r) => (
+                      <div
+                        key={r.id}
+                        className="p-2.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)] flex flex-col gap-1"
+                      >
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <strong className="font-mono">{r.id}</strong>
+                          <div className="flex gap-1 flex-wrap">
+                            {r['key_shredded?'] && <Badge tone="ok">key shredded</Badge>}
+                            {r['compacted?'] && <Badge tone="accent">compacted</Badge>}
+                            <Badge tone="neutral">{r.audit_entries_redacted} audit redacted</Badge>
+                          </div>
+                        </div>
+                        <div className="font-mono text-[11px] text-[var(--fg-muted)]">
+                          subject_sha256={r.subject_id_sha256.slice(0, 16)}… · by={r.erased_by} ·{' '}
+                          {r.reason}
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              )}
+            </Card>
+          </div>
         </div>
       )}
 

@@ -77,6 +77,8 @@ SetClearanceRequest(..),
 SubmitGovProposalRequest(..),
 SubscribeFeedRequest(..),
 AckFeedRequest(..),
+ClearTaintRequest(..),
+EraseSubjectRequest(..),
 MemorySearchHit(..),
 MemorySearchResponse(..),
 EventSearchHit(..),
@@ -730,6 +732,20 @@ end
 struct AckFeedRequest
   up_to_txid: Int
   delivered_count: Option(Int)
+end
+
+struct ClearTaintRequest
+  reviewer: Option(Text)
+  reason: Option(Text)
+end
+
+struct EraseSubjectRequest
+  receipt_id: Text
+  subject_id: Text
+  match_tokens: Option(List(Text))
+  reviewer: Option(Text)
+  reason: Option(Text)
+  compact: Option(Bool)
 end
 
 struct MemorySearchHit

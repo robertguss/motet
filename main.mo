@@ -4,6 +4,7 @@ module Main
 use Brain
 use Command
 use Http
+use Json
 use Llm{LlmMessage, build_http_request}
 use Mcp{parse_host_port}
 use Modb.Export
@@ -64,7 +65,9 @@ fn print_usage(console: Console)
       "  motet worlds                                     List speculative CoW Worlds & landing metrics",
       "  motet policy                                     Show Sensitivity policy, clearances & dynamic rules",
       "  motet proposals [status]                         List governance proposals & CapabilityDiffs",
-      "  motet feeds [poll <id> [--limit N]]              List reactive change feeds or poll O(diff) deltas"
+      "  motet feeds [poll <id> [--limit N]]              List reactive change feeds or poll O(diff) deltas",
+      "  motet taint [--json]                             List Modb.Taint session taint trackers",
+      "  motet erasures [--json]                          List Modb.Erasure verifiable receipts"
     ].join("\n")
   )
 end
@@ -816,6 +819,50 @@ fn cmd_feeds(db: Store.DbHandle, clock: Clock, console: Console, rest: List(Text
   end
 end
 
+fn cmd_taint(db: Store.DbHandle, console: Console, rest: List(Text)) : Int
+  json? = rest.any?(fn(x) x.trim == "--json" end)
+  case Store.list_taint_sessions(db)
+    Ok(sessions):
+      if json?
+        console.print(Json.encode(sessions.to_json))
+      else if sessions.empty?
+        console.print("No tracked taint sessions recorded.")
+      else
+        for s in sessions
+          srcs = if s.untrusted_sources.empty?: "-" else: s.untrusted_sources.join(",")
+          console.print(
+            "#{s.id} principal=#{s.principal} tainted=#{s.untrusted_tainted} blocked=#{s
+              .blocked_attempts} sources=[#{srcs}]"
+          )
+        end
+      end
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
+fn cmd_erasures(db: Store.DbHandle, console: Console, rest: List(Text)) : Int
+  json? = rest.any?(fn(x) x.trim == "--json" end)
+  case Store.list_erasure_receipts(db)
+    Ok(recs):
+      if json?
+        console.print(Json.encode(recs.to_json))
+      else if recs.empty?
+        console.print("No verifiable erasure receipts recorded.")
+      else
+        for r in recs
+          console.print(
+            "#{r.id} subject_sha=#{Text.from_chars(r.subject_id_sha256.chars.take(12))} rows=#{r
+              .rows_deleted} audit_redacted=#{r.audit_entries_redacted} compacted=#{r
+              .compacted?} by=#{r.erased_by}"
+          )
+        end
+      end
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
 fn main(
   args: Args,
   env: Env,
@@ -866,6 +913,8 @@ fn main(
   return cmd_policy(db, console) if head == "policy"
   return cmd_proposals(db, console, rest) if head == "proposals"
   return cmd_feeds(db, clock, console, rest) if head == "feeds"
+  return cmd_taint(db, console, rest) if head == "taint"
+  return cmd_erasures(db, console, rest) if head == "erasures"
 
   if head == "tick"
     _drained = Brain.drain_queued_runs(rt, db, 10)
@@ -1044,4 +1093,12 @@ test "motet CLI initializes specialist roster, seals Vault API key, runs canonic
   c13 = Console.fake()
   assert main(Args.of(["feeds"]), env, c13, files, cmd, Network.fake({}), clock, srng) == 0
   assert (c13.printed.first or "").contains?("No reactive change feeds registered.")
+
+  c14 = Console.fake()
+  assert main(Args.of(["taint"]), env, c14, files, cmd, Network.fake({}), clock, srng) == 0
+  assert (c14.printed.first or "").contains?("No tracked taint sessions recorded.")
+
+  c15 = Console.fake()
+  assert main(Args.of(["erasures"]), env, c15, files, cmd, Network.fake({}), clock, srng) == 0
+  assert (c15.printed.first or "").contains?("No verifiable erasure receipts recorded.")
 end

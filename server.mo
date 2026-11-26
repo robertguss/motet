@@ -18,6 +18,7 @@ use Llm
 use Mcp{parse_host_port, resolve_connector_url}
 use Memory
 use Modb.Claims
+use Modb.Erasure
 use Modb.Export
 use Modb.Feeds
 use Modb.Grants
@@ -25,6 +26,7 @@ use Modb.Ledger
 use Modb.Policy
 use Modb.Proposals
 use Modb.Replay
+use Modb.Taint
 use Modb.Views
 use Modb.World{BucketDiffSummary, ChildLandResult, LandOutcome, LandResult, PriorityTicket, WorldRecord}
 use Oauth
@@ -44,6 +46,7 @@ use Types{
   BotRun,
   BudgetSnapshot,
   BulkActionResult,
+  ClearTaintRequest,
   CloneBotRequest,
   ConnectorAuthStatus,
   ConnectorSpec,
@@ -55,6 +58,7 @@ use Types{
   DeleteResult,
   DreamingDigest,
   EnqueueRunRequest,
+  EraseSubjectRequest,
   EvaluateIntentsRequest,
   EvaluateIntentsResponse,
   EventSearchResponse,
@@ -272,6 +276,10 @@ api
   post "/v1/modb/feeds/:id/consume" post_modb_feed_consume
   post "/v1/modb/feeds/:id/resync" post_modb_feed_resync
   delete "/v1/modb/feeds/:id" delete_modb_feed
+  get "/v1/modb/taint/sessions" get_modb_taint_sessions
+  post "/v1/modb/taint/sessions/:id/clear" post_modb_taint_clear
+  get "/v1/modb/erasures" get_modb_erasures
+  post "/v1/modb/erasures" post_modb_erasures
 
   post "/webhooks/:source" post_webhook
   post "/mcp" post_mcp
@@ -2573,6 +2581,53 @@ fn delete_modb_feed(op: Operator, files: Files, clock: Clock, id: Text, reason: 
   Ok(Json.Object({"id": id.to_json, "status": "unsubscribed".to_json}))
 end
 
+fn get_modb_taint_sessions(_op: Operator, files: Files, clock: Clock) : Result(
+  List(Taint.TaintSession),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_taint_sessions(db)
+end
+
+fn post_modb_taint_clear(op: Operator, files: Files, clock: Clock, id: Text, req: Api.Request) : Result(
+  Taint.TaintSession,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  body = if req.body.empty?
+    ClearTaintRequest(reviewer: None, reason: None)
+  else
+    try Json.decode[ClearTaintRequest](req.body).map_error(fn(e)
+      BadInput(message: "invalid clear taint body: #{e}")
+    end)
+  end
+  who = case body.reviewer
+    Some(r) if not r.trim.empty?: r.trim
+    Some(_) | None: op.subject
+  end
+  rsn = case body.reason
+    Some(r) if not r.trim.empty?: r.trim
+    Some(_) | None: "operator cleared taint via API"
+  end
+  Store.clear_taint_session(db, id.trim, who, rsn)
+end
+
+fn get_modb_erasures(_op: Operator, files: Files, clock: Clock) : Result(
+  List(Erasure.ErasureReceipt),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_erasure_receipts(db)
+end
+
+fn post_modb_erasures(_op: Operator, files: Files, clock: Clock, body: EraseSubjectRequest) : Result(
+  Erasure.ErasureReceipt,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.erase_subject_data(db, body)
+end
+
 ## Receives an external webhook payload with HMAC-SHA256 verification (when configured),
 ## logs it under External trust, and enqueues an External-trust async BotRun for the target bot.
 fn post_webhook(
@@ -2916,6 +2971,40 @@ fn post_mcp(
             "admin": Json.Object({"type": Json.String("boolean")}),
             "up_to_txid": Json.Object({"type": Json.String("integer")}),
             "delivered_count": Json.Object({"type": Json.String("integer")}),
+            "reason": Json.Object({"type": Json.String("string")})
+          })
+        })
+      }),
+      Json.Object({
+        "name": Json.String("motet_taint"),
+        "description": Json.String(
+          "List Modb.Taint Lethal Trifecta session trackers or clear untrusted taint on a session"
+        ),
+        "inputSchema": Json.Object({
+          "type": Json.String("object"),
+          "properties": Json.Object({
+            "action": Json.Object({"type": Json.String("string")}),
+            "session_id": Json.Object({"type": Json.String("string")}),
+            "reason": Json.Object({"type": Json.String("string")})
+          })
+        })
+      }),
+      Json.Object({
+        "name": Json.String("motet_erasures"),
+        "description": Json.String(
+          "List verifiable Modb.Erasure receipts or erase a data subject across memories, events, FTS/Vec, Replay, ReadLog, and Audit"
+        ),
+        "inputSchema": Json.Object({
+          "type": Json.String("object"),
+          "properties": Json.Object({
+            "action": Json.Object({"type": Json.String("string")}),
+            "receipt_id": Json.Object({"type": Json.String("string")}),
+            "subject_id": Json.Object({"type": Json.String("string")}),
+            "match_tokens": Json.Object({
+              "type": Json.String("array"),
+              "items": Json.Object({"type": Json.String("string")})
+            }),
+            "compact": Json.Object({"type": Json.String("boolean")}),
             "reason": Json.Object({"type": Json.String("string")})
           })
         })
@@ -3279,6 +3368,47 @@ fn post_mcp(
       end
       flist = try Store.list_feeds(db)
       return Ok(mcp_ok(id, mcp_text_result(Json.encode(flist), flist.to_json)))
+    end
+    if tname == "motet_taint"
+      act = (args.text_at("action") or "list").trim
+      if act == "clear"
+        sid = (args.text_at("session_id") or "").trim
+        return Error(BadInput(message: "session_id required")) if sid.empty?
+        rsn = args.text_at("reason") or "cleared via MCP"
+        ts = try Store.clear_taint_session(db, sid, "mcp", rsn)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(ts), ts.to_json)))
+      end
+      ts_all = try Store.list_taint_sessions(db)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(ts_all), ts_all.to_json)))
+    end
+    if tname == "motet_erasures"
+      act = (args.text_at("action") or "list").trim
+      if act == "erase"
+        rid = (args.text_at("receipt_id") or "").trim
+        sid = (args.text_at("subject_id") or "").trim
+        return Error(BadInput(message: "receipt_id and subject_id required")) if rid.empty? or
+          sid.empty?
+        toks_opt = case args.path("match_tokens")
+          Some(tj): Some(
+            try Json.decode[List(Text)](tj.to_text).map_error(fn(e)
+              BadInput(message: "invalid match_tokens: #{e}")
+            end)
+          )
+          None: None
+        end
+        ereq = EraseSubjectRequest(
+          receipt_id: rid,
+          subject_id: sid,
+          match_tokens: toks_opt,
+          reviewer: Some("mcp"),
+          reason: args.text_at("reason"),
+          compact: args.bool_at("compact")
+        )
+        rec = try Store.erase_subject_data(db, ereq)
+        return Ok(mcp_ok(id, mcp_text_result(Json.encode(rec), rec.to_json)))
+      end
+      recs = try Store.list_erasure_receipts(db)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(recs), recs.to_json)))
     end
     if tname == "motet_ask"
       bot_name = args.text_at("bot") or "chief"
@@ -4626,4 +4756,76 @@ test "HTTP and MCP serve hybrid/BM25/semantic search, Vault Gemini reindex, and 
     srng
   )
   assert feed_del.status == 200 and feed_del.text.contains?("unsubscribed")
+
+  # Milestone 13 HTTP + MCP: Session Taint Monitor & Erasure Receipts
+  t_get = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/taint/sessions").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert t_get.status == 200 and t_get.text.trim.starts_with?("[")
+
+  er_post = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/erasures").with_bearer("secret-op").with_json(
+      EraseSubjectRequest(
+        receipt_id: "srv-gdpr-1",
+        subject_id: "srv-alice",
+        match_tokens: Some(["alice.srv@example.com"]),
+        reviewer: Some("operator"),
+        reason: Some("server gdpr e2e"),
+        compact: Some(true)
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert er_post.status == 200 and
+    er_post.text.contains?("srv-gdpr-1") and
+    er_post.text.contains?("\"compacted?\":true")
+
+  mcp_taint = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_json(
+      Json.Object({
+        "jsonrpc": "2.0".to_json,
+        "id": 106.to_json,
+        "method": "tools/call".to_json,
+        "params": Json.Object({
+          "name": "motet_taint".to_json,
+          "arguments": Json.Object({"action": "list".to_json})
+        })
+      })
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_taint.status == 200
+
+  mcp_er = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_json(
+      Json.Object({
+        "jsonrpc": "2.0".to_json,
+        "id": 107.to_json,
+        "method": "tools/call".to_json,
+        "params": Json.Object({
+          "name": "motet_erasures".to_json,
+          "arguments": Json.Object({"action": "list".to_json})
+        })
+      })
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_er.status == 200 and mcp_er.text.contains?("srv-gdpr-1")
 end
