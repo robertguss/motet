@@ -231,7 +231,17 @@ erase_subject_data,
 explain_read_program,
 list_matviews,
 refresh_matview,
-query_matview
+query_matview,
+sync_err,
+sync_init_peer,
+sync_list_peers,
+sync_export_base_snapshot,
+sync_export_delta,
+sync_ack_peer,
+sync_apply_delta,
+sync_remove_peer,
+resolve_backup_key
+use Crypto
 use Http
 use Json
 use Llm
@@ -248,6 +258,7 @@ use Modb.Matview
 use Modb.Policy
 use Modb.Proposals
 use Modb.Replay{ReplayCatalog, ReplayFilter, ReplayProposal}
+use Modb.Sync
 use Modb.Table{Index, Table, TableError}
 use Modb.Taint
 use Modb.Vec
@@ -958,6 +969,28 @@ fn erasure_err(e: Erasure.ErasureError) : MotetError
       message: Erasure.to_text(e)
     )
     Erasure.CryptoFailure(detail: _): StorageFailed(message: Erasure.to_text(e))
+  end
+end
+
+fn sync_err(e: Sync.SyncError) : MotetError
+  case e
+    Sync.UnknownPeer(peer_id: _): ItemNotFound(message: Sync.to_text(e))
+    Sync.PeerAlreadyExists(peer_id: _) | Sync.AckMismatch(reason: _) | Sync.ChainMismatch(
+      expected_seq: _,
+      actual_seq: _,
+      expected_prev_hash: _,
+      actual_prev_hash: _
+    ): Conflict(message: Sync.to_text(e))
+    Sync.InvalidPeerId(peer_id: _) | Sync.InvalidDelta(reason: _) | Sync.InvalidEnvelope(
+      reason: _
+    ) | Sync.InvalidKeyLength(expected: _, got: _) | Sync.TargetExists(path: _): BadInput(
+      message: Sync.to_text(e)
+    )
+    Sync.DecryptionFailed: PolicyDenied(message: Sync.to_text(e))
+    Sync.StorageFailure(me): modb_err(me)
+    Sync.TableFailure(te): table_err(te)
+    Sync.ExportFailure(ee): export_err(ee)
+    Sync.PinMissing(pin_id: _): StorageFailed(message: Sync.to_text(e))
   end
 end
 
@@ -8109,6 +8142,104 @@ fn export_snapshot(db: DbHandle, now: Time) : Result(PortableSnapshot, MotetErro
   )
 end
 
+fn decode_32b_key_text(raw: Text, source_name: Text) : Result(Bytes, MotetError)
+  t = raw.trim
+  if t.byte_count == 64
+    case Bytes.from_hex(t)
+      Some(kb) if kb.size == 32: return Ok(kb)
+      Some(_) | None: Unit
+    end
+  end
+  if t.starts_with?("b64:")
+    b64 = t.drop_prefix("b64:") or ""
+    case Bytes.from_base64url(b64)
+      Some(kb) if kb.size == 32: return Ok(kb)
+      Some(_) | None: Unit
+    end
+  end
+  return Ok(t.bytes) if t.bytes.size == 32
+  Error(
+    BadInput(
+      message: "#{source_name} must be 64 hex chars, b64:<32B-base64url>, or 32 UTF-8 bytes"
+    )
+  )
+end
+
+## Resolves the 32-byte AES-256-GCM off-host backup key from `MODB_BACKUP_KEY_HEX` or Vault secret
+## `modb_backup_key` (SHA-256 derived if arbitrary passphrase), never returning or logging key bytes.
+fn resolve_backup_key(db: DbHandle, env: Env) : Result(Bytes, MotetError)
+  case env.get("MODB_BACKUP_KEY_HEX")
+    Some(raw) if not raw.trim.empty?: return decode_32b_key_text(raw, "MODB_BACKUP_KEY_HEX")
+    Some(_) | None: Unit
+  end
+  case try get_vault_secret(db, env, "modb_backup_key")
+    Some(sec) if not sec.trim.empty?:
+      t = sec.trim
+      if t.byte_count == 64
+        case Bytes.from_hex(t)
+          Some(kb) if kb.size == 32: return Ok(kb)
+          Some(_) | None: Unit
+        end
+      end
+      Ok(Crypto.sha256(t.bytes))
+    Some(_) | None: Error(
+      BadInput(
+        message: "no backup key configured: set MODB_BACKUP_KEY_HEX or seal vault secret 'modb_backup_key'"
+      )
+    )
+  end
+end
+
+fn sync_init_peer(
+  db: DbHandle,
+  peer_id: Text,
+  include_internal?: Bool,
+  from_empty?: Bool,
+  now: Time
+) : Result(Sync.SyncPeer, MotetError)
+  Sync.init_peer_locked(db.files, db.path, peer_id, include_internal?, from_empty?, now).map_error(
+    sync_err
+  )
+end
+
+fn sync_list_peers(db: DbHandle) : Result(List(Sync.SyncPeer), MotetError)
+  Sync.list_peers_locked(db.files.read_only, db.path).map_error(sync_err)
+end
+
+fn sync_export_base_snapshot(db: DbHandle, peer_id: Text, now: Time) : Result(
+  PortableSnapshot,
+  MotetError
+)
+  Sync.export_peer_base_snapshot_locked(db.files.read_only, db.path, peer_id, now).map_error(
+    sync_err
+  )
+end
+
+fn sync_export_delta(db: DbHandle, peer_id: Text, now: Time) : Result(Sync.SyncDelta, MotetError)
+  Sync.export_delta_locked(db.files, db.path, peer_id, now).map_error(sync_err)
+end
+
+fn sync_ack_peer(
+  db: DbHandle,
+  peer_id: Text,
+  seq: Int,
+  delta_hash: Text,
+  now: Time
+) : Result(Sync.SyncPeer, MotetError)
+  Sync.ack_peer_locked(db.files, db.path, peer_id, seq, delta_hash, now).map_error(sync_err)
+end
+
+fn sync_apply_delta(db: DbHandle, delta: Sync.SyncDelta, now: Time) : Result(
+  Sync.SyncApplyReport,
+  MotetError
+)
+  Sync.apply_delta_tracked_locked(db.files, db.path, delta, now).map_error(sync_err)
+end
+
+fn sync_remove_peer(db: DbHandle, peer_id: Text) : Result(Unit, MotetError)
+  Sync.remove_peer_locked(db.files, db.path, peer_id).map_error(sync_err)
+end
+
 fn simulate_replay(
   db: DbHandle,
   id: Text,
@@ -9851,4 +9982,39 @@ test "Milestone 12: sensitivity policy, governed export, agent proposals & react
   assert list_matviews(db) is Ok(mvs) and mvs.size >= 2
   assert refresh_matview(db, "budget_by_bot") is Ok(mv_ref) and mv_ref.name == "budget_by_bot"
   assert query_matview(db, "budget_by_bot", None) is Ok(mv_q) and mv_q.name == "budget_by_bot"
+
+  # 6. Milestone 16: Modb.Sync incremental peer + Vault/Env backup key resolution + AEAD envelope
+  srng = SecureRandom.seeded(91)
+  sync_env = Env.of({
+    "MOTB_DUMMY": "0",
+    "MODB_BACKUP_KEY_HEX": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+  })
+  assert resolve_backup_key(db, sync_env) is Ok(bkey) and bkey.size == 32
+  assert resolve_backup_key(db, Env.of({})) is Error(BadInput(message: _))
+
+  assert sync_init_peer(db, "offsite-s3", true, false, t0) is Ok(sp0) and
+    sp0.acked_seq == 0
+  assert sync_export_base_snapshot(db, "offsite-s3", t0) is Ok(s_base)
+  assert save_memory(db, "shared", "fact", "Sync captured update", "user", t0.to_text) is Ok(_)
+  assert sync_export_delta(db, "offsite-s3", t0) is Ok(s_d1) and
+    s_d1.seq == 1 and
+    s_d1.op_count >= 1
+  assert sync_ack_peer(db, "offsite-s3", s_d1.seq, s_d1.delta_hash, t0) is Ok(sp1) and
+    sp1.acked_seq == 1
+  assert Sync.seal_snapshot(srng, bkey, "env-hex", "motet-test", s_base, t0) is Ok(e_base)
+  assert Sync.seal_delta(srng, bkey, "env-hex", "motet-test", s_d1, t0) is Ok(e_d1)
+  assert Sync.restore_sealed_chain(
+    files,
+    "motet-restored.modb",
+    e_base,
+    [e_d1],
+    bkey,
+    "motet-test"
+  ) is
+    Ok(rc_rep) and
+    rc_rep.deltas_applied == 1
+  assert Ledger.open(files, "motet-restored.modb", motet_schema(), t0) is Ok(rest_ldb) and
+    Ledger.verify_all(rest_ldb) is Ok(_)
+  assert sync_remove_peer(db, "offsite-s3") is Ok(Unit)
+  assert verify_all(db) is Ok(vrep3) and vrep3.ok? and vrep3.secrets_ok?
 end

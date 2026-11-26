@@ -27,6 +27,7 @@ use Modb.Matview
 use Modb.Policy
 use Modb.Proposals
 use Modb.Replay
+use Modb.Sync
 use Modb.Taint
 use Modb.Views
 use Modb.World{BucketDiffSummary, ChildLandResult, LandOutcome, LandResult, PriorityTicket, WorldRecord}
@@ -121,6 +122,17 @@ use WebUi
 
 struct Operator
   subject: Text
+end
+
+struct SyncPeerCreateRequest
+  peer_id: Text
+  include_internal: Option(Bool)
+  from_empty: Option(Bool)
+end
+
+struct SyncAckRequest
+  seq: Int
+  delta_hash: Text
 end
 
 api
@@ -290,6 +302,10 @@ api
   post "/v1/modb/taint/sessions/:id/clear" post_modb_taint_clear
   get "/v1/modb/erasures" get_modb_erasures
   post "/v1/modb/erasures" post_modb_erasures
+  get "/v1/modb/sync/peers" get_modb_sync_peers
+  post "/v1/modb/sync/peers" post_modb_sync_peers
+  post "/v1/modb/sync/peers/:id/:action" post_modb_sync_peer_action
+  delete "/v1/modb/sync/peers/:id" delete_modb_sync_peer
 
   post "/webhooks/:source" post_webhook
   post "/mcp" post_mcp
@@ -3076,6 +3092,169 @@ fn post_modb_erasures(_op: Operator, files: Files, clock: Clock, body: EraseSubj
   )
 end
 
+## Milestone 16: Signed incremental CoW sync replication & AES-256-GCM encrypted backup API.
+fn get_modb_sync_peers(_op: Operator, files: Files, clock: Clock) : Result(
+  List(Sync.SyncPeer),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.sync_list_peers(db)
+end
+
+fn post_modb_sync_peers(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  body: SyncPeerCreateRequest
+) : Result(Api.Response, MotetError)
+  db = try ensure_ready(files, clock)
+  inc? = body.include_internal or false
+  empty? = body.from_empty or false
+  peer = try Store.sync_init_peer(db, body.peer_id, inc?, empty?, clock.now)
+  Ok(
+    json_motet_sse(
+      peer,
+      [("motet", "sync.peer_created")],
+      [Sync.sync_peers_bucket],
+      "sync_init_peer"
+    )
+  )
+end
+
+fn post_modb_sync_snapshot(
+  _op: Operator,
+  files: Files,
+  env: Env,
+  clock: Clock,
+  srng: SecureRandom,
+  id: Text,
+  encrypt: Option(Bool),
+  key_id: Option(Text),
+  aad: Option(Text)
+) : Result(Api.Response, MotetError)
+  db = try ensure_ready(files, clock)
+  snap = try Store.sync_export_base_snapshot(db, id.trim, clock.now)
+  payload = if encrypt == Some(true)
+    bkey = try Store.resolve_backup_key(db, env)
+    senv = try Sync.seal_snapshot(
+      srng,
+      bkey,
+      key_id or "motet-default",
+      aad or "",
+      snap,
+      clock.now
+    ).map_error(Store.sync_err)
+    Sync.encode_sealed_json(senv)
+  else
+    Export.encode_snapshot_json(snap)
+  end
+  Ok(Api.response(200, [("Content-Type", "application/json")], payload.bytes))
+end
+
+fn post_modb_sync_export(
+  _op: Operator,
+  files: Files,
+  env: Env,
+  clock: Clock,
+  srng: SecureRandom,
+  id: Text,
+  encrypt: Option(Bool),
+  key_id: Option(Text),
+  aad: Option(Text)
+) : Result(Api.Response, MotetError)
+  db = try ensure_ready(files, clock)
+  delta = try Store.sync_export_delta(db, id.trim, clock.now)
+  payload = if encrypt == Some(true)
+    bkey = try Store.resolve_backup_key(db, env)
+    senv = try Sync.seal_delta(
+      srng,
+      bkey,
+      key_id or "motet-default",
+      aad or "",
+      delta,
+      clock.now
+    ).map_error(Store.sync_err)
+    Sync.encode_sealed_json(senv)
+  else
+    Sync.encode_delta_json(delta)
+  end
+  Ok(
+    Api.with_sse_publish_json(
+      Api.response(200, [("Content-Type", "application/json")], payload.bytes),
+      "motet",
+      "sync.delta_exported",
+      Json.Object({
+        "peer_id": Json.String(delta.peer_id),
+        "seq": Json.int(delta.seq),
+        "encrypted": Json.Boolean(encrypt == Some(true))
+      })
+    )
+  )
+end
+
+fn post_modb_sync_ack(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  id: Text,
+  body: SyncAckRequest
+) : Result(Api.Response, MotetError)
+  db = try ensure_ready(files, clock)
+  peer = try Store.sync_ack_peer(db, id.trim, body.seq, body.delta_hash, clock.now)
+  Ok(
+    json_motet_sse(
+      peer,
+      [("motet", "sync.peer_acked")],
+      [Sync.sync_peers_bucket],
+      "sync_ack_peer"
+    )
+  )
+end
+
+fn delete_modb_sync_peer(_op: Operator, files: Files, clock: Clock, id: Text) : Result(
+  Api.Response,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  _ = try Store.sync_remove_peer(db, id.trim)
+  Ok(
+    json_motet_sse(
+      Json.Object({"ok": Json.Boolean(true), "peer_id": Json.String(id.trim)}),
+      [("motet", "sync.peer_removed")],
+      [Sync.sync_peers_bucket],
+      "sync_remove_peer"
+    )
+  )
+end
+
+fn post_modb_sync_peer_action(
+  op: Operator,
+  files: Files,
+  env: Env,
+  clock: Clock,
+  srng: SecureRandom,
+  req: Api.Request,
+  id: Text,
+  action: Text,
+  encrypt: Option(Bool),
+  key_id: Option(Text),
+  aad: Option(Text)
+) : Result(Api.Response, MotetError)
+  act = action.trim
+  if act == "snapshot"
+    post_modb_sync_snapshot(op, files, env, clock, srng, id, encrypt, key_id, aad)
+  else if act == "export"
+    post_modb_sync_export(op, files, env, clock, srng, id, encrypt, key_id, aad)
+  else if act == "ack"
+    body = try Json.decode[SyncAckRequest](req.body).map_error(fn(e)
+      BadInput(message: "invalid sync ack body: #{e}")
+    end)
+    post_modb_sync_ack(op, files, clock, id, body)
+  else
+    Error(ItemNotFound(message: "unknown sync peer action '#{act}'"))
+  end
+end
+
 ## Receives an external webhook payload with HMAC-SHA256 verification (when configured),
 ## logs it under External trust, and enqueues an External-trust async BotRun for the target bot.
 fn post_webhook(
@@ -5448,4 +5627,88 @@ test "HTTP and MCP serve hybrid/BM25/semantic search, Vault Gemini reindex, and 
     srng
   )
   assert mvs_q.status == 200 and mvs_q.text.contains?("approvals_by_status")
+
+  # Milestone 16: /v1/modb/sync/peers* plain + encrypted off-host backup API
+  sync_env = Env.of({
+    "MOTET_API_TOKEN": "secret-op",
+    "MODB_BACKUP_KEY_HEX": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+  })
+  sy_cr = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/sync/peers").with_bearer("secret-op").with_json(
+      SyncPeerCreateRequest(peer_id: "srv-offsite", include_internal: Some(true), from_empty: Some(false))
+    ),
+    files,
+    sync_env,
+    clock,
+    srng
+  )
+  assert sy_cr.status == 200 and sy_cr.text.contains?("srv-offsite")
+
+  sy_ls = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/sync/peers").with_bearer("secret-op"),
+    files,
+    sync_env,
+    clock,
+    srng
+  )
+  assert sy_ls.status == 200 and sy_ls.text.contains?("srv-offsite")
+
+  sy_sn_enc = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/sync/peers/srv-offsite/snapshot?encrypt=true&key_id=k1&aad=srv").with_bearer(
+      "secret-op"
+    ),
+    files,
+    sync_env,
+    clock,
+    srng
+  )
+  assert sy_sn_enc.status == 200 and sy_sn_enc.text.contains?("\"alg\":\"AES-256-GCM\"")
+
+  sy_ex_plain = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/sync/peers/srv-offsite/export").with_bearer("secret-op"),
+    files,
+    sync_env,
+    clock,
+    srng
+  )
+  assert sy_ex_plain.status == 200
+  assert Json.decode[Sync.SyncDelta](sy_ex_plain.text.bytes) is Ok(srv_d1)
+
+  sy_ak = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/sync/peers/srv-offsite/ack").with_bearer("secret-op").with_json(
+      SyncAckRequest(seq: srv_d1.seq, delta_hash: srv_d1.delta_hash)
+    ),
+    files,
+    sync_env,
+    clock,
+    srng
+  )
+  assert sy_ak.status == 200 and sy_ak.text.contains?("\"acked_seq\":1")
+
+  sy_ex_enc = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/sync/peers/srv-offsite/export?encrypt=true&key_id=k1&aad=srv").with_bearer(
+      "secret-op"
+    ),
+    files,
+    sync_env,
+    clock,
+    srng
+  )
+  assert sy_ex_enc.status == 200 and sy_ex_enc.text.contains?("\"kind\":\"delta\"")
+
+  sy_dl = ApiTest.send(
+    Server,
+    Api.delete("/v1/modb/sync/peers/srv-offsite").with_bearer("secret-op"),
+    files,
+    sync_env,
+    clock,
+    srng
+  )
+  assert sy_dl.status == 200 and sy_dl.text.contains?("\"ok\":true")
 end

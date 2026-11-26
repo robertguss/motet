@@ -8,6 +8,7 @@ use Json
 use Llm{LlmMessage, build_http_request}
 use Mcp{parse_host_port}
 use Modb.Export
+use Modb.Sync{SealedEnvelope, SyncDelta}
 use Skills
 use Store
 use Telegram
@@ -67,7 +68,15 @@ fn print_usage(console: Console)
       "  motet proposals [status]                         List governance proposals & CapabilityDiffs",
       "  motet feeds [poll <id> [--limit N]]              List reactive change feeds or poll O(diff) deltas",
       "  motet taint [--json]                             List Modb.Taint session taint trackers",
-      "  motet erasures [--json]                          List Modb.Erasure verifiable receipts"
+      "  motet erasures [--json]                          List Modb.Erasure verifiable receipts",
+      "  motet sync init-peer <peer> [--include-internal] [--from-empty] [--json]",
+      "  motet sync peers [--json]",
+      "  motet sync base-snapshot <peer> <out.json> [--encrypt] [--key-file <p>|--key-env <V>] [--key-id <id>] [--aad <t>]",
+      "  motet sync export <peer> <out.json> [--encrypt] [--key-file <p>|--key-env <V>] [--key-id <id>] [--aad <t>] [--json]",
+      "  motet sync ack <peer> --seq <N> --hash <hex> [--json]",
+      "  motet sync apply <delta.json> [--decrypt] [--key-file <p>|--key-env <V>] [--aad <t>] [--json]",
+      "  motet sync remove-peer <peer>",
+      "  motet sync restore <dst.modb> --base <snap.json> [<delta1.json> ...] [--decrypt] [--key-file <p>|--key-env <V>] [--aad <t>] [--json]"
     ].join("\n")
   )
 end
@@ -871,6 +880,422 @@ fn cmd_erasures(db: Store.DbHandle, console: Console, rest: List(Text)) : Int
   end
 end
 
+fn decode_motet_sync_key_bytes(raw: Bytes) : Result(Bytes, MotetError)
+  case raw.decode_utf8
+    Some(s):
+      t = s.trim
+      if t.byte_count == 64
+        case Bytes.from_hex(t)
+          Some(kb) if kb.size == 32: return Ok(kb)
+          Some(_) | None: Unit
+        end
+      end
+      if t.starts_with?("b64:")
+        b64 = t.drop_prefix("b64:") or ""
+        case Bytes.from_base64url(b64)
+          Some(kb) if kb.size == 32: return Ok(kb)
+          Some(_) | None: Unit
+        end
+      end
+    None: Unit
+  end
+  return Ok(raw) if raw.size == 32
+  Error(
+    BadInput(
+      message: "sync encryption key must be 32 raw bytes, 64 hex chars, or b64:<base64url>"
+    )
+  )
+end
+
+fn resolve_cli_sync_key(
+  db: Store.DbHandle,
+  files: Files,
+  env: Env,
+  key_file_opt: Option(Text),
+  key_env_opt: Option(Text)
+) : Result(Bytes, MotetError)
+  case key_file_opt
+    Some(kp):
+      raw = try files.read_only.read_bytes(kp).map_error(fn(e)
+        BadInput(message: "cannot read key file '#{kp}': #{e}")
+      end)
+      decode_motet_sync_key_bytes(raw)
+    None:
+      case key_env_opt
+        Some(ev):
+          v = try env.get(ev).or_fail(BadInput(message: "env var '#{ev}' is not set"))
+          decode_motet_sync_key_bytes(v.bytes)
+        None: Store.resolve_backup_key(db, env)
+      end
+  end
+end
+
+fn cmd_sync(
+  db: Store.DbHandle,
+  env: Env,
+  files: Files,
+  clock: Clock,
+  srng: SecureRandom,
+  console: Console,
+  rest: List(Text)
+) : Int
+  var pos = []
+  var json? = false
+  var include_internal? = false
+  var from_empty? = false
+  var encrypt? = false
+  var decrypt? = false
+  var key_file_opt = None
+  var key_env_opt = None
+  var key_id_opt = None
+  var aad_opt = None
+  var base_opt = None
+  var seq_opt = None
+  var hash_opt = None
+  var i = 0
+  while i < rest.size
+    tok = rest.get(i) or ""
+    if tok == "--json"
+      json? = true
+      i += 1
+    else if tok == "--include-internal"
+      include_internal? = true
+      i += 1
+    else if tok == "--from-empty"
+      from_empty? = true
+      i += 1
+    else if tok == "--encrypt"
+      encrypt? = true
+      i += 1
+    else if tok == "--decrypt"
+      decrypt? = true
+      i += 1
+    else if tok == "--key-file"
+      v = (rest.get(i + 1) or "").trim
+      if v.empty?
+        return print_err(console, BadInput(message: "--key-file requires a path"))
+      end
+      key_file_opt = Some(v)
+      i += 2
+    else if tok == "--key-env"
+      v = (rest.get(i + 1) or "").trim
+      if v.empty?
+        return print_err(console, BadInput(message: "--key-env requires a var name"))
+      end
+      key_env_opt = Some(v)
+      i += 2
+    else if tok == "--key-id"
+      key_id_opt = Some((rest.get(i + 1) or "").trim)
+      i += 2
+    else if tok == "--aad"
+      aad_opt = Some(rest.get(i + 1) or "")
+      i += 2
+    else if tok == "--base"
+      base_opt = Some((rest.get(i + 1) or "").trim)
+      i += 2
+    else if tok == "--seq"
+      v = (rest.get(i + 1) or "").trim
+      case v.to_int
+        Some(n): seq_opt = Some(n)
+        None: return print_err(console, BadInput(message: "invalid --seq integer: '#{v}'"))
+      end
+      i += 2
+    else if tok == "--hash"
+      hash_opt = Some((rest.get(i + 1) or "").trim)
+      i += 2
+    else
+      pos = pos.append(tok)
+      i += 1
+    end
+  end
+
+  sub = (pos.first or "").trim
+  now = clock.now
+  if sub == "peers"
+    return case Store.sync_list_peers(db)
+      Error(err): print_err(console, err)
+      Ok(peers):
+        if json?
+          console.print(Json.encode(peers.to_json))
+        else if peers.empty?
+          console.print("No sync peers registered.")
+        else
+          for p in peers
+            console.print(
+              "#{p.peer_id} acked_seq=#{p.acked_seq} acked_tx=#{p.acked_txid} internal=#{p
+                .include_internal?}"
+            )
+          end
+        end
+        0
+    end
+  else if sub == "init-peer"
+    pid = (pos.get(1) or "").trim
+    if pid.empty?
+      console.error("usage: motet sync init-peer <peer> [--include-internal] [--from-empty]")
+      return 2
+    end
+    return case Store.sync_init_peer(db, pid, include_internal?, from_empty?, now)
+      Error(err): print_err(console, err)
+      Ok(peer):
+        if json?
+          console.print(Json.encode(peer.to_json))
+        else
+          console.print("Motet sync init-peer ok peer=#{peer.peer_id} tx=#{peer.acked_txid}")
+        end
+        0
+    end
+  else if sub == "base-snapshot"
+    pid = (pos.get(1) or "").trim
+    out = (pos.get(2) or "").trim
+    if pid.empty? or out.empty?
+      console.error("usage: motet sync base-snapshot <peer> <out.json> [--encrypt]")
+      return 2
+    end
+    snap = case Store.sync_export_base_snapshot(db, pid, now)
+      Ok(s): s
+      Error(err): return print_err(console, err)
+    end
+    payload = if encrypt?
+      bkey = case resolve_cli_sync_key(db, files, env, key_file_opt, key_env_opt)
+        Ok(k): k
+        Error(err): return print_err(console, err)
+      end
+      senv = case Sync.seal_snapshot(
+        srng,
+        bkey,
+        key_id_opt or "motet-default",
+        aad_opt or "",
+        snap,
+        now
+      )
+        Ok(e): e
+        Error(se): return print_err(console, Store.sync_err(se))
+      end
+      Sync.encode_sealed_json(senv)
+    else
+      Export.encode_snapshot_json(snap)
+    end
+    return case files.write_text(out, payload)
+      Error(fe): print_err(console, StorageFailed(message: fe.to_text))
+      Ok(Unit):
+        console.print(
+          "Motet sync base-snapshot ok peer=#{pid} out=#{out} encrypted=#{encrypt?} entries=#{snap
+            .entry_count}"
+        )
+        0
+    end
+  else if sub == "export"
+    pid = (pos.get(1) or "").trim
+    out = (pos.get(2) or "").trim
+    if pid.empty? or out.empty?
+      console.error("usage: motet sync export <peer> <out.json> [--encrypt]")
+      return 2
+    end
+    delta = case Store.sync_export_delta(db, pid, now)
+      Ok(d): d
+      Error(err): return print_err(console, err)
+    end
+    payload = if encrypt?
+      bkey = case resolve_cli_sync_key(db, files, env, key_file_opt, key_env_opt)
+        Ok(k): k
+        Error(err): return print_err(console, err)
+      end
+      senv = case Sync.seal_delta(
+        srng,
+        bkey,
+        key_id_opt or "motet-default",
+        aad_opt or "",
+        delta,
+        now
+      )
+        Ok(e): e
+        Error(se): return print_err(console, Store.sync_err(se))
+      end
+      Sync.encode_sealed_json(senv)
+    else
+      Sync.encode_delta_json(delta)
+    end
+    return case files.write_text(out, payload)
+      Error(fe): print_err(console, StorageFailed(message: fe.to_text))
+      Ok(Unit):
+        if json?
+          console.print(
+            Json.encode(
+              Json.Object({
+                "ok": Json.Boolean(true),
+                "peer_id": Json.String(pid),
+                "seq": Json.int(delta.seq),
+                "delta_hash": Json.String(delta.delta_hash),
+                "ops": Json.int(delta.op_count),
+                "encrypted": Json.Boolean(encrypt?)
+              })
+            )
+          )
+        else
+          console.print(
+            "Motet sync export ok peer=#{pid} seq=#{delta.seq} ops=#{delta.op_count} encrypted=#{encrypt?} hash=#{delta
+              .delta_hash}"
+          )
+        end
+        0
+    end
+  else if sub == "ack"
+    pid = (pos.get(1) or "").trim
+    seq = case seq_opt
+      Some(s): s
+      None:
+        console.error("usage: motet sync ack <peer> --seq <N> --hash <hex>")
+        return 2
+    end
+    dhash = case hash_opt
+      Some(h) if not h.empty?: h
+      Some(_) | None:
+        console.error("usage: motet sync ack <peer> --seq <N> --hash <hex>")
+        return 2
+    end
+    return case Store.sync_ack_peer(db, pid, seq, dhash, now)
+      Error(err): print_err(console, err)
+      Ok(peer):
+        if json?
+          console.print(Json.encode(peer.to_json))
+        else
+          console.print("Motet sync ack ok peer=#{peer.peer_id} acked_seq=#{peer.acked_seq}")
+        end
+        0
+    end
+  else if sub == "apply"
+    dpath = (pos.get(1) or "").trim
+    if dpath.empty?
+      console.error("usage: motet sync apply <delta.json> [--decrypt]")
+      return 2
+    end
+    draw = case files.read_only.read_text(dpath)
+      Ok(s): s
+      Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
+    end
+    use_dec? = decrypt? or key_file_opt is Some(_) or key_env_opt is Some(_) or
+      draw.contains?("\"ciphertext_b64\"")
+    delta = if use_dec?
+      bkey = case resolve_cli_sync_key(db, files, env, key_file_opt, key_env_opt)
+        Ok(k): k
+        Error(err): return print_err(console, err)
+      end
+      senv = case Json.decode[SealedEnvelope](draw)
+        Ok(e): e
+        Error(je): return print_err(console, BadInput(message: "invalid sealed delta JSON: #{je}"))
+      end
+      case Sync.open_delta(bkey, aad_opt or "", senv)
+        Ok(d): d
+        Error(se): return print_err(console, Store.sync_err(se))
+      end
+    else
+      case Json.decode[SyncDelta](draw)
+        Ok(d): d
+        Error(je): return print_err(console, BadInput(message: "invalid delta JSON: #{je}"))
+      end
+    end
+    return case Store.sync_apply_delta(db, delta, now)
+      Error(err): print_err(console, err)
+      Ok(rep):
+        console.print(
+          "Motet sync apply ok peer=#{rep.peer_id} seq=#{rep.seq} puts=#{rep.puts_applied} dels=#{rep
+            .deletes_applied}"
+        )
+        0
+    end
+  else if sub == "remove-peer"
+    pid = (pos.get(1) or "").trim
+    if pid.empty?
+      console.error("usage: motet sync remove-peer <peer>")
+      return 2
+    end
+    return case Store.sync_remove_peer(db, pid)
+      Error(err): print_err(console, err)
+      Ok(Unit):
+        console.print("Motet sync remove-peer ok peer=#{pid}")
+        0
+    end
+  else if sub == "restore"
+    dst = (pos.get(1) or "").trim
+    bpath = case base_opt
+      Some(b) if not b.empty?: b
+      Some(_) | None:
+        console.error("usage: motet sync restore <dst.modb> --base <snap.json> [<delta1.json>...]")
+        return 2
+    end
+    if dst.empty?
+      console.error("usage: motet sync restore <dst.modb> --base <snap.json> [<delta1.json>...]")
+      return 2
+    end
+    braw = case files.read_only.read_text(bpath)
+      Ok(s): s
+      Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
+    end
+    use_dec? = decrypt? or key_file_opt is Some(_) or key_env_opt is Some(_) or
+      braw.contains?("\"ciphertext_b64\"")
+    dpaths = pos.drop(2)
+    rep = if use_dec?
+      bkey = case resolve_cli_sync_key(db, files, env, key_file_opt, key_env_opt)
+        Ok(k): k
+        Error(err): return print_err(console, err)
+      end
+      sbase = case Json.decode[SealedEnvelope](braw)
+        Ok(e): e
+        Error(je): return print_err(console, BadInput(message: "invalid sealed snapshot JSON: #{je}"))
+      end
+      var sdeltas = []
+      for dp in dpaths
+        draw = case files.read_only.read_text(dp)
+          Ok(s): s
+          Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
+        end
+        sd = case Json.decode[SealedEnvelope](draw)
+          Ok(e): e
+          Error(je): return print_err(console, BadInput(message: "invalid sealed delta '#{dp}': #{je}"))
+        end
+        sdeltas = sdeltas.append(sd)
+      end
+      case Sync.restore_sealed_chain(files, dst, sbase, sdeltas, bkey, aad_opt or "")
+        Ok(r): r
+        Error(se): return print_err(console, Store.sync_err(se))
+      end
+    else
+      bsnap = case Json.decode[Export.PortableSnapshot](braw)
+        Ok(s): s
+        Error(je): return print_err(console, BadInput(message: "invalid snapshot JSON: #{je}"))
+      end
+      var deltas = []
+      for dp in dpaths
+        draw = case files.read_only.read_text(dp)
+          Ok(s): s
+          Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
+        end
+        d = case Json.decode[SyncDelta](draw)
+          Ok(v): v
+          Error(je): return print_err(console, BadInput(message: "invalid delta '#{dp}': #{je}"))
+        end
+        deltas = deltas.append(d)
+      end
+      case Sync.restore_chain(files, dst, bsnap, deltas)
+        Ok(r): r
+        Error(se): return print_err(console, Store.sync_err(se))
+      end
+    end
+    if json?
+      console.print(Json.encode(rep.to_json))
+    else
+      console.print(
+        "Motet sync restore ok dst=#{rep.dst_path} final_tx=#{rep.final_txid} deltas=#{rep
+          .deltas_applied} puts=#{rep.puts_applied} pages=#{rep.page_count}"
+      )
+    end
+    return 0
+  end
+  console.error("usage: motet sync <init-peer|peers|base-snapshot|export|ack|apply|remove-peer|restore> ...")
+  2
+end
+
 fn main(
   args: Args,
   env: Env,
@@ -923,6 +1348,7 @@ fn main(
   return cmd_feeds(db, clock, console, rest) if head == "feeds"
   return cmd_taint(db, console, rest) if head == "taint"
   return cmd_erasures(db, console, rest) if head == "erasures"
+  return cmd_sync(db, env, files, clock, srng, console, rest) if head == "sync"
 
   if head == "tick"
     _drained = Brain.drain_queued_runs(rt, db, 10)
@@ -1109,4 +1535,85 @@ test "motet CLI initializes specialist roster, seals Vault API key, runs canonic
   c15 = Console.fake()
   assert main(Args.of(["erasures"]), env, c15, files, cmd, Network.fake({}), clock, srng) == 0
   assert (c15.printed.first or "").contains?("No verifiable erasure receipts recorded.")
+
+  # Milestone 16: encrypted `motet sync` CLI backup/delta/ack/restore/remove-peer workflow
+  sync_cli_env = Env.of({
+    "ANTHROPIC_API_KEY": "sk-test-anthropic",
+    "MODB_BACKUP_KEY_HEX": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+  })
+  c16a = Console.fake()
+  assert main(
+    Args.of(["sync", "init-peer", "cli-peer", "--include-internal"]),
+    sync_cli_env,
+    c16a,
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
+  assert (c16a.printed.first or "").contains?("cli-peer")
+
+  c16b = Console.fake()
+  assert main(
+    Args.of(["sync", "base-snapshot", "cli-peer", "cli-snap.enc.json", "--encrypt", "--aad", "m16"]),
+    sync_cli_env,
+    c16b,
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
+  assert files.read_only.exists?("cli-snap.enc.json")
+
+  c16c = Console.fake()
+  assert main(
+    Args.of(["sync", "export", "cli-peer", "cli-d1.enc.json", "--encrypt", "--aad", "m16", "--json"]),
+    sync_cli_env,
+    c16c,
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
+  assert Json.decode[Json](c16c.printed.join("\n").bytes) is Ok(ex_j)
+  dh = ex_j.text_at("delta_hash") or ""
+  assert not dh.empty?
+
+  assert main(
+    Args.of(["sync", "ack", "cli-peer", "--seq", "1", "--hash", dh]),
+    sync_cli_env,
+    Console.fake(),
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
+
+  c16d = Console.fake()
+  assert main(
+    Args.of(["sync", "restore", "cli-restored.modb", "--base", "cli-snap.enc.json", "cli-d1.enc.json", "--decrypt", "--aad", "m16"]),
+    sync_cli_env,
+    c16d,
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
+  assert (c16d.printed.first or "").contains?("deltas=1")
+
+  assert main(
+    Args.of(["sync", "remove-peer", "cli-peer"]),
+    sync_cli_env,
+    Console.fake(),
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
 end
