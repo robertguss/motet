@@ -69,14 +69,17 @@ fn print_usage(console: Console)
       "  motet feeds [poll <id> [--limit N]]              List reactive change feeds or poll O(diff) deltas",
       "  motet taint [--json]                             List Modb.Taint session taint trackers",
       "  motet erasures [--json]                          List Modb.Erasure verifiable receipts",
+      "  motet alert <message...>                         Send an owner Telegram alert via bot token",
       "  motet sync init-peer <peer> [--include-internal] [--from-empty] [--json]",
       "  motet sync peers [--json]",
       "  motet sync base-snapshot <peer> <out.json> [--encrypt] [--key-file <p>|--key-env <V>] [--key-id <id>] [--aad <t>]",
       "  motet sync export <peer> <out.json> [--encrypt] [--key-file <p>|--key-env <V>] [--key-id <id>] [--aad <t>] [--json]",
       "  motet sync ack <peer> --seq <N> --hash <hex> [--json]",
-      "  motet sync apply <delta.json> [--decrypt] [--key-file <p>|--key-env <V>] [--aad <t>] [--json]",
+      "  motet sync apply <delta.json> [--decrypt] [--key-file <p>|--key-env <V>|--keyring-file <p>|--keyring-env <V>] [--aad <t>] [--json]",
       "  motet sync remove-peer <peer>",
-      "  motet sync restore <dst.modb> --base <snap.json> [<delta1.json> ...] [--decrypt] [--key-file <p>|--key-env <V>] [--aad <t>] [--json]"
+      "  motet sync restore <dst.modb> --base <snap.json> [<delta1.json> ...] [--decrypt] [--key-file <p>|--key-env <V>|--keyring-file <p>|--keyring-env <V>] [--aad <t>] [--json]",
+      "  motet sync secrets-snapshot <out.json> [--encrypt] [--key-file <p>|--key-env <V>] [--key-id <id>] [--aad <t>] [--json]",
+      "  motet sync restore-secrets <dst.modb> <snap.json> [--decrypt] [--key-file <p>|--key-env <V>|--keyring-file <p>|--keyring-env <V>] [--aad <t>] [--json]"
     ].join("\n")
   )
 end
@@ -930,6 +933,310 @@ fn resolve_cli_sync_key(
   end
 end
 
+fn resolve_cli_sync_key_id(key_id_opt: Option(Text), env: Env) : Text
+  case key_id_opt
+    Some(id) if not id.trim.empty?: id.trim
+    Some(_) | None:
+      case env.get("MODB_BACKUP_KEY_ID")
+        Some(id) if not id.trim.empty?: id.trim
+        Some(_) | None: "motet-default"
+      end
+  end
+end
+
+fn resolve_cli_sync_keyring_opt(
+  db: Store.DbHandle,
+  files: Files,
+  env: Env,
+  keyring_file_opt: Option(Text),
+  keyring_env_opt: Option(Text),
+  key_file_opt: Option(Text),
+  key_env_opt: Option(Text),
+  key_id_opt: Option(Text)
+) : Result(Option(Map(Text, Bytes)), MotetError)
+  kr_opt = case keyring_file_opt
+    Some(kp):
+      raw = try files.read_only.read_text(kp).map_error(fn(e)
+        BadInput(message: "cannot read keyring file '#{kp}': #{e}")
+      end)
+      kr = try Sync.parse_keyring_text(raw).map_error(Store.sync_err)
+      Some(kr)
+    None:
+      case keyring_env_opt
+        Some(ev):
+          raw = try env.get(ev).or_fail(BadInput(message: "keyring env var '#{ev}' is not set"))
+          kr = try Sync.parse_keyring_text(raw).map_error(Store.sync_err)
+          Some(kr)
+        None:
+          if key_file_opt is Some(_) or key_env_opt is Some(_)
+            None
+          else
+            try Store.resolve_backup_keyring_opt(db, env)
+          end
+      end
+  end
+  case kr_opt
+    None: Ok(None)
+    Some(kr):
+      kid = resolve_cli_sync_key_id(key_id_opt, env)
+      if kr.get(kid) is None
+        case resolve_cli_sync_key(db, files, env, key_file_opt, key_env_opt)
+          Ok(active_k): return Ok(Some(kr.set(kid, active_k)))
+          Error(_): Unit
+        end
+      end
+      Ok(Some(kr))
+  end
+end
+
+fn cmd_sync_apply(
+  db: Store.DbHandle,
+  env: Env,
+  files: Files,
+  now: Time,
+  console: Console,
+  dpath: Text,
+  decrypt?: Bool,
+  key_file_opt: Option(Text),
+  key_env_opt: Option(Text),
+  keyring_file_opt: Option(Text),
+  keyring_env_opt: Option(Text),
+  key_id_opt: Option(Text),
+  aad_opt: Option(Text)
+) : Int
+  draw = case files.read_only.read_text(dpath)
+    Ok(s): s
+    Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
+  end
+  use_dec? = decrypt? or key_file_opt is Some(_) or key_env_opt is Some(_) or
+    keyring_file_opt is Some(_) or keyring_env_opt is Some(_) or
+    draw.contains?("\"ciphertext_b64\"")
+  delta = if use_dec?
+    kr_opt = case resolve_cli_sync_keyring_opt(
+      db,
+      files,
+      env,
+      keyring_file_opt,
+      keyring_env_opt,
+      key_file_opt,
+      key_env_opt,
+      key_id_opt
+    )
+      Ok(k): k
+      Error(err): return print_err(console, err)
+    end
+    senv = case Json.decode[SealedEnvelope](draw)
+      Ok(e): e
+      Error(je): return print_err(console, BadInput(message: "invalid sealed delta JSON: #{je}"))
+    end
+    case kr_opt
+      Some(kr):
+        case Sync.open_delta_with_keyring(kr, aad_opt or "", senv)
+          Ok(d): d
+          Error(se): return print_err(console, Store.sync_err(se))
+        end
+      None:
+        bkey = case resolve_cli_sync_key(db, files, env, key_file_opt, key_env_opt)
+          Ok(k): k
+          Error(err): return print_err(console, err)
+        end
+        case Sync.open_delta(bkey, aad_opt or "", senv)
+          Ok(d): d
+          Error(se): return print_err(console, Store.sync_err(se))
+        end
+    end
+  else
+    case Json.decode[SyncDelta](draw)
+      Ok(d): d
+      Error(je): return print_err(console, BadInput(message: "invalid delta JSON: #{je}"))
+    end
+  end
+  case Store.sync_apply_delta(db, delta, now)
+    Error(err): print_err(console, err)
+    Ok(rep):
+      console.print(
+        "Motet sync apply ok peer=#{rep.peer_id} seq=#{rep.seq} puts=#{rep.puts_applied} dels=#{rep
+          .deletes_applied}"
+      )
+      0
+  end
+end
+
+fn cmd_sync_restore_common(
+  db: Store.DbHandle,
+  env: Env,
+  files: Files,
+  console: Console,
+  json?: Bool,
+  decrypt?: Bool,
+  key_file_opt: Option(Text),
+  key_env_opt: Option(Text),
+  keyring_file_opt: Option(Text),
+  keyring_env_opt: Option(Text),
+  key_id_opt: Option(Text),
+  aad_opt: Option(Text),
+  dst: Text,
+  bpath: Text,
+  dpaths: List(Text),
+  secrets_mode?: Bool
+) : Int
+  braw = case files.read_only.read_text(bpath)
+    Ok(s): s
+    Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
+  end
+  use_dec? = decrypt? or key_file_opt is Some(_) or key_env_opt is Some(_) or
+    keyring_file_opt is Some(_) or keyring_env_opt is Some(_) or
+    braw.contains?("\"ciphertext_b64\"")
+  rep = if use_dec?
+    kr_opt = case resolve_cli_sync_keyring_opt(
+      db,
+      files,
+      env,
+      keyring_file_opt,
+      keyring_env_opt,
+      key_file_opt,
+      key_env_opt,
+      key_id_opt
+    )
+      Ok(k): k
+      Error(err): return print_err(console, err)
+    end
+    sbase = case Json.decode[SealedEnvelope](braw)
+      Ok(e): e
+      Error(je): return print_err(console, BadInput(message: "invalid sealed snapshot JSON: #{je}"))
+    end
+    var sdeltas = []
+    for dp in dpaths
+      draw = case files.read_only.read_text(dp)
+        Ok(s): s
+        Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
+      end
+      sd = case Json.decode[SealedEnvelope](draw)
+        Ok(e): e
+        Error(je): return print_err(console, BadInput(message: "invalid sealed delta '#{dp}': #{je}"))
+      end
+      sdeltas = sdeltas.append(sd)
+    end
+    case kr_opt
+      Some(kr):
+        case Sync.restore_sealed_chain_with_keyring(files, dst, sbase, sdeltas, kr, aad_opt or "")
+          Ok(r): r
+          Error(se): return print_err(console, Store.sync_err(se))
+        end
+      None:
+        bkey = case resolve_cli_sync_key(db, files, env, key_file_opt, key_env_opt)
+          Ok(k): k
+          Error(err): return print_err(console, err)
+        end
+        case Sync.restore_sealed_chain(files, dst, sbase, sdeltas, bkey, aad_opt or "")
+          Ok(r): r
+          Error(se): return print_err(console, Store.sync_err(se))
+        end
+    end
+  else
+    bsnap = case Json.decode[Export.PortableSnapshot](braw)
+      Ok(s): s
+      Error(je): return print_err(console, BadInput(message: "invalid snapshot JSON: #{je}"))
+    end
+    var deltas = []
+    for dp in dpaths
+      draw = case files.read_only.read_text(dp)
+        Ok(s): s
+        Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
+      end
+      d = case Json.decode[SyncDelta](draw)
+        Ok(v): v
+        Error(je): return print_err(console, BadInput(message: "invalid delta '#{dp}': #{je}"))
+      end
+      deltas = deltas.append(d)
+    end
+    case Sync.restore_chain(files, dst, bsnap, deltas)
+      Ok(r): r
+      Error(se): return print_err(console, Store.sync_err(se))
+    end
+  end
+  if json?
+    console.print(Json.encode(rep.to_json))
+  else if secrets_mode?
+    console.print(
+      "Motet sync restore-secrets ok dst=#{rep.dst_path} final_tx=#{rep.final_txid} puts=#{rep
+        .puts_applied} pages=#{rep.page_count}"
+    )
+  else
+    console.print(
+      "Motet sync restore ok dst=#{rep.dst_path} final_tx=#{rep.final_txid} deltas=#{rep
+        .deltas_applied} puts=#{rep.puts_applied} pages=#{rep.page_count}"
+    )
+  end
+  0
+end
+
+fn cmd_sync_secrets_snapshot(
+  db: Store.DbHandle,
+  env: Env,
+  files: Files,
+  now: Time,
+  srng: SecureRandom,
+  console: Console,
+  out: Text,
+  json?: Bool,
+  encrypt?: Bool,
+  key_file_opt: Option(Text),
+  key_env_opt: Option(Text),
+  key_id_opt: Option(Text),
+  aad_opt: Option(Text)
+) : Int
+  snap = case Store.export_secrets_snapshot(db, now)
+    Ok(s): s
+    Error(err): return print_err(console, err)
+  end
+  payload = if encrypt?
+    bkey = case resolve_cli_sync_key(db, files, env, key_file_opt, key_env_opt)
+      Ok(k): k
+      Error(err): return print_err(console, err)
+    end
+    senv = case Sync.seal_snapshot(
+      srng,
+      bkey,
+      resolve_cli_sync_key_id(key_id_opt, env),
+      aad_opt or "",
+      snap,
+      now
+    )
+      Ok(e): e
+      Error(se): return print_err(console, Store.sync_err(se))
+    end
+    Sync.encode_sealed_json(senv)
+  else
+    Export.encode_snapshot_json(snap)
+  end
+  case files.write_text(out, payload)
+    Error(fe): print_err(console, StorageFailed(message: fe.to_text))
+    Ok(Unit):
+      if json?
+        console.print(
+          Json.encode(
+            Json.Object({
+              "ok": Json.Boolean(true),
+              "out": Json.String(out),
+              "encrypted": Json.Boolean(encrypt?),
+              "txid": Json.int(snap.source_txid),
+              "buckets": Json.int(snap.bucket_count),
+              "entries": Json.int(snap.entry_count),
+              "sha256": Json.String(snap.sha256)
+            })
+          )
+        )
+      else
+        console.print(
+          "Motet sync secrets-snapshot ok out=#{out} encrypted=#{encrypt?} entries=#{snap
+            .entry_count}"
+        )
+      end
+      0
+  end
+end
+
 fn cmd_sync(
   db: Store.DbHandle,
   env: Env,
@@ -947,6 +1254,8 @@ fn cmd_sync(
   var decrypt? = false
   var key_file_opt = None
   var key_env_opt = None
+  var keyring_file_opt = None
+  var keyring_env_opt = None
   var key_id_opt = None
   var aad_opt = None
   var base_opt = None
@@ -983,6 +1292,20 @@ fn cmd_sync(
         return print_err(console, BadInput(message: "--key-env requires a var name"))
       end
       key_env_opt = Some(v)
+      i += 2
+    else if tok == "--keyring-file"
+      v = (rest.get(i + 1) or "").trim
+      if v.empty?
+        return print_err(console, BadInput(message: "--keyring-file requires a path"))
+      end
+      keyring_file_opt = Some(v)
+      i += 2
+    else if tok == "--keyring-env"
+      v = (rest.get(i + 1) or "").trim
+      if v.empty?
+        return print_err(console, BadInput(message: "--keyring-env requires a var name"))
+      end
+      keyring_env_opt = Some(v)
       i += 2
     else if tok == "--key-id"
       key_id_opt = Some((rest.get(i + 1) or "").trim)
@@ -1064,7 +1387,7 @@ fn cmd_sync(
       senv = case Sync.seal_snapshot(
         srng,
         bkey,
-        key_id_opt or "motet-default",
+        resolve_cli_sync_key_id(key_id_opt, env),
         aad_opt or "",
         snap,
         now
@@ -1104,7 +1427,7 @@ fn cmd_sync(
       senv = case Sync.seal_delta(
         srng,
         bkey,
-        key_id_opt or "motet-default",
+        resolve_cli_sync_key_id(key_id_opt, env),
         aad_opt or "",
         delta,
         now
@@ -1170,40 +1493,21 @@ fn cmd_sync(
       console.error("usage: motet sync apply <delta.json> [--decrypt]")
       return 2
     end
-    draw = case files.read_only.read_text(dpath)
-      Ok(s): s
-      Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
-    end
-    use_dec? = decrypt? or key_file_opt is Some(_) or key_env_opt is Some(_) or
-      draw.contains?("\"ciphertext_b64\"")
-    delta = if use_dec?
-      bkey = case resolve_cli_sync_key(db, files, env, key_file_opt, key_env_opt)
-        Ok(k): k
-        Error(err): return print_err(console, err)
-      end
-      senv = case Json.decode[SealedEnvelope](draw)
-        Ok(e): e
-        Error(je): return print_err(console, BadInput(message: "invalid sealed delta JSON: #{je}"))
-      end
-      case Sync.open_delta(bkey, aad_opt or "", senv)
-        Ok(d): d
-        Error(se): return print_err(console, Store.sync_err(se))
-      end
-    else
-      case Json.decode[SyncDelta](draw)
-        Ok(d): d
-        Error(je): return print_err(console, BadInput(message: "invalid delta JSON: #{je}"))
-      end
-    end
-    return case Store.sync_apply_delta(db, delta, now)
-      Error(err): print_err(console, err)
-      Ok(rep):
-        console.print(
-          "Motet sync apply ok peer=#{rep.peer_id} seq=#{rep.seq} puts=#{rep.puts_applied} dels=#{rep
-            .deletes_applied}"
-        )
-        0
-    end
+    return cmd_sync_apply(
+      db,
+      env,
+      files,
+      now,
+      console,
+      dpath,
+      decrypt?,
+      key_file_opt,
+      key_env_opt,
+      keyring_file_opt,
+      keyring_env_opt,
+      key_id_opt,
+      aad_opt
+    )
   else if sub == "remove-peer"
     pid = (pos.get(1) or "").trim
     if pid.empty?
@@ -1228,72 +1532,119 @@ fn cmd_sync(
       console.error("usage: motet sync restore <dst.modb> --base <snap.json> [<delta1.json>...]")
       return 2
     end
-    braw = case files.read_only.read_text(bpath)
-      Ok(s): s
-      Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
+    return cmd_sync_restore_common(
+      db,
+      env,
+      files,
+      console,
+      json?,
+      decrypt?,
+      key_file_opt,
+      key_env_opt,
+      keyring_file_opt,
+      keyring_env_opt,
+      key_id_opt,
+      aad_opt,
+      dst,
+      bpath,
+      pos.drop(2),
+      false
+    )
+  else if sub == "secrets-snapshot"
+    out = (pos.get(1) or "").trim
+    if out.empty?
+      console.error("usage: motet sync secrets-snapshot <out.json> [--encrypt] [--key-file <p>|--key-env <V>] [--key-id <id>] [--aad <t>] [--json]")
+      return 2
     end
-    use_dec? = decrypt? or key_file_opt is Some(_) or key_env_opt is Some(_) or
-      braw.contains?("\"ciphertext_b64\"")
-    dpaths = pos.drop(2)
-    rep = if use_dec?
-      bkey = case resolve_cli_sync_key(db, files, env, key_file_opt, key_env_opt)
-        Ok(k): k
-        Error(err): return print_err(console, err)
-      end
-      sbase = case Json.decode[SealedEnvelope](braw)
-        Ok(e): e
-        Error(je): return print_err(console, BadInput(message: "invalid sealed snapshot JSON: #{je}"))
-      end
-      var sdeltas = []
-      for dp in dpaths
-        draw = case files.read_only.read_text(dp)
-          Ok(s): s
-          Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
-        end
-        sd = case Json.decode[SealedEnvelope](draw)
-          Ok(e): e
-          Error(je): return print_err(console, BadInput(message: "invalid sealed delta '#{dp}': #{je}"))
-        end
-        sdeltas = sdeltas.append(sd)
-      end
-      case Sync.restore_sealed_chain(files, dst, sbase, sdeltas, bkey, aad_opt or "")
-        Ok(r): r
-        Error(se): return print_err(console, Store.sync_err(se))
-      end
-    else
-      bsnap = case Json.decode[Export.PortableSnapshot](braw)
-        Ok(s): s
-        Error(je): return print_err(console, BadInput(message: "invalid snapshot JSON: #{je}"))
-      end
-      var deltas = []
-      for dp in dpaths
-        draw = case files.read_only.read_text(dp)
-          Ok(s): s
-          Error(fe): return print_err(console, StorageFailed(message: fe.to_text))
-        end
-        d = case Json.decode[SyncDelta](draw)
-          Ok(v): v
-          Error(je): return print_err(console, BadInput(message: "invalid delta '#{dp}': #{je}"))
-        end
-        deltas = deltas.append(d)
-      end
-      case Sync.restore_chain(files, dst, bsnap, deltas)
-        Ok(r): r
-        Error(se): return print_err(console, Store.sync_err(se))
-      end
+    return cmd_sync_secrets_snapshot(
+      db,
+      env,
+      files,
+      now,
+      srng,
+      console,
+      out,
+      json?,
+      encrypt?,
+      key_file_opt,
+      key_env_opt,
+      key_id_opt,
+      aad_opt
+    )
+  else if sub == "restore-secrets"
+    dst = (pos.get(1) or "").trim
+    spath = (pos.get(2) or "").trim
+    if dst.empty? or spath.empty?
+      console.error("usage: motet sync restore-secrets <dst.modb> <snap.json> [--decrypt] [--key-file <p>|--key-env <V>|--keyring-file <p>|--keyring-env <V>] [--aad <t>] [--json]")
+      return 2
     end
-    if json?
-      console.print(Json.encode(rep.to_json))
-    else
-      console.print(
-        "Motet sync restore ok dst=#{rep.dst_path} final_tx=#{rep.final_txid} deltas=#{rep
-          .deltas_applied} puts=#{rep.puts_applied} pages=#{rep.page_count}"
-      )
-    end
-    return 0
+    return cmd_sync_restore_common(
+      db,
+      env,
+      files,
+      console,
+      json?,
+      decrypt?,
+      key_file_opt,
+      key_env_opt,
+      keyring_file_opt,
+      keyring_env_opt,
+      key_id_opt,
+      aad_opt,
+      dst,
+      spath,
+      [],
+      true
+    )
   end
-  console.error("usage: motet sync <init-peer|peers|base-snapshot|export|ack|apply|remove-peer|restore> ...")
+  console.error("usage: motet sync <init-peer|peers|base-snapshot|export|ack|apply|remove-peer|restore|secrets-snapshot|restore-secrets> ...")
   2
+end
+
+fn cmd_alert(
+  db: Store.DbHandle,
+  env: Env,
+  network: Network,
+  console: Console,
+  rest: List(Text)
+) : Int
+  msg = rest.join(" ").trim
+  if msg.empty?
+    console.error("usage: motet alert <message...>")
+    return 2
+  end
+  settings = case Store.get_settings(db)
+    Ok(s): s
+    Error(err): return print_err(console, err)
+  end
+  chat_id = if not settings.telegram_allowed_user_id.trim.empty?
+    settings.telegram_allowed_user_id.trim
+  else
+    case Store.resolve_secret(db, env, "TELEGRAM_ALLOWED_USER_ID")
+      Ok(Some(v)): v.trim
+      Ok(None) | Error(_): ""
+    end
+  end
+  if chat_id.empty?
+    return print_err(
+      console,
+      BadInput(message: "telegram_allowed_user_id is not configured for alerts")
+    )
+  end
+  token = case Store.resolve_secret(db, env, "TELEGRAM_BOT_TOKEN")
+    Ok(Some(t)): t.trim
+    Ok(None): ""
+    Error(err): return print_err(console, err)
+  end
+  if token.empty?
+    return print_err(console, BadInput(message: "TELEGRAM_BOT_TOKEN is not configured"))
+  end
+  case Telegram.send_message(network, token, chat_id, msg)
+    Ok(mid):
+      console.print("Motet alert sent message_id=#{mid}")
+      0
+    Error(err): print_err(console, err)
+  end
 end
 
 fn main(
@@ -1349,6 +1700,7 @@ fn main(
   return cmd_taint(db, console, rest) if head == "taint"
   return cmd_erasures(db, console, rest) if head == "erasures"
   return cmd_sync(db, env, files, clock, srng, console, rest) if head == "sync"
+  return cmd_alert(db, env, network, console, rest) if head == "alert"
 
   if head == "tick"
     _drained = Brain.drain_queued_runs(rt, db, 10)
@@ -1616,4 +1968,90 @@ test "motet CLI initializes specialist roster, seals Vault API key, runs canonic
     clock,
     srng
   ) == 0
+
+  # Keyring rotation + isolated secrets snapshot/restore + alert CLI tests
+  rot_cli_env = Env.of({
+    "ANTHROPIC_API_KEY": "sk-test-anthropic",
+    "MODB_BACKUP_KEY_HEX": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "MODB_BACKUP_KEY_ID": "rot-v2",
+    "MODB_BACKUP_KEYRING": "rot-v1=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "TELEGRAM_BOT_TOKEN": "tg-tok-alert",
+    "TELEGRAM_ALLOWED_USER_ID": "998877"
+  })
+  assert main(
+    Args.of(["sync", "init-peer", "rot-peer", "--include-internal"]),
+    rot_cli_env,
+    Console.fake(),
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
+  assert main(
+    Args.of(["sync", "base-snapshot", "rot-peer", "rot-snap.enc.json", "--encrypt", "--key-id", "rot-v1", "--key-env", "MODB_BACKUP_KEY_OLD", "--aad", "rot"]),
+    Env.of({
+      "ANTHROPIC_API_KEY": "sk-test-anthropic",
+      "MODB_BACKUP_KEY_OLD": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+    }),
+    Console.fake(),
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
+  assert main(
+    Args.of(["sync", "export", "rot-peer", "rot-d1.enc.json", "--encrypt", "--aad", "rot"]),
+    rot_cli_env,
+    Console.fake(),
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
+  assert main(
+    Args.of(["sync", "restore", "cli-rot-restored.modb", "--base", "rot-snap.enc.json", "rot-d1.enc.json", "--decrypt", "--aad", "rot", "--json"]),
+    rot_cli_env,
+    Console.fake(),
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
+  assert main(
+    Args.of(["sync", "secrets-snapshot", "cli-secrets.enc.json", "--encrypt", "--aad", "sec-aad", "--json"]),
+    rot_cli_env,
+    Console.fake(),
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
+  c_sec_r = Console.fake()
+  assert main(
+    Args.of(["sync", "restore-secrets", "cli-secrets-restored.modb", "cli-secrets.enc.json", "--decrypt", "--aad", "sec-aad", "--json"]),
+    rot_cli_env,
+    c_sec_r,
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) == 0
+  assert c_sec_r.printed.join("\n").contains?("cli-secrets-restored.modb")
+
+  alert_req = Http.post("https://api.telegram.org/bottg-tok-alert/sendMessage").json(
+    Json.Object({"chat_id": Json.String("998877"), "text": Json.String("Backup verify failed")})
+  ).within(25.seconds)
+  alert_net = Network.fake(
+    Http.replies([(alert_req, Http.reply(200, "{\"ok\":true,\"result\":{\"message_id\":77}}"))])
+  )
+  c_al = Console.fake()
+  assert main(Args.of(["alert", "Backup", "verify", "failed"]), rot_cli_env, c_al, files, cmd, alert_net, clock, srng) ==
+    0
+  assert (c_al.printed.first or "").contains?("message_id=77")
 end

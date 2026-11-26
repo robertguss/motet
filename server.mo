@@ -306,6 +306,7 @@ api
   post "/v1/modb/sync/peers" post_modb_sync_peers
   post "/v1/modb/sync/peers/:id/:action" post_modb_sync_peer_action
   delete "/v1/modb/sync/peers/:id" delete_modb_sync_peer
+  get "/v1/modb/backups/status" get_modb_backups_status
 
   post "/webhooks/:source" post_webhook
   post "/mcp" post_mcp
@@ -3136,10 +3137,18 @@ fn post_modb_sync_snapshot(
   snap = try Store.sync_export_base_snapshot(db, id.trim, clock.now)
   payload = if encrypt == Some(true)
     bkey = try Store.resolve_backup_key(db, env)
+    active_kid = case key_id
+      Some(k) if not k.trim.empty?: k.trim
+      Some(_) | None:
+        case env.get("MODB_BACKUP_KEY_ID")
+          Some(ek) if not ek.trim.empty?: ek.trim
+          Some(_) | None: "motet-default"
+        end
+    end
     senv = try Sync.seal_snapshot(
       srng,
       bkey,
-      key_id or "motet-default",
+      active_kid,
       aad or "",
       snap,
       clock.now
@@ -3166,10 +3175,18 @@ fn post_modb_sync_export(
   delta = try Store.sync_export_delta(db, id.trim, clock.now)
   payload = if encrypt == Some(true)
     bkey = try Store.resolve_backup_key(db, env)
+    active_kid = case key_id
+      Some(k) if not k.trim.empty?: k.trim
+      Some(_) | None:
+        case env.get("MODB_BACKUP_KEY_ID")
+          Some(ek) if not ek.trim.empty?: ek.trim
+          Some(_) | None: "motet-default"
+        end
+    end
     senv = try Sync.seal_delta(
       srng,
       bkey,
-      key_id or "motet-default",
+      active_kid,
       aad or "",
       delta,
       clock.now
@@ -3253,6 +3270,19 @@ fn post_modb_sync_peer_action(
   else
     Error(ItemNotFound(message: "unknown sync peer action '#{act}'"))
   end
+end
+
+## Reads scheduled encrypted backup & off-host DR status (`backups/encrypted/status.json`).
+fn get_modb_backups_status(_op: Operator, rf: ReadFiles, _clock: Clock) : Result(Json, MotetError)
+  path = "backups/encrypted/status.json"
+  if not rf.exists?(path)
+    return Ok(Json.Object({"configured?": Json.Boolean(false), "status": Json.Null}))
+  end
+  raw = try rf.read_text(path).map_error(fn(e) StorageFailed(message: e.to_text) end)
+  parsed = try Json.parse(raw).map_error(fn(e)
+    StorageFailed(message: "corrupt backup status.json: #{e}")
+  end)
+  Ok(Json.Object({"configured?": Json.Boolean(true), "status": parsed}))
 end
 
 ## Receives an external webhook payload with HMAC-SHA256 verification (when configured),
@@ -5711,4 +5741,33 @@ test "HTTP and MCP serve hybrid/BM25/semantic search, Vault Gemini reindex, and 
     srng
   )
   assert sy_dl.status == 200 and sy_dl.text.contains?("\"ok\":true")
+
+  bk_absent = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/backups/status").with_bearer("secret-op"),
+    files,
+    sync_env,
+    clock,
+    srng
+  )
+  assert bk_absent.status == 200 and bk_absent.text.contains?("\"configured?\":false")
+
+  _mk1 = files.make_folder("backups")
+  _mk2 = files.make_folder("backups/encrypted")
+  assert files.write_text(
+    "backups/encrypted/status.json",
+    "{\"generation\":\"gen-test\",\"acked_seq\":2,\"secrets_verified\":true,\"offhost_ok\":true}"
+  ) is
+    Ok(Unit)
+  bk_present = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/backups/status").with_bearer("secret-op"),
+    files,
+    sync_env,
+    clock,
+    srng
+  )
+  assert bk_present.status == 200 and
+    bk_present.text.contains?("\"configured?\":true") and
+    bk_present.text.contains?("\"gen-test\"")
 end

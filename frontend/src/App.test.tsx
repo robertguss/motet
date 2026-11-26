@@ -639,6 +639,38 @@ function mockFetch() {
         },
       ]);
     }
+    if (url.includes('/v1/modb/backups/status')) {
+      return json({
+        'configured?': true,
+        status: {
+          last_run_at: '2026-11-26T23:03:03Z',
+          peer_id: 'auto-backup',
+          generation: 'gen-20261126T230258Z',
+          action: 'delta_exported',
+          acked_seq: 1,
+          acked_txid: 46,
+          delta_count: 1,
+          last_export_ops: 3,
+          encrypted: true,
+          key_id: 'motet-auto-v1',
+          aad: 'motet-auto-backup',
+          secrets_aad: 'motet-secrets-auto',
+          secrets_backed_up: true,
+          secrets_verified: true,
+          secrets_entries: 8,
+          offhost_mode: 'git',
+          offhost_target: 'github-backups:robertguss/motet-encrypted-backups',
+          offhost_ok: true,
+          offhost_pushed_at: '2026-11-26T23:03:04Z',
+          retention_generations_kept: 1,
+          verified_this_run: true,
+          last_verified_at: '2026-11-26T23:03:03Z',
+          last_verified_txid: 46,
+          last_verified_audit_entries: 41,
+          last_error: null,
+        },
+      });
+    }
     if (url.includes('/v1/analytics')) {
       return json({
         day: '2026-11-25',
@@ -943,9 +975,13 @@ describe('Motet Control Plane Dashboard', () => {
       expect(screen.getByText('cohort=3 (min k=2)')).toBeInTheDocument();
     });
 
-    // Sync & Backups tab + two-phase peer init / encrypted snapshot / export delta / ack / remove
+    // Sync & Backups tab + Scheduled Off-Host DR Health + two-phase peer init / encrypted snapshot / export delta / ack / remove
     fireEvent.click(screen.getByText('Sync & Backups'));
     await waitFor(() => {
+      expect(screen.getByText('Scheduled Encrypted Backup & Off-Host DR Health')).toBeInTheDocument();
+      expect(screen.getByText('gen-20261126T230258Z')).toBeInTheDocument();
+      expect(screen.getByText('secrets verified (8)')).toBeInTheDocument();
+      expect(screen.getByText('off-host git ok')).toBeInTheDocument();
       expect(screen.getByText('Register Incremental Sync Peer (Modb.Sync)')).toBeInTheDocument();
       expect(screen.getByText('No sync peers registered')).toBeInTheDocument();
     });

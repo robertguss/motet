@@ -2,15 +2,15 @@
 set -euo pipefail
 umask 077
 
-# Hourly encrypted CoW-incremental backup + restore verification for Motet's live MoDB.
-# Uses `Modb.Sync` persistent two-phase root pins (`sync:auto-backup` / `sync_pending:auto-backup`)
-# with AES-256-GCM sealing (`MODB_BACKUP_KEY_HEX`) and periodic full `motet sync restore` + `modb verify`.
+# Hourly encrypted CoW-incremental backup, restore verification, Telegram failure alerting,
+# and fail-closed off-host ciphertext replication for Motet (`motet.modb` + `motet-secrets.modb`).
 
 STATE_DIR="${MOTET_STATE_DIR:-$HOME/.local/share/motet}"
 ENV_FILE="${MOTET_ENV_FILE:-$HOME/.config/motet/env}"
 PEER_ID="${MODB_BACKUP_PEER_ID:-auto-backup}"
 KEY_ID="${MODB_BACKUP_KEY_ID:-motet-auto-v1}"
 AAD="${MODB_BACKUP_AAD:-motet-auto-backup}"
+SECRETS_AAD="${MODB_BACKUP_SECRETS_AAD:-motet-secrets-auto}"
 RETENTION_GENS="${MODB_BACKUP_RETENTION_GENS:-4}"
 MAX_DELTAS_PER_GEN="${MODB_BACKUP_MAX_DELTAS:-168}"
 MAX_GEN_AGE_SEC="${MODB_BACKUP_MAX_GEN_AGE_SEC:-604800}"
@@ -41,25 +41,128 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "${MODB_BACKUP_KEY_HEX:-}" ] && [ -r "$ENV_FILE" ]; then
-  # Extract only MODB_BACKUP_KEY_HEX without echoing any secret values.
-  _key_line="$(grep -E '^(export[[:space:]]+)?MODB_BACKUP_KEY_HEX=' "$ENV_FILE" | tail -n 1 || true)"
-  if [ -n "$_key_line" ]; then
-    _key_val="${_key_line#*=}"
-    _key_val="${_key_val%\"}"
-    _key_val="${_key_val#\"}"
-    _key_val="${_key_val%\'}"
-    _key_val="${_key_val#\'}"
-    export MODB_BACKUP_KEY_HEX="$_key_val"
+load_env_var_if_unset() {
+  local var_name="$1"
+  local current_val="${!var_name:-}"
+  if [ -n "$current_val" ] || [ ! -r "$ENV_FILE" ]; then
+    return 0
   fi
-  unset _key_line _key_val
-fi
+  local raw_line=""
+  raw_line="$(grep -E "^(export[[:space:]]+)?${var_name}=" "$ENV_FILE" | tail -n 1 || true)"
+  if [ -n "$raw_line" ]; then
+    local val="${raw_line#*=}"
+    val="${val%\"}"
+    val="${val#\"}"
+    val="${val%\'}"
+    val="${val#\'}"
+    export "${var_name}=${val}"
+  fi
+}
 
+load_env_var_if_unset MODB_BACKUP_KEY_HEX
+load_env_var_if_unset MODB_BACKUP_KEYRING
+load_env_var_if_unset MODB_BACKUP_KEY_ID
+load_env_var_if_unset MODB_BACKUP_AAD
+load_env_var_if_unset MODB_BACKUP_SECRETS_AAD
+load_env_var_if_unset MODB_BACKUP_GIT_REMOTE
+load_env_var_if_unset MODB_BACKUP_RSYNC_DEST
+load_env_var_if_unset TELEGRAM_BOT_TOKEN
+load_env_var_if_unset TELEGRAM_ALLOWED_USER_ID
+
+# Re-evaluate overridable settings if loaded from ENV_FILE above.
+KEY_ID="${MODB_BACKUP_KEY_ID:-$KEY_ID}"
+AAD="${MODB_BACKUP_AAD:-$AAD}"
+SECRETS_AAD="${MODB_BACKUP_SECRETS_AAD:-$SECRETS_AAD}"
+
+BACKUP_ROOT="backups/encrypted"
+ABS_BACKUP_ROOT="$STATE_DIR/$BACKUP_ROOT"
+mkdir -p "$ABS_BACKUP_ROOT"
+chmod 700 "$ABS_BACKUP_ROOT"
+
+CUR_GEN=""
+ACKED_SEQ=0
+ACKED_TXID=0
+LAST_OPS=0
+SECRETS_BACKED_UP=0
+SECRETS_VERIFIED=0
+SECRETS_ENTRIES=0
+OFFHOST_MODE="local-only"
+OFFHOST_TARGET="local disk only"
+OFFHOST_OK=0
+OFFHOST_PUSHED_AT=""
+LAST_ERR_STAGE="init"
+
+TMP_RESTORE_REL=""
+TMP_SECRETS_REL=""
+cleanup() {
+  if [ -n "$TMP_RESTORE_REL" ]; then
+    rm -f "$STATE_DIR/$TMP_RESTORE_REL" "$STATE_DIR/${TMP_RESTORE_REL}.sync-restore.tmp" 2>/dev/null || true
+  fi
+  if [ -n "$TMP_SECRETS_REL" ]; then
+    rm -f "$STATE_DIR/$TMP_SECRETS_REL" "$STATE_DIR/${TMP_SECRETS_REL}.sync-restore.tmp" 2>/dev/null || true
+  fi
+  rm -f "$ABS_BACKUP_ROOT/.delta.tmp.json" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+write_error_status() {
+  local err_msg="$1"
+  python3 - "$ABS_BACKUP_ROOT" "$CUR_GEN" "$PEER_ID" "$KEY_ID" "$AAD" "$SECRETS_AAD" "$OFFHOST_MODE" "$OFFHOST_TARGET" "$err_msg" <<'PY' || true
+import datetime, json, os, sys
+abs_root, cur_gen, peer_id, key_id, aad, sec_aad, off_mode, off_target, err_msg = sys.argv[1:10]
+status_path = os.path.join(abs_root, "status.json")
+prev = {}
+if os.path.exists(status_path):
+    try:
+        with open(status_path, "r", encoding="utf-8") as fh:
+            prev = json.load(fh)
+    except Exception:
+        prev = {}
+now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+status = dict(prev)
+status.update({
+    "last_run_at": now_iso,
+    "peer_id": peer_id,
+    "generation": cur_gen or prev.get("generation", ""),
+    "action": "error",
+    "encrypted": True,
+    "key_id": key_id,
+    "aad": aad,
+    "secrets_aad": sec_aad,
+    "offhost_mode": off_mode,
+    "offhost_target": off_target,
+    "offhost_ok": False,
+    "verified_this_run": False,
+    "last_error": err_msg,
+})
+tmp = status_path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(status, fh, indent=2)
+    fh.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, status_path)
+PY
+}
+
+on_err() {
+  local rc="$1"
+  local lineno="$2"
+  trap - ERR
+  local msg="step='${LAST_ERR_STAGE}' exit=${rc} line=${lineno}"
+  echo "[motet-modb-backup] ERROR: $msg" >&2
+  write_error_status "$msg"
+  if [ -x "$MOTET_BIN" ]; then
+    (cd "$STATE_DIR" 2>/dev/null && "$MOTET_BIN" alert "[Motet Backup Alert] motet-modb-backup failed on $(hostname -s): ${msg}") >/dev/null 2>&1 || true
+  fi
+  exit "$rc"
+}
+trap 'on_err $? $LINENO' ERR
+
+LAST_ERR_STAGE="preflight"
 if [ -z "${MODB_BACKUP_KEY_HEX:-}" ]; then
   echo "[motet-modb-backup] ERROR: MODB_BACKUP_KEY_HEX is unset (check $ENV_FILE)" >&2
   exit 1
 fi
-
 if [ ! -x "$MOTET_BIN" ]; then
   echo "[motet-modb-backup] ERROR: motet binary not found/executable at $MOTET_BIN" >&2
   exit 1
@@ -73,11 +176,6 @@ if [ ! -f "$STATE_DIR/motet.modb" ]; then
   exit 1
 fi
 
-BACKUP_ROOT="backups/encrypted"
-ABS_BACKUP_ROOT="$STATE_DIR/$BACKUP_ROOT"
-mkdir -p "$ABS_BACKUP_ROOT"
-chmod 700 "$ABS_BACKUP_ROOT"
-
 LOCK_FILE="$ABS_BACKUP_ROOT/.backup.lock"
 exec 9>"$LOCK_FILE"
 if ! flock -w 30 9; then
@@ -85,17 +183,9 @@ if ! flock -w 30 9; then
   exit 1
 fi
 
-TMP_RESTORE_REL=""
-cleanup() {
-  if [ -n "$TMP_RESTORE_REL" ]; then
-    rm -f "$STATE_DIR/$TMP_RESTORE_REL" "$STATE_DIR/${TMP_RESTORE_REL}.sync-restore.tmp" 2>/dev/null || true
-  fi
-  rm -f "$ABS_BACKUP_ROOT/.delta.tmp.json" 2>/dev/null || true
-}
-trap cleanup EXIT
-
 cd "$STATE_DIR"
 
+LAST_ERR_STAGE="check_peers"
 PEERS_JSON="$("$MOTET_BIN" sync peers --json)"
 PEER_INFO="$(
   python3 - "$PEER_ID" "$PEERS_JSON" <<'PY'
@@ -111,7 +201,6 @@ PY
 )"
 IFS=$'\t' read -r PEER_EXISTS ACKED_SEQ ACKED_TXID <<< "$PEER_INFO"
 
-CUR_GEN=""
 if [ -r "$ABS_BACKUP_ROOT/current.txt" ]; then
   CUR_GEN="$(tr -d '[:space:]' < "$ABS_BACKUP_ROOT/current.txt")"
 fi
@@ -139,9 +228,9 @@ fi
 
 ACTION=""
 SHOULD_VERIFY=0
-LAST_OPS=0
 
 if [ "$NEED_NEW_GEN" -eq 1 ]; then
+  LAST_ERR_STAGE="new_generation"
   TS_SLUG="$(date -u +%Y%m%dT%H%M%SZ)"
   GEN_NAME="gen-$TS_SLUG"
   SUF=1
@@ -168,13 +257,14 @@ PY
   "$MOTET_BIN" sync base-snapshot "$PEER_ID" "$REL_BASE" --encrypt --key-id "$KEY_ID" --aad "$AAD" >/dev/null
   chmod 600 "$STATE_DIR/$REL_BASE"
 
-  python3 - "$ABS_BACKUP_ROOT/$GEN_NAME/meta.json" "$PEER_ID" "$KEY_ID" "$AAD" "$ACKED_TXID" <<'PY'
-import datetime, json, sys, time
-out_path, pid, key_id, aad, txid = sys.argv[1:6]
+  python3 - "$ABS_BACKUP_ROOT/$GEN_NAME/meta.json" "$PEER_ID" "$KEY_ID" "$AAD" "$SECRETS_AAD" "$ACKED_TXID" <<'PY'
+import datetime, json, os, sys, time
+out_path, pid, key_id, aad, sec_aad, txid = sys.argv[1:7]
 meta = {
     "peer_id": pid,
     "key_id": key_id,
     "aad": aad,
+    "secrets_aad": sec_aad,
     "base_file": "base.enc.json",
     "base_txid": int(txid),
     "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -184,7 +274,6 @@ tmp = out_path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
     json.dump(meta, fh, indent=2)
     fh.write("\n")
-import os
 os.chmod(tmp, 0o600)
 os.replace(tmp, out_path)
 PY
@@ -211,6 +300,7 @@ if len(gens) > keep_s:
             shutil.rmtree(os.path.join(root, g), ignore_errors=True)
 PY
 else
+  LAST_ERR_STAGE="export_delta"
   REL_TMP_DELTA="$BACKUP_ROOT/.delta.tmp.json"
   rm -f "$STATE_DIR/$REL_TMP_DELTA"
   EXPORT_JSON="$("$MOTET_BIN" sync export "$PEER_ID" "$REL_TMP_DELTA" --encrypt --key-id "$KEY_ID" --aad "$AAD" --json)"
@@ -244,6 +334,55 @@ PY
   fi
 fi
 
+# Back up isolated motet-secrets.modb whenever missing in current generation or changed on disk.
+LAST_ERR_STAGE="secrets_snapshot"
+REL_SECRETS="$BACKUP_ROOT/$CUR_GEN/secrets.enc.json"
+ABS_SECRETS_SNAP="$STATE_DIR/$REL_SECRETS"
+if [ -f "$STATE_DIR/motet-secrets.modb" ]; then
+  SECRETS_SHA256="$(sha256sum "$STATE_DIR/motet-secrets.modb" | awk '{print $1}')"
+  PREV_SECRETS_INFO="$(
+    python3 - "$ABS_BACKUP_ROOT/$CUR_GEN/meta.json" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        m = json.load(fh)
+    print(f"{m.get('secrets_sha256', '')}\t{int(m.get('secrets_entries', 0))}")
+except Exception:
+    print("\t0")
+PY
+  )"
+  IFS=$'\t' read -r STORED_SEC_SHA SECRETS_ENTRIES <<< "$PREV_SECRETS_INFO"
+  if [ ! -f "$ABS_SECRETS_SNAP" ] || [ "$SECRETS_SHA256" != "$STORED_SEC_SHA" ]; then
+    SEC_OUT_JSON="$("$MOTET_BIN" sync secrets-snapshot "$REL_SECRETS" --encrypt --key-id "$KEY_ID" --aad "$SECRETS_AAD" --json)"
+    chmod 600 "$ABS_SECRETS_SNAP"
+    SECRETS_ENTRIES="$(
+      python3 - "$SEC_OUT_JSON" <<'PY'
+import json, sys
+print(int(json.loads(sys.argv[1]).get("entries", 0)))
+PY
+    )"
+    python3 - "$ABS_BACKUP_ROOT/$CUR_GEN/meta.json" "$SECRETS_SHA256" "$SECRETS_ENTRIES" "$SECRETS_AAD" <<'PY'
+import datetime, json, os, sys
+meta_path, sec_sha, sec_entries_s, sec_aad = sys.argv[1:5]
+with open(meta_path, "r", encoding="utf-8") as fh:
+    meta = json.load(fh)
+meta["secrets_file"] = "secrets.enc.json"
+meta["secrets_sha256"] = sec_sha
+meta["secrets_entries"] = int(sec_entries_s)
+meta["secrets_aad"] = sec_aad
+meta["secrets_updated_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+tmp = meta_path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(meta, fh, indent=2)
+    fh.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, meta_path)
+PY
+    SHOULD_VERIFY=1
+  fi
+  SECRETS_BACKED_UP=1
+fi
+
 if [ "$FORCE_VERIFY" -eq 1 ]; then
   SHOULD_VERIFY=1
 fi
@@ -252,6 +391,7 @@ VERIFIED_RESTORE=0
 VERIFIED_TXID=0
 VERIFIED_AUDIT=0
 if [ "$SHOULD_VERIFY" -eq 1 ]; then
+  LAST_ERR_STAGE="verify_restore"
   TMP_RESTORE_REL="$BACKUP_ROOT/.verify-${CUR_GEN}.modb"
   rm -f "$STATE_DIR/$TMP_RESTORE_REL" "$STATE_DIR/${TMP_RESTORE_REL}.sync-restore.tmp"
   REL_BASE="$BACKUP_ROOT/$CUR_GEN/base.enc.json"
@@ -277,15 +417,146 @@ if not ok:
 print(f"1 {int(v.get('txid', 0))} {int(v.get('audit_entries', 0))}")
 PY
   )"
+
+  if [ -f "$ABS_SECRETS_SNAP" ]; then
+    LAST_ERR_STAGE="verify_restore_secrets"
+    TMP_SECRETS_REL="$BACKUP_ROOT/.verify-${CUR_GEN}-secrets.modb"
+    rm -f "$STATE_DIR/$TMP_SECRETS_REL" "$STATE_DIR/${TMP_SECRETS_REL}.sync-restore.tmp"
+    SEC_REST_JSON="$("$MOTET_BIN" sync restore-secrets "$TMP_SECRETS_REL" "$REL_SECRETS" --decrypt --aad "$SECRETS_AAD" --json)"
+    python3 - "$SEC_REST_JSON" <<'PY'
+import json, sys
+r = json.loads(sys.argv[1])
+if int(r.get("final_txid", 0)) < 1:
+    sys.stderr.write(f"unexpected restored secrets final_txid: {r}\n")
+    sys.exit(1)
+PY
+    rm -f "$STATE_DIR/$TMP_SECRETS_REL" "$STATE_DIR/${TMP_SECRETS_REL}.sync-restore.tmp"
+    TMP_SECRETS_REL=""
+    SECRETS_VERIFIED=1
+  fi
 fi
 
-python3 - "$ABS_BACKUP_ROOT" "$CUR_GEN" "$PEER_ID" "$KEY_ID" "$AAD" "$ACTION" "$ACKED_SEQ" "$ACKED_TXID" "$LAST_OPS" "$VERIFIED_RESTORE" "$VERIFIED_TXID" "$VERIFIED_AUDIT" <<'PY'
+# Fail-closed ciphertext assertion + off-host replication (Git / Rsync).
+if [ -n "${MODB_BACKUP_GIT_REMOTE:-}" ] || [ -d "$ABS_BACKUP_ROOT/.git" ]; then
+  LAST_ERR_STAGE="offhost_git_verify"
+  python3 - "$ABS_BACKUP_ROOT" <<'PY'
+import glob, json, os, sys
+root = sys.argv[1]
+enc_files = sorted(glob.glob(os.path.join(root, "gen-*", "*.enc.json")))
+if not enc_files:
+    sys.stderr.write("no encrypted *.enc.json artifacts found under generations\n")
+    sys.exit(1)
+for fp in enc_files:
+    with open(fp, "r", encoding="utf-8") as fh:
+        obj = json.load(fh)
+    if (
+        not isinstance(obj, dict)
+        or obj.get("format_version") != 1
+        or obj.get("alg") != "AES-256-GCM"
+        or obj.get("kind") not in ("snapshot", "delta")
+        or not obj.get("nonce_b64")
+        or not obj.get("ciphertext_b64")
+        or "buckets" in obj
+        or "payload_hash" in obj
+        or "sha256" in obj
+    ):
+        sys.stderr.write(f"refusing unsealed or malformed backup file before push: {fp}\n")
+        sys.exit(1)
+PY
+
+  LAST_ERR_STAGE="offhost_git_push"
+  cat > "$ABS_BACKUP_ROOT/.gitignore.tmp" <<'EOF'
+status.json
+status.json.tmp
+.backup.lock
+.verify-*
+.delta.tmp.json
+*.tmp
+*.modb
+*.modb.*
+EOF
+  chmod 600 "$ABS_BACKUP_ROOT/.gitignore.tmp"
+  mv "$ABS_BACKUP_ROOT/.gitignore.tmp" "$ABS_BACKUP_ROOT/.gitignore"
+
+  if [ ! -d "$ABS_BACKUP_ROOT/.git" ]; then
+    git -C "$ABS_BACKUP_ROOT" init -b main >/dev/null
+    git -C "$ABS_BACKUP_ROOT" config user.name "Motet Backup"
+    git -C "$ABS_BACKUP_ROOT" config user.email "motet-backup@local"
+  fi
+  REMOTE_URL="${MODB_BACKUP_GIT_REMOTE:-}"
+  if [ -n "$REMOTE_URL" ]; then
+    if git -C "$ABS_BACKUP_ROOT" remote get-url origin >/dev/null 2>&1; then
+      CUR_REMOTE="$(git -C "$ABS_BACKUP_ROOT" remote get-url origin)"
+      if [ "$CUR_REMOTE" != "$REMOTE_URL" ]; then
+        git -C "$ABS_BACKUP_ROOT" remote set-url origin "$REMOTE_URL"
+      fi
+    else
+      git -C "$ABS_BACKUP_ROOT" remote add origin "$REMOTE_URL"
+    fi
+  else
+    REMOTE_URL="$(git -C "$ABS_BACKUP_ROOT" remote get-url origin 2>/dev/null || echo "")"
+  fi
+
+  git -C "$ABS_BACKUP_ROOT" add -A -- .gitignore current.txt gen-*
+  PUSH_RAN=0
+  if ! git -C "$ABS_BACKUP_ROOT" diff --cached --quiet; then
+    git -C "$ABS_BACKUP_ROOT" commit -m "backup: ${CUR_GEN} seq=${ACKED_SEQ} tx=${ACKED_TXID}" >/dev/null
+    git -C "$ABS_BACKUP_ROOT" push -u origin main >/dev/null 2>&1
+    PUSH_RAN=1
+  elif git -C "$ABS_BACKUP_ROOT" rev-parse --verify origin/main >/dev/null 2>&1; then
+    AHEAD_CNT="$(git -C "$ABS_BACKUP_ROOT" rev-list --count origin/main..HEAD)"
+    if [ "$AHEAD_CNT" -gt 0 ]; then
+      git -C "$ABS_BACKUP_ROOT" push origin main >/dev/null 2>&1
+      PUSH_RAN=1
+    fi
+  else
+    git -C "$ABS_BACKUP_ROOT" push -u origin main >/dev/null 2>&1
+    PUSH_RAN=1
+  fi
+
+  OFFHOST_MODE="git"
+  # Strip any embedded credentials if user ever configures https URL with userinfo.
+  OFFHOST_TARGET="$(
+    python3 - "$REMOTE_URL" <<'PY'
+import re, sys
+u = sys.argv[1].strip()
+u = re.sub(r'://[^/@]+@', '://***@', u)
+u = re.sub(r'^git@', '', u)
+print(u or "origin")
+PY
+  )"
+  OFFHOST_OK=1
+  if [ "$PUSH_RAN" -eq 1 ]; then
+    OFFHOST_PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
+elif [ -n "${MODB_BACKUP_RSYNC_DEST:-}" ]; then
+  LAST_ERR_STAGE="offhost_rsync"
+  rsync -az --delete \
+    --exclude 'status.json' \
+    --exclude 'status.json.tmp' \
+    --exclude '.backup.lock' \
+    --exclude '.verify-*' \
+    --exclude '.delta.tmp.json' \
+    --exclude '*.tmp' \
+    --exclude '*.modb' \
+    --exclude '*.modb.*' \
+    "$ABS_BACKUP_ROOT/" "$MODB_BACKUP_RSYNC_DEST/" >/dev/null
+  OFFHOST_MODE="rsync"
+  OFFHOST_TARGET="$MODB_BACKUP_RSYNC_DEST"
+  OFFHOST_OK=1
+  OFFHOST_PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
+
+LAST_ERR_STAGE="write_status"
+python3 - "$ABS_BACKUP_ROOT" "$CUR_GEN" "$PEER_ID" "$KEY_ID" "$AAD" "$SECRETS_AAD" "$ACTION" "$ACKED_SEQ" "$ACKED_TXID" "$LAST_OPS" "$VERIFIED_RESTORE" "$VERIFIED_TXID" "$VERIFIED_AUDIT" "$SECRETS_BACKED_UP" "$SECRETS_VERIFIED" "$SECRETS_ENTRIES" "$OFFHOST_MODE" "$OFFHOST_TARGET" "$OFFHOST_OK" "$OFFHOST_PUSHED_AT" <<'PY'
 import datetime, json, os, sys
 (
-    abs_root, cur_gen, peer_id, key_id, aad, action,
+    abs_root, cur_gen, peer_id, key_id, aad, sec_aad, action,
     acked_seq_s, acked_txid_s, last_ops_s,
-    ver_ok_s, ver_tx_s, ver_audit_s
-) = sys.argv[1:13]
+    ver_ok_s, ver_tx_s, ver_audit_s,
+    sec_up_s, sec_ver_s, sec_ent_s,
+    off_mode, off_target, off_ok_s, off_pushed_at
+) = sys.argv[1:21]
 gen_dir = os.path.join(abs_root, cur_gen)
 deltas = sorted(f for f in os.listdir(gen_dir) if f.endswith(".delta.enc.json"))
 gens = sorted(d for d in os.listdir(abs_root) if d.startswith("gen-") and os.path.isdir(os.path.join(abs_root, d)))
@@ -299,6 +570,9 @@ if os.path.exists(status_path):
         prev = {}
 now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 ver_ok = ver_ok_s == "1"
+sec_up = sec_up_s == "1"
+sec_ver = (sec_ver_s == "1") or (sec_up and bool(prev.get("secrets_verified", False)) and prev.get("generation") == cur_gen)
+off_ok = off_ok_s == "1"
 status = {
     "last_run_at": now_iso,
     "peer_id": peer_id,
@@ -311,11 +585,20 @@ status = {
     "encrypted": True,
     "key_id": key_id,
     "aad": aad,
+    "secrets_aad": sec_aad,
+    "secrets_backed_up": sec_up,
+    "secrets_verified": sec_ver,
+    "secrets_entries": int(sec_ent_s),
+    "offhost_mode": off_mode,
+    "offhost_target": off_target,
+    "offhost_ok": off_ok,
+    "offhost_pushed_at": off_pushed_at or prev.get("offhost_pushed_at"),
     "retention_generations_kept": len(gens),
     "verified_this_run": ver_ok,
     "last_verified_at": now_iso if ver_ok else prev.get("last_verified_at"),
     "last_verified_txid": int(ver_tx_s) if ver_ok else prev.get("last_verified_txid"),
     "last_verified_audit_entries": int(ver_audit_s) if ver_ok else prev.get("last_verified_audit_entries"),
+    "last_error": None,
 }
 tmp = status_path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
@@ -325,4 +608,4 @@ os.chmod(tmp, 0o600)
 os.replace(tmp, status_path)
 PY
 
-echo "[motet-modb-backup] ok gen=$CUR_GEN action=$ACTION seq=$ACKED_SEQ tx=$ACKED_TXID ops=$LAST_OPS verified=$VERIFIED_RESTORE verify_tx=$VERIFIED_TXID audit=$VERIFIED_AUDIT"
+echo "[motet-modb-backup] ok gen=$CUR_GEN action=$ACTION seq=$ACKED_SEQ tx=$ACKED_TXID ops=$LAST_OPS verified=$VERIFIED_RESTORE verify_tx=$VERIFIED_TXID audit=$VERIFIED_AUDIT secrets_ok=$SECRETS_BACKED_UP secrets_verified=$SECRETS_VERIFIED offhost=$OFFHOST_MODE:$OFFHOST_OK"

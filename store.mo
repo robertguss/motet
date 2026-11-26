@@ -240,7 +240,9 @@ sync_export_delta,
 sync_ack_peer,
 sync_apply_delta,
 sync_remove_peer,
-resolve_backup_key
+resolve_backup_key,
+resolve_backup_keyring_opt,
+export_secrets_snapshot
 use Crypto
 use Http
 use Json
@@ -983,9 +985,9 @@ fn sync_err(e: Sync.SyncError) : MotetError
     ): Conflict(message: Sync.to_text(e))
     Sync.InvalidPeerId(peer_id: _) | Sync.InvalidDelta(reason: _) | Sync.InvalidEnvelope(
       reason: _
-    ) | Sync.InvalidKeyLength(expected: _, got: _) | Sync.TargetExists(path: _): BadInput(
-      message: Sync.to_text(e)
-    )
+    ) | Sync.InvalidKeyLength(expected: _, got: _) | Sync.TargetExists(path: _) | Sync.KeyNotFound(
+      key_id: _
+    ): BadInput(message: Sync.to_text(e))
     Sync.DecryptionFailed: PolicyDenied(message: Sync.to_text(e))
     Sync.StorageFailure(me): modb_err(me)
     Sync.TableFailure(te): table_err(te)
@@ -8190,6 +8192,62 @@ fn resolve_backup_key(db: DbHandle, env: Env) : Result(Bytes, MotetError)
   end
 end
 
+## Resolves an optional rotated-key keyring from `MODB_BACKUP_KEYRING`, merging the active
+## `MODB_BACKUP_KEY_HEX` under `MODB_BACKUP_KEY_ID` if missing. Returns `None` if unset.
+fn resolve_backup_keyring_opt(db: DbHandle, env: Env) : Result(
+  Option(Map(Text, Bytes)),
+  MotetError
+)
+  base_opt = case env.get("MODB_BACKUP_KEYRING")
+    Some(raw) if not raw.trim.empty?:
+      kr = try Sync.parse_keyring_text(raw).map_error(sync_err)
+      Some(kr)
+    Some(_) | None: None
+  end
+  case base_opt
+    None: Ok(None)
+    Some(kr):
+      kid = case env.get("MODB_BACKUP_KEY_ID")
+        Some(k) if not k.trim.empty?: k.trim
+        Some(_) | None: "motet-default"
+      end
+      if kr.get(kid) is None
+        case resolve_backup_key(db, env)
+          Ok(active_k): return Ok(Some(kr.set(kid, active_k)))
+          Error(_): Unit
+        end
+      end
+      Ok(Some(kr))
+  end
+end
+
+## Exports a layout-independent SHA-256 `PortableSnapshot` of isolated `motet-secrets.modb`.
+## Returns a verified empty snapshot if the secrets file has not been initialized yet.
+fn export_secrets_snapshot(db: DbHandle, now: Time) : Result(PortableSnapshot, MotetError)
+  if not db.files.read_only.exists?(db.secrets_path)
+    digest = Export.compute_snapshot_digest(1, 1, 0, true, now, [])
+    return Ok(
+      PortableSnapshot(
+        format_version: 1,
+        source_txid: 1,
+        schema_version: 0,
+        include_internal: true,
+        exported_at: now,
+        bucket_count: 0,
+        entry_count: 0,
+        buckets: [],
+        sha256: digest
+      )
+    )
+  end
+  Modb.with_shared_lock(
+    db.files.read_only,
+    db.secrets_path,
+    modb_err,
+    fn(st) Export.export_store(st, true, now).map_error(export_err) end
+  )
+end
+
 fn sync_init_peer(
   db: DbHandle,
   peer_id: Text,
@@ -10016,5 +10074,36 @@ test "Milestone 12: sensitivity policy, governed export, agent proposals & react
   assert Ledger.open(files, "motet-restored.modb", motet_schema(), t0) is Ok(rest_ldb) and
     Ledger.verify_all(rest_ldb) is Ok(_)
   assert sync_remove_peer(db, "offsite-s3") is Ok(Unit)
+
+  # Keyring rotation + isolated secrets_path (`motet-secrets.modb`) backup/restore verification
+  rot_env = Env.of({
+    "MOTET_MASTER_KEY": "store-rot-master-key",
+    "MODB_BACKUP_KEY_HEX": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "MODB_BACKUP_KEY_ID": "rot-v2",
+    "MODB_BACKUP_KEYRING": "env-hex=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+  })
+  assert resolve_backup_keyring_opt(db, rot_env) is Ok(Some(kr_map)) and
+    kr_map.get("env-hex") is Some(_) and
+    kr_map.get("rot-v2") is Some(_)
+  assert export_secrets_snapshot(db, t0) is Ok(sec_empty) and sec_empty.entry_count == 0
+  assert save_vault_secret(db, rot_env, srng, "ROT_TEST_SECRET", "backup", "top-secret-42", t0.to_text) is
+    Ok(_)
+  assert export_secrets_snapshot(db, t0) is Ok(sec_snap) and sec_snap.entry_count >= 1
+  assert resolve_backup_key(db, rot_env) is Ok(bkey2)
+  assert Sync.seal_snapshot(srng, bkey2, "rot-v2", "motet-secrets-test", sec_snap, t0) is
+    Ok(sec_enc)
+  assert Sync.restore_sealed_chain_with_keyring(
+    files,
+    "motet-secrets-restored.modb",
+    sec_enc,
+    [],
+    kr_map,
+    "motet-secrets-test"
+  ) is
+    Ok(sec_rep) and
+    sec_rep.base_txid == sec_snap.source_txid
+  assert Modb.open_read_only(files.read_only, "motet-secrets-restored.modb") is Ok(sec_rest_st) and
+    Modb.verify(sec_rest_st) is Ok(_)
+
   assert verify_all(db) is Ok(vrep3) and vrep3.ok? and vrep3.secrets_ok?
 end

@@ -854,6 +854,39 @@ export interface ModbSyncDelta {
   delta_hash: string;
 }
 
+export interface ModbBackupStatusSnapshot {
+  last_run_at: string;
+  peer_id: string;
+  generation: string;
+  action: string;
+  acked_seq: number;
+  acked_txid: number;
+  delta_count: number;
+  last_export_ops: number;
+  encrypted: boolean;
+  key_id: string;
+  aad: string;
+  secrets_aad?: string | null;
+  secrets_backed_up?: boolean;
+  secrets_verified?: boolean;
+  secrets_entries?: number;
+  offhost_mode?: string | null;
+  offhost_target?: string | null;
+  offhost_ok?: boolean;
+  offhost_pushed_at?: string | null;
+  retention_generations_kept: number;
+  verified_this_run: boolean;
+  last_verified_at?: string | null;
+  last_verified_txid?: number | null;
+  last_verified_audit_entries?: number | null;
+  last_error?: string | null;
+}
+
+export interface ModbBackupStatusResponse {
+  'configured?': boolean;
+  status: ModbBackupStatusSnapshot | null;
+}
+
 export function getStoredToken(): string {
   return localStorage.getItem('motet_token') || '';
 }

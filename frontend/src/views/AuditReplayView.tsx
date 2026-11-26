@@ -24,6 +24,7 @@ import {
   api,
   apiOptional,
   ModbAuditEntry,
+  ModbBackupStatusResponse,
   ModbBucketRowDiff,
   ModbCallRecord,
   ModbClaim,
@@ -326,6 +327,7 @@ export const AuditReplayView: React.FC<{
   const [matQueryResult, setMatQueryResult] = useState<ModbMatQueryResult | null>(null);
 
   // Sync & Encrypted Off-Host Backups state (Milestone 16)
+  const [backupStatus, setBackupStatus] = useState<ModbBackupStatusResponse | null>(null);
   const [syncPeers, setSyncPeers] = useState<ModbSyncPeer[]>([]);
   const [newPeerId, setNewPeerId] = useState('offsite-backup');
   const [newPeerIncludeInternal, setNewPeerIncludeInternal] = useState(true);
@@ -438,7 +440,7 @@ export const AuditReplayView: React.FC<{
         }),
         apiOptional<ModbReadLogEntry[]>('/v1/modb/reads', []),
       ]);
-      const [polOv, gProps, fds, tSess, erRecs, mvs, sPeers] = await Promise.all([
+      const [polOv, gProps, fds, tSess, erRecs, mvs, sPeers, bkStat] = await Promise.all([
         apiOptional<ModbPolicyOverview | null>('/v1/modb/policy', null),
         apiOptional<ModbGovProposal[]>('/v1/modb/proposals', []),
         apiOptional<ModbFeedSubscription[]>('/v1/modb/feeds', []),
@@ -446,6 +448,7 @@ export const AuditReplayView: React.FC<{
         apiOptional<ModbErasureReceipt[]>('/v1/modb/erasures', []),
         apiOptional<ModbMatViewMeta[]>('/v1/modb/matviews', []),
         apiOptional<ModbSyncPeer[]>('/v1/modb/sync/peers', []),
+        apiOptional<ModbBackupStatusResponse | null>('/v1/modb/backups/status', null),
       ]);
       setVerify(v);
       setBaseline(bl);
@@ -464,6 +467,7 @@ export const AuditReplayView: React.FC<{
       setErasureReceipts(erRecs);
       setMatviews(mvs);
       setSyncPeers(sPeers);
+      setBackupStatus(bkStat);
       if (gr.length && !clrGrantId) {
         setClrGrantId(gr[0].id);
         setGovPropTargetGrant(gr[0].id);
@@ -3444,6 +3448,104 @@ export const AuditReplayView: React.FC<{
       {/* TAB 6: INCREMENTAL SYNC PEERS & ENCRYPTED OFF-HOST BACKUPS */}
       {subTab === 'sync' && (
         <div className="flex flex-col gap-4">
+          <Card>
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <strong className="text-sm">
+                Scheduled Encrypted Backup &amp; Off-Host DR Health
+              </strong>
+              {backupStatus?.['configured?'] && backupStatus.status ? (
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <Badge tone="ok">{backupStatus.status.generation}</Badge>
+                  <Badge
+                    tone={
+                      backupStatus.status.secrets_verified
+                        ? 'ok'
+                        : backupStatus.status.secrets_backed_up
+                          ? 'info'
+                          : 'warn'
+                    }
+                  >
+                    {backupStatus.status.secrets_verified
+                      ? `secrets verified (${backupStatus.status.secrets_entries ?? 0})`
+                      : backupStatus.status.secrets_backed_up
+                        ? `secrets backed up (${backupStatus.status.secrets_entries ?? 0})`
+                        : 'secrets pending'}
+                  </Badge>
+                  <Badge
+                    tone={
+                      backupStatus.status.offhost_ok
+                        ? 'ok'
+                        : backupStatus.status.offhost_mode === 'local-only' ||
+                            !backupStatus.status.offhost_mode
+                          ? 'warn'
+                          : 'bad'
+                    }
+                  >
+                    {backupStatus.status.offhost_ok
+                      ? `off-host ${backupStatus.status.offhost_mode || 'remote'} ok`
+                      : backupStatus.status.offhost_mode === 'local-only' ||
+                          !backupStatus.status.offhost_mode
+                        ? 'local-only (no remote)'
+                        : `off-host ${backupStatus.status.offhost_mode} failed`}
+                  </Badge>
+                  {backupStatus.status.last_error && <Badge tone="bad">alert triggered</Badge>}
+                </div>
+              ) : (
+                <Badge tone="neutral">timer status not recorded yet</Badge>
+              )}
+            </div>
+            {backupStatus?.['configured?'] && backupStatus.status ? (
+              <div className="flex flex-col gap-2 text-xs">
+                {backupStatus.status.last_error && (
+                  <div className="p-2.5 rounded-lg border border-[var(--bad)] bg-[var(--bad-soft)] text-[var(--fg)] font-mono">
+                    Last backup error: {backupStatus.status.last_error}
+                  </div>
+                )}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                  <div className="p-2.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)]">
+                    <div className="text-[var(--fg-muted)]">Main Database (motet.modb)</div>
+                    <strong className="font-mono">
+                      seq #{backupStatus.status.acked_seq} · tx #{backupStatus.status.acked_txid} ·{' '}
+                      {backupStatus.status.delta_count} delta(s)
+                    </strong>
+                    <div className="font-mono text-[11px] text-[var(--fg-subtle)] mt-0.5">
+                      key_id={backupStatus.status.key_id} · gens={backupStatus.status.retention_generations_kept} · last={backupStatus.status.last_run_at}
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)]">
+                    <div className="text-[var(--fg-muted)]">Last Verified Restore</div>
+                    <strong className="font-mono">
+                      {backupStatus.status.last_verified_txid != null
+                        ? `tx #${backupStatus.status.last_verified_txid} · ${backupStatus.status.last_verified_audit_entries ?? 0} audit`
+                        : 'not yet verified'}
+                    </strong>
+                    <div className="font-mono text-[11px] text-[var(--fg-subtle)] mt-0.5">
+                      at {backupStatus.status.last_verified_at || 'pending'}
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-[var(--bg-elev)] border border-[var(--border)]">
+                    <div className="text-[var(--fg-muted)]">Off-Host Ciphertext Mirror</div>
+                    <strong className="font-mono break-all">
+                      {backupStatus.status.offhost_target || 'local disk only'}
+                    </strong>
+                    <div className="font-mono text-[11px] text-[var(--fg-subtle)] mt-0.5">
+                      pushed={backupStatus.status.offhost_pushed_at || 'not yet pushed'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="text-xs text-[var(--fg-muted)]">
+                Run <code>motet-modb-backup</code> or enable <code>motet-modb-backup.timer</code>{' '}
+                to populate scheduled restore verification and off-host ciphertext mirror status.
+              </div>
+            )}
+            <div className="text-[11px] text-[var(--fg-subtle)]">
+              Reminder: keep <code>MODB_BACKUP_KEY_HEX</code>, <code>MODB_BACKUP_KEYRING</code>, and{' '}
+              <code>MOTET_MASTER_KEY</code> outside the backup repository (e.g. password manager / host env).
+            </div>
+          </Card>
+
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
             <Card>
               <strong className="text-sm">Register Incremental Sync Peer (Modb.Sync)</strong>
