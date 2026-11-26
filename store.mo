@@ -1,7 +1,7 @@
 ## Durable pure-Mo MoDB storage engine for Motet (`motet.modb` + isolated `motet-secrets.modb`):
 ## - Layer 1/2: Crash-safe CoW B+Tree (`Modb`) + typed tables & secondary indexes (`Modb.Table`)
-##              + transactional BM25+ full-text search indexes (`Modb.Fts`: `events`, `memories`)
-## - Layer 3:   Tamper-evident SHA-256 hash-chained audit ledger, schema v2, commit invariants
+##              + transactional BM25+ full-text (`Modb.Fts`) & 128-d vector (`Modb.Vec`) indexes (`events`, `memories`)
+## - Layer 3:   Tamper-evident SHA-256 hash-chained audit ledger, schema v3, commit invariants
 ## - Layer 4:   Attenuated `Grants`, `Claims` leases, `Views` + `OnboardingManifest`,
 ##              lossless `Replay`, and canonical SHA-256 `Export`.
 ## - Security:  AES-256-GCM Vault ciphertexts, OAuth PKCE state, and Bearer access tokens live ONLY
@@ -10,6 +10,7 @@
 module Store
 expose default_db_path,
 default_secrets_path,
+vec_dimensions,
 DbHandle(..),
 open,
 open_at,
@@ -68,6 +69,7 @@ append_event_full,
 list_events,
 list_events_after,
 search_events,
+search_events_rich,
 count_session_tool_denials,
 has_events_since,
 list_recent_owner_user_messages,
@@ -80,6 +82,12 @@ update_memory_content,
 archive_memory,
 restore_memory,
 search_memories,
+search_memories_rich,
+search_stats,
+resolve_embed_config,
+sync_memory_neural_embedding,
+sync_event_neural_embedding,
+reindex_neural_vectors,
 delete_memory,
 record_dreaming_run,
 list_dreaming_runs,
@@ -189,7 +197,9 @@ proposal_to_view,
 list_replay_proposal_views,
 accept_replay_proposal,
 discard_replay_proposal
+use Http
 use Json
+use Llm
 use Modb{WriteTx}
 use Modb.Claims
 use Modb.Errors{ModbError}
@@ -199,6 +209,7 @@ use Modb.Grants{GrantSpec}
 use Modb.Ledger{AuditEntry, LedgerError, Schema, WriteMeta}
 use Modb.Replay{ReplayCatalog, ReplayFilter, ReplayProposal}
 use Modb.Table{Index, Table, TableError}
+use Modb.Vec
 use Modb.Views{
   OnboardingManifest,
   ReadLogEntry,
@@ -236,14 +247,20 @@ use Types{
   ConnectorSpec,
   DreamingDigest,
   EffectClass,
+  EventSearchHit,
+  EventSearchResponse,
   HealthSummary,
   MemoryEntry,
+  MemorySearchHit,
+  MemorySearchResponse,
   ModbVerifySummary,
   MotetError,
   PolicyRule,
   ProviderKind,
   PushSubscription,
   RoutineSpec,
+  SearchIndexStats,
+  SearchReindexResult,
   SessionEvent,
   SessionSummary,
   StandingIntent,
@@ -645,6 +662,28 @@ fn wrap_fts(res: Result(T, Fts.FtsError)) : Result(T, Text)
   res.map_error(fn(e) e.to_text end)
 end
 
+fn vec_err(e: Vec.VecError) : MotetError
+  StorageFailed(message: "vec error: #{Vec.to_text(e)}")
+end
+
+fn vec_to_table_err(e: Vec.VecError) : TableError
+  case e
+    Vec.Storage(me): Table.Storage(me)
+    Vec.TableFailure(te): te
+    Vec.FtsFailure(fe): fts_to_table_err(fe)
+    Vec.InvalidConfig(reason: r) | Vec.InvalidVector(reason: r): Table.Storage(
+      Errors.InvalidArgument(reason: r)
+    )
+    Vec.DimensionMismatch(expected: _, actual: _): Table.Storage(
+      Errors.InvalidArgument(reason: Vec.to_text(e))
+    )
+  end
+end
+
+fn wrap_vec(res: Result(T, Vec.VecError)) : Result(T, Text)
+  res.map_error(fn(e) Vec.to_text(e) end)
+end
+
 fn ledger_err(e: LedgerError) : MotetError
   case e
     InvariantViolation(name: n, detail: d): BadInput(message: "invariant '#{n}': #{d}")
@@ -984,12 +1023,47 @@ fn tokenize(text: Text) : List(Text)
   cleaned.words.unique
 end
 
+vec_dimensions = 128
+
+sketch_max_chars = 600
+
+neural_max_chars = 2000
+
+neural_provider_setting_key = "_embedding_neural_provider"
+
 fn events_fts_index() : FtsIndex
   Fts.index("events")
 end
 
 fn memories_fts_index() : FtsIndex
   Fts.index("memories")
+end
+
+fn events_vec_index() : Vec.VecIndex
+  Vec.index("events", vec_dimensions)
+end
+
+fn memories_vec_index() : Vec.VecIndex
+  Vec.index("memories", vec_dimensions)
+end
+
+fn events_neural_index() : Vec.VecIndex
+  Vec.index("events_neural", vec_dimensions)
+end
+
+fn memories_neural_index() : Vec.VecIndex
+  Vec.index("memories_neural", vec_dimensions)
+end
+
+fn cap_text_chars(text: Text, max_chars: Int) : Text
+  clean = text.trim
+  if max_chars <= 0
+    ""
+  else if clean.char_count <= max_chars
+    clean
+  else
+    Text.from_chars(clean.chars.take(max_chars))
+  end
 end
 
 fn event_fts_doc(ev: SessionEvent) : DocumentInput
@@ -1013,6 +1087,36 @@ fn memory_fts_doc(m: MemoryRow) : DocumentInput
       FieldInput(name: "kind", text: m.kind, weight: 2),
       FieldInput(name: "scope", text: m.scope, weight: 1)
     ]
+  )
+end
+
+fn event_embed_text(ev: SessionEvent, max_chars: Int) : Text
+  base = case ev.tool_name
+    Some(tn) if not tn.trim.empty?: "#{ev.kind} #{tn.trim}: #{ev.content}"
+    Some(_) | None: "#{ev.kind} #{ev.role}: #{ev.content}"
+  end
+  clean = cap_text_chars(base, max_chars)
+  if clean.empty?: "(empty event)" else: clean
+end
+
+fn memory_embed_text(m: MemoryRow, max_chars: Int) : Text
+  clean = cap_text_chars("[#{m.scope}/#{m.kind}] #{m.content}", max_chars)
+  if clean.empty?: "(empty memory)" else: clean
+end
+
+fn event_sketch_vec(ev: SessionEvent) : Vec.VectorInput
+  Vec.VectorInput(
+    doc_id: "#{ev.id}",
+    scope: ev.session_id,
+    values: Vec.text_sketch_embedding(event_embed_text(ev, sketch_max_chars), vec_dimensions)
+  )
+end
+
+fn memory_sketch_vec(m: MemoryRow) : Vec.VectorInput
+  Vec.VectorInput(
+    doc_id: "#{m.id}",
+    scope: m.scope,
+    values: Vec.text_sketch_embedding(memory_embed_text(m, sketch_max_chars), vec_dimensions)
   )
 end
 
@@ -1053,6 +1157,35 @@ fn migrate_v1_to_v2(tx: WriteTx) : Result(WriteTx, TableError)
   Ok(cur)
 end
 
+fn migrate_v2_to_v3(tx: WriteTx) : Result(WriteTx, TableError)
+  var cur = tx
+  for b in [
+    "events_vec_data",
+    "events_vec_docs",
+    "events_vec_meta",
+    "memories_vec_data",
+    "memories_vec_docs",
+    "memories_vec_meta"
+  ]
+    cur = try delete_bucket_t(cur, b)
+  end
+  ev_rows = try Table.tx_scan(cur, events_table(), None, None, 0)
+  for (_id, ev) in ev_rows
+    cur = try Vec.tx_put_vector(cur, events_vec_index(), event_sketch_vec(ev)).map_error(
+      vec_to_table_err
+    )
+  end
+  mem_rows = try Table.tx_scan(cur, memories_table(), None, None, 0)
+  for (_id, m) in mem_rows
+    if not m.staged and not m.archived?
+      cur = try Vec.tx_put_vector(cur, memories_vec_index(), memory_sketch_vec(m)).map_error(
+        vec_to_table_err
+      )
+    end
+  end
+  Ok(cur)
+end
+
 fn tx_next_id(tx: WriteTx, seq_name: Text) : Result((WriteTx, Int), TableError)
   tbl = seqs_table()
   cur = (try Table.tx_get(tx, tbl, seq_name)) or 0
@@ -1077,12 +1210,18 @@ fn utc_day_prefix(ts: Text) : Text
   Text.from_chars(ts.chars.take(10))
 end
 
-## Schema v2 with commit-time invariants and transactional BM25 FTS across Motet's state.
+## Schema v3 with commit-time invariants and transactional BM25 FTS + 128-d Vec across Motet's state.
 fn motet_schema() : Schema
-  Ledger.schema(2).with_require_reason(true).with_migration(
+  Ledger.schema(3).with_require_reason(true).with_migration(
     Ledger.migration(1, "initialize motet v1 schema", fn(tx) Ok(tx) end)
   ).with_migration(
     Ledger.migration(2, "migrate keyword buckets to Modb.Fts BM25 indexes", migrate_v1_to_v2)
+  ).with_migration(
+    Ledger.migration(
+      3,
+      "add transactional Modb.Vec 128-d sketch vector indexes for hybrid search",
+      migrate_v2_to_v3
+    )
   ).with_invariant(
     Ledger.row_invariant(
       "bots_valid",
@@ -1757,7 +1896,8 @@ fn action_append_event(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
     None: t3
   end
   t5 = try wrap_fts(Fts.tx_index_document(t4, events_fts_index(), event_fts_doc(ev)))
-  Ok((t5, ev.to_json))
+  t6 = try wrap_vec(Vec.tx_put_vector(t5, events_vec_index(), event_sketch_vec(ev)))
+  Ok((t6, ev.to_json))
 end
 
 fn action_save_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
@@ -1777,7 +1917,8 @@ fn action_save_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
   )
   t2 = try wrap_t(Table.put(t1, memories_table(), id, row))
   t3 = if not row.staged and not row.archived?
-    try wrap_fts(Fts.tx_index_document(t2, memories_fts_index(), memory_fts_doc(row)))
+    tf = try wrap_fts(Fts.tx_index_document(t2, memories_fts_index(), memory_fts_doc(row)))
+    try wrap_vec(Vec.tx_put_vector(tf, memories_vec_index(), memory_sketch_vec(row)))
   else
     t2
   end
@@ -1808,7 +1949,8 @@ fn action_promote_staged_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json
   end
   t1 = try wrap_t(Table.put(tx, tbl, a.id, next_row))
   t2 = if not next_row.staged and not next_row.archived?
-    try wrap_fts(Fts.tx_index_document(t1, memories_fts_index(), memory_fts_doc(next_row)))
+    tf = try wrap_fts(Fts.tx_index_document(t1, memories_fts_index(), memory_fts_doc(next_row)))
+    try wrap_vec(Vec.tx_put_vector(tf, memories_vec_index(), memory_sketch_vec(next_row)))
   else
     t1
   end
@@ -1835,12 +1977,16 @@ fn action_update_memory_content(tx: WriteTx, args: Json) : Result((WriteTx, Json
     created_at: cur.created_at
   )
   t1 = try wrap_t(Table.put(tx, tbl, a.id, updated))
-  t2 = if not updated.staged and not updated.archived?
-    try wrap_fts(Fts.tx_index_document(t1, memories_fts_index(), memory_fts_doc(updated)))
+  # Clear any stale neural vector synchronously; updated neural vector is synced out-of-lock after commit.
+  t2 = try wrap_vec(Vec.tx_remove_vector(t1, memories_neural_index(), "#{a.id}"))
+  t3 = if not updated.staged and not updated.archived?
+    tf = try wrap_fts(Fts.tx_index_document(t2, memories_fts_index(), memory_fts_doc(updated)))
+    try wrap_vec(Vec.tx_put_vector(tf, memories_vec_index(), memory_sketch_vec(updated)))
   else
-    try wrap_fts(Fts.tx_remove_document(t1, memories_fts_index(), "#{a.id}"))
+    tf = try wrap_fts(Fts.tx_remove_document(t2, memories_fts_index(), "#{a.id}"))
+    try wrap_vec(Vec.tx_remove_vector(tf, memories_vec_index(), "#{a.id}"))
   end
-  Ok((t2, mem_row_to_entry(updated).to_json))
+  Ok((t3, mem_row_to_entry(updated).to_json))
 end
 
 fn set_memory_archived_tx(tx: WriteTx, id: Int, archived?: Bool) : Result((WriteTx, Json), Text)
@@ -1861,9 +2007,12 @@ fn set_memory_archived_tx(tx: WriteTx, id: Int, archived?: Bool) : Result((Write
       )
       t_row = try wrap_t(Table.put(tx, tbl, id, updated))
       if archived? or updated.staged
-        try wrap_fts(Fts.tx_remove_document(t_row, memories_fts_index(), "#{id}"))
+        tf = try wrap_fts(Fts.tx_remove_document(t_row, memories_fts_index(), "#{id}"))
+        tv = try wrap_vec(Vec.tx_remove_vector(tf, memories_vec_index(), "#{id}"))
+        try wrap_vec(Vec.tx_remove_vector(tv, memories_neural_index(), "#{id}"))
       else
-        try wrap_fts(Fts.tx_index_document(t_row, memories_fts_index(), memory_fts_doc(updated)))
+        tf = try wrap_fts(Fts.tx_index_document(t_row, memories_fts_index(), memory_fts_doc(updated)))
+        try wrap_vec(Vec.tx_put_vector(tf, memories_vec_index(), memory_sketch_vec(updated)))
       end
     None: tx
   end
@@ -1886,7 +2035,9 @@ fn action_delete_memory(tx: WriteTx, args: Json) : Result((WriteTx, Json), Text)
   t1 = case try wrap_t(Table.tx_get(tx, tbl, a.id))
     Some(_m):
       t_fts = try wrap_fts(Fts.tx_remove_document(tx, memories_fts_index(), "#{a.id}"))
-      try wrap_t(Table.delete(t_fts, tbl, a.id))
+      t_vec = try wrap_vec(Vec.tx_remove_vector(t_fts, memories_vec_index(), "#{a.id}"))
+      t_neu = try wrap_vec(Vec.tx_remove_vector(t_vec, memories_neural_index(), "#{a.id}"))
+      try wrap_t(Table.delete(t_neu, tbl, a.id))
     None: tx
   end
   Ok((t1, Json.Object({"deleted": Json.Boolean(true)})))
@@ -2594,6 +2745,7 @@ fn action_import_snapshot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Tex
     max_seqs = max_seqs.set(ev.session_id, max_int_val(prev_seq, ev.seq))
     cur_tx = try wrap_t(Table.put(cur_tx, events_table(), ev.id, ev))
     cur_tx = try wrap_fts(Fts.tx_index_document(cur_tx, events_fts_index(), event_fts_doc(ev)))
+    cur_tx = try wrap_vec(Vec.tx_put_vector(cur_tx, events_vec_index(), event_sketch_vec(ev)))
   end
 
   for s in snap.sessions
@@ -2619,6 +2771,9 @@ fn action_import_snapshot(tx: WriteTx, args: Json) : Result((WriteTx, Json), Tex
     if not m.staged and not m.archived?
       cur_tx = try wrap_fts(
         Fts.tx_index_document(cur_tx, memories_fts_index(), memory_fts_doc(m))
+      )
+      cur_tx = try wrap_vec(
+        Vec.tx_put_vector(cur_tx, memories_vec_index(), memory_sketch_vec(m))
       )
     end
   end
@@ -4222,17 +4377,35 @@ fn list_events_after(db: DbHandle, session_id: Text, after_seq: Int, limit: Int)
 end
 
 fn search_events(db: DbHandle, query: Text, limit: Int) : Result(List(SessionEvent), MotetError)
-  return Ok([]) if Fts.tokenize(query, 64).empty?
+  clean = query.trim
+  return Ok([]) if Fts.tokenize(clean, 64).empty?
   cap = if limit > 0 and limit <= 100: limit else: 20
-  opts = SearchOptions(limit: cap, prefix_last_term?: true, required_scope: None)
+  q_vec = Vec.text_sketch_embedding(clean, vec_dimensions)
+  hopts = Vec.HybridOptions(
+    limit: cap,
+    prefix_last_term?: true,
+    required_scope: None,
+    rrf_k: 60,
+    fts_weight: 1.0.to_float,
+    vec_weight: 0.9.to_float,
+    candidate_limit: if cap * 4 > 24: cap * 4 else: 24,
+    min_vec_score: Some(0.32.to_float)
+  )
   with_db_read(
     db,
     fn(ldb)
       st = Ledger.store(ldb)
-      fts_hits = try Fts.search(st, events_fts_index(), query, opts).map_error(fts_err)
+      hhits = try Vec.hybrid_search(
+        st,
+        events_fts_index(),
+        events_vec_index(),
+        clean,
+        Some(q_vec),
+        hopts
+      ).map_error(vec_err)
       var hits = []
-      for fhit in fts_hits
-        case fhit.doc_id.to_int
+      for hh in hhits
+        case hh.doc_id.to_int
           Some(eid):
             case try Table.get(st, events_table(), eid).map_error(table_err)
               Some(ev): hits = hits.append(ev)
@@ -4433,8 +4606,19 @@ fn search_memories(db: DbHandle, scope_opt: Option(Text), query: Text) : Result(
   List(MemoryEntry),
   MotetError
 )
-  return list_memories(db, scope_opt, 20) if Fts.tokenize(query, 64).empty?
-  opts = SearchOptions(limit: 20, prefix_last_term?: true, required_scope: None)
+  clean = query.trim
+  return list_memories(db, scope_opt, 20) if Fts.tokenize(clean, 64).empty?
+  q_vec = Vec.text_sketch_embedding(clean, vec_dimensions)
+  hopts = Vec.HybridOptions(
+    limit: 20,
+    prefix_last_term?: true,
+    required_scope: None,
+    rrf_k: 60,
+    fts_weight: 1.0.to_float,
+    vec_weight: 0.9.to_float,
+    candidate_limit: 40,
+    min_vec_score: Some(0.32.to_float)
+  )
   allow_doc = fn(_doc_id, doc_scope)
     case scope_opt
       Some(s): doc_scope == s or doc_scope == "shared"
@@ -4445,12 +4629,18 @@ fn search_memories(db: DbHandle, scope_opt: Option(Text), query: Text) : Result(
     db,
     fn(ldb)
       st = Ledger.store(ldb)
-      fts_hits = try Fts.search_filtered(st, memories_fts_index(), query, opts, allow_doc).map_error(
-        fts_err
-      )
+      hhits = try Vec.hybrid_search_filtered(
+        st,
+        memories_fts_index(),
+        memories_vec_index(),
+        clean,
+        Some(q_vec),
+        hopts,
+        allow_doc
+      ).map_error(vec_err)
       var hits = []
-      for fhit in fts_hits
-        case fhit.doc_id.to_int
+      for hh in hhits
+        case hh.doc_id.to_int
           Some(mid):
             case try Table.get(st, memories_table(), mid).map_error(table_err)
               Some(m) if not m.staged and not m.archived?: hits = hits.append(mem_row_to_entry(m))
@@ -5409,6 +5599,774 @@ fn set_setting_val(db: DbHandle, key: Text, value: Text) : Result(Unit, MotetErr
     SetSettingArgs(key: key, value: value).to_json
   )
   Ok(Unit)
+end
+
+fn resolve_embed_config(db: DbHandle, env: Env) : Result(Option(Llm.EmbedConfig), MotetError)
+  gem_key = try resolve_secret(db, env, "GEMINI_API_KEY")
+  oai_key = try resolve_secret(db, env, "OPENAI_API_KEY")
+  Ok(Llm.resolve_embed_config(gem_key, oai_key, vec_dimensions))
+end
+
+fn try_resolve_embed_config_soft(db: DbHandle, env: Env) : Option(Llm.EmbedConfig)
+  case resolve_embed_config(db, env)
+    Ok(opt): opt
+    Error(_): None
+  end
+end
+
+fn normalize_search_mode(mode_raw: Text) : Text
+  low = mode_raw.trim.ascii_lowercase
+  if low == "bm25" or low == "fts"
+    "bm25"
+  else if low == "semantic" or low == "vec" or low == "vector"
+    "semantic"
+  else
+    "hybrid"
+  end
+end
+
+fn min_vec_score_for_backend(tag: Text) : Float
+  if tag.starts_with?("gemini:")
+    0.45.to_float
+  else if tag.starts_with?("openai:")
+    0.30.to_float
+  else
+    0.32.to_float
+  end
+end
+
+## Reports live corpus counts across BM25 FTS, deterministic 128-d sketch, and neural 128-d indexes.
+fn search_stats(db: DbHandle, env: Env) : Result(SearchIndexStats, MotetError)
+  (sc_ver, neural_prov, m_fts, m_vec, m_neu, e_fts, e_vec, e_neu) = try with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      np_raw = try Table.get(st, app_settings_table(), neural_provider_setting_key).map_error(
+        table_err
+      )
+      mf = try Fts.stats(st, memories_fts_index()).map_error(fts_err)
+      mv = try Vec.stats(st, memories_vec_index()).map_error(vec_err)
+      mn = try Vec.stats(st, memories_neural_index()).map_error(vec_err)
+      ef = try Fts.stats(st, events_fts_index()).map_error(fts_err)
+      ev = try Vec.stats(st, events_vec_index()).map_error(vec_err)
+      en = try Vec.stats(st, events_neural_index()).map_error(vec_err)
+      Ok((
+        Ledger.schema_version(ldb),
+        np_raw,
+        mf.doc_count,
+        mv.doc_count,
+        mn.doc_count,
+        ef.doc_count,
+        ev.doc_count,
+        en.doc_count
+      ))
+    end
+  )
+  cfg_opt = try_resolve_embed_config_soft(db, env)
+  np_opt = case neural_prov
+    Some(s) if not s.trim.empty?: Some(s.trim)
+    Some(_) | None: None
+  end
+  Ok(
+    SearchIndexStats(
+      schema_version: sc_ver,
+      dimensions: vec_dimensions,
+      neural_provider: np_opt,
+      configured_provider: cfg_opt.map(fn(c) c.tag end),
+      memories_fts_docs: m_fts,
+      memories_sketch_docs: m_vec,
+      memories_neural_docs: m_neu,
+      events_fts_docs: e_fts,
+      events_sketch_docs: e_vec,
+      events_neural_docs: e_neu
+    )
+  )
+end
+
+## Best-effort out-of-lock neural embedding sync for a newly saved or promoted active memory.
+fn sync_memory_neural_embedding(
+  db: DbHandle,
+  network: Network,
+  env: Env,
+  mem: MemoryEntry
+) : Unit
+  return Unit if mem.staged or mem.content.trim.empty?
+  cfg = case try_resolve_embed_config_soft(db, env)
+    Some(c): c
+    None: return Unit
+  end
+  probe = with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      sp = try Table.get(st, app_settings_table(), neural_provider_setting_key).map_error(
+        table_err
+      )
+      nst = try Vec.stats(st, memories_neural_index()).map_error(vec_err)
+      Ok((sp, nst.doc_count))
+    end
+  )
+  case probe
+    Ok((sp, cnt)):
+      if cnt > 0 and sp != Some(cfg.tag)
+        return Unit
+      end
+    Error(_): return Unit
+  end
+  txt = cap_text_chars("[#{mem.scope}/#{mem.kind}] #{mem.content}", neural_max_chars)
+  qvec = case Llm.embed_text(network, db.clock, cfg, txt, Llm.EmbedDocument)
+    Ok(v): v
+    Error(_): return Unit
+  end
+  now = db.clock.now
+  _res = Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      st_cur = Ledger.store(ldb)
+      sp_cur = try Table.get(st_cur, app_settings_table(), neural_provider_setting_key).map_error(
+        table_err
+      )
+      nst_cur = try Vec.stats(st_cur, memories_neural_index()).map_error(vec_err)
+      if nst_cur.doc_count > 0 and sp_cur != Some(cfg.tag)
+        return Ok(Unit)
+      end
+      meta = WriteMeta(
+        principal: "system:embeddings",
+        action: "sync_memory_neural",
+        reason: "sync neural embedding for memory ##{mem.id}",
+        at: now
+      )
+      _ldb2 = try Ledger.write(
+        ldb,
+        meta,
+        "sync memory ##{mem.id} neural vector (#{cfg.tag})",
+        Json.Object({"id": mem.id.to_json, "provider": cfg.tag.to_json}),
+        fn(tx)
+          case try Table.tx_get(tx, memories_table(), mem.id)
+            None: Ok(tx)
+            Some(cur):
+              if cur.staged or cur.archived? or cur.content != mem.content
+                return Ok(tx)
+              end
+              t1 = try Vec.tx_put_vector(
+                tx,
+                memories_neural_index(),
+                Vec.VectorInput(doc_id: "#{cur.id}", scope: cur.scope, values: qvec)
+              ).map_error(vec_to_table_err)
+              Table.put(t1, app_settings_table(), neural_provider_setting_key, cfg.tag)
+          end
+        end
+      ).map_error(ledger_err)
+      Ok(Unit)
+    end
+  )
+  Unit
+end
+
+## Best-effort out-of-lock neural embedding sync for a persisted session event.
+fn sync_event_neural_embedding(
+  db: DbHandle,
+  network: Network,
+  env: Env,
+  ev: SessionEvent
+) : Unit
+  return Unit if ev.content.trim.empty?
+  cfg = case try_resolve_embed_config_soft(db, env)
+    Some(c): c
+    None: return Unit
+  end
+  probe = with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      sp = try Table.get(st, app_settings_table(), neural_provider_setting_key).map_error(
+        table_err
+      )
+      nst = try Vec.stats(st, events_neural_index()).map_error(vec_err)
+      Ok((sp, nst.doc_count))
+    end
+  )
+  case probe
+    Ok((sp, cnt)):
+      if cnt > 0 and sp != Some(cfg.tag)
+        return Unit
+      end
+    Error(_): return Unit
+  end
+  txt = event_embed_text(ev, neural_max_chars)
+  qvec = case Llm.embed_text(network, db.clock, cfg, txt, Llm.EmbedDocument)
+    Ok(v): v
+    Error(_): return Unit
+  end
+  now = db.clock.now
+  _res = Ledger.locked(
+    db.files,
+    db.path,
+    motet_schema(),
+    now,
+    ledger_err,
+    fn(ldb)
+      st_cur = Ledger.store(ldb)
+      sp_cur = try Table.get(st_cur, app_settings_table(), neural_provider_setting_key).map_error(
+        table_err
+      )
+      nst_cur = try Vec.stats(st_cur, events_neural_index()).map_error(vec_err)
+      if nst_cur.doc_count > 0 and sp_cur != Some(cfg.tag)
+        return Ok(Unit)
+      end
+      meta = WriteMeta(
+        principal: "system:embeddings",
+        action: "sync_event_neural",
+        reason: "sync neural embedding for event ##{ev.id}",
+        at: now
+      )
+      _ldb2 = try Ledger.write(
+        ldb,
+        meta,
+        "sync event ##{ev.id} neural vector (#{cfg.tag})",
+        Json.Object({"id": ev.id.to_json, "provider": cfg.tag.to_json}),
+        fn(tx)
+          case try Table.tx_get(tx, events_table(), ev.id)
+            None: Ok(tx)
+            Some(cur):
+              t1 = try Vec.tx_put_vector(
+                tx,
+                events_neural_index(),
+                Vec.VectorInput(doc_id: "#{cur.id}", scope: cur.session_id, values: qvec)
+              ).map_error(vec_to_table_err)
+              Table.put(t1, app_settings_table(), neural_provider_setting_key, cfg.tag)
+          end
+        end
+      ).map_error(ledger_err)
+      Ok(Unit)
+    end
+  )
+  Unit
+end
+
+## Backfills or rebuilds vector indexes across all active memories & events (network outside lock).
+fn reindex_neural_vectors(db: DbHandle, network: Network, env: Env) : Result(
+  SearchReindexResult,
+  MotetError
+)
+  (active_mems, all_evs, had_stale) = try with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      m_rows = try Table.all(st, memories_table()).map_error(table_err)
+      e_rows = try Table.all(st, events_table()).map_error(table_err)
+      act_m = m_rows.map(fn(p) p.1 end).filter(fn(m) not m.staged and not m.archived? end)
+      evs = e_rows.map(fn(p) p.1 end)
+      sp = try Table.get(st, app_settings_table(), neural_provider_setting_key).map_error(
+        table_err
+      )
+      mn = try Vec.stats(st, memories_neural_index()).map_error(vec_err)
+      en = try Vec.stats(st, events_neural_index()).map_error(vec_err)
+      stale = sp is Some(_) or mn.doc_count > 0 or en.doc_count > 0
+      Ok((act_m, evs, stale))
+    end
+  )
+  cfg_opt = try resolve_embed_config(db, env)
+  now = db.clock.now
+  case cfg_opt
+    Some(cfg):
+      mem_texts = active_mems.map(fn(m) memory_embed_text(m, neural_max_chars) end)
+      ev_texts = all_evs.map(fn(ev) event_embed_text(ev, neural_max_chars) end)
+      mem_vecs = try Llm.embed_batch(network, db.clock, cfg, mem_texts, Llm.EmbedDocument)
+      ev_vecs = try Llm.embed_batch(network, db.clock, cfg, ev_texts, Llm.EmbedDocument)
+      (m_cnt, e_cnt) = try Ledger.locked(
+        db.files,
+        db.path,
+        motet_schema(),
+        now,
+        ledger_err,
+        fn(ldb)
+          meta = WriteMeta(
+            principal: "operator",
+            action: "reindex_neural_vectors",
+            reason: "reindex embeddings via #{cfg.tag}",
+            at: now
+          )
+          _ldb2 = try Ledger.write(
+            ldb,
+            meta,
+            "reindex #{mem_vecs.size} memories and #{ev_vecs.size} events (#{cfg.tag})",
+            Json.Object({
+              "provider": cfg.tag.to_json,
+              "memories": mem_vecs.size.to_json,
+              "events": ev_vecs.size.to_json
+            }),
+            fn(tx)
+              var cur = tx
+              for b in [
+                "memories_neural_vec_data",
+                "memories_neural_vec_docs",
+                "memories_neural_vec_meta",
+                "events_neural_vec_data",
+                "events_neural_vec_docs",
+                "events_neural_vec_meta"
+              ]
+                cur = try delete_bucket_t(cur, b)
+              end
+              for (m, v) in active_mems.zip(mem_vecs)
+                case try Table.tx_get(cur, memories_table(), m.id)
+                  Some(live_m) if not live_m.staged and not live_m.archived?:
+                    cur = try Vec.tx_put_vector(
+                      cur,
+                      memories_neural_index(),
+                      Vec.VectorInput(doc_id: "#{live_m.id}", scope: live_m.scope, values: v)
+                    ).map_error(vec_to_table_err)
+                  Some(_) | None: Unit
+                end
+              end
+              for (ev, v) in all_evs.zip(ev_vecs)
+                case try Table.tx_get(cur, events_table(), ev.id)
+                  Some(live_ev):
+                    cur = try Vec.tx_put_vector(
+                      cur,
+                      events_neural_index(),
+                      Vec.VectorInput(doc_id: "#{live_ev.id}", scope: live_ev.session_id, values: v)
+                    ).map_error(vec_to_table_err)
+                  None: Unit
+                end
+              end
+              Table.put(cur, app_settings_table(), neural_provider_setting_key, cfg.tag)
+            end
+          ).map_error(ledger_err)
+          Ok((mem_vecs.size, ev_vecs.size))
+        end
+      )
+      Ok(
+        SearchReindexResult(
+          backend: cfg.tag,
+          memories_indexed: m_cnt,
+          events_indexed: e_cnt,
+          cleared_stale_neural?: had_stale
+        )
+      )
+    None:
+      (m_cnt, e_cnt) = try Ledger.locked(
+        db.files,
+        db.path,
+        motet_schema(),
+        now,
+        ledger_err,
+        fn(ldb)
+          meta = WriteMeta(
+            principal: "operator",
+            action: "reindex_sketch_vectors",
+            reason: "rebuild deterministic 128-d sketch vectors (no neural API key configured)",
+            at: now
+          )
+          _ldb2 = try Ledger.write(
+            ldb,
+            meta,
+            "rebuild #{active_mems.size} memories and #{all_evs.size} events (sketch:128)",
+            Json.Object({
+              "provider": "sketch:128".to_json,
+              "memories": active_mems.size.to_json,
+              "events": all_evs.size.to_json
+            }),
+            fn(tx)
+              var cur = tx
+              for b in [
+                "memories_neural_vec_data",
+                "memories_neural_vec_docs",
+                "memories_neural_vec_meta",
+                "events_neural_vec_data",
+                "events_neural_vec_docs",
+                "events_neural_vec_meta",
+                "memories_vec_data",
+                "memories_vec_docs",
+                "memories_vec_meta",
+                "events_vec_data",
+                "events_vec_docs",
+                "events_vec_meta"
+              ]
+                cur = try delete_bucket_t(cur, b)
+              end
+              cur = try Table.delete(cur, app_settings_table(), neural_provider_setting_key)
+              mem_now = try Table.tx_scan(cur, memories_table(), None, None, 0)
+              var mc = 0
+              for (_id, m) in mem_now
+                if not m.staged and not m.archived?
+                  cur = try Vec.tx_put_vector(cur, memories_vec_index(), memory_sketch_vec(m))
+                    .map_error(vec_to_table_err)
+                  mc += 1
+                end
+              end
+              ev_now = try Table.tx_scan(cur, events_table(), None, None, 0)
+              var ec = 0
+              for (_id, ev) in ev_now
+                cur = try Vec.tx_put_vector(cur, events_vec_index(), event_sketch_vec(ev))
+                  .map_error(vec_to_table_err)
+                ec += 1
+              end
+              Ok(cur)
+            end
+          ).map_error(ledger_err)
+          Ok((active_mems.size, all_evs.size))
+        end
+      )
+      Ok(
+        SearchReindexResult(
+          backend: "sketch:128",
+          memories_indexed: m_cnt,
+          events_indexed: e_cnt,
+          cleared_stale_neural?: had_stale
+        )
+      )
+  end
+end
+
+## Rich scored hybrid/BM25/semantic search over active persistent memories (neural when synced).
+fn search_memories_rich(
+  db: DbHandle,
+  network: Network,
+  env: Env,
+  scope_opt: Option(Text),
+  query: Text,
+  mode_raw: Text,
+  limit: Int
+) : Result(MemorySearchResponse, MotetError)
+  mode = normalize_search_mode(mode_raw)
+  clean = query.trim
+  cap = if limit > 0 and limit <= 100: limit else: 20
+  if clean.empty?
+    be = if mode == "bm25": "bm25" else: "sketch:128"
+    return Ok(MemorySearchResponse(query: query, mode: mode, embedding_backend: be, hits: []))
+  end
+
+  (stored_prov, neural_docs) = try with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      sp = try Table.get(st, app_settings_table(), neural_provider_setting_key).map_error(
+        table_err
+      )
+      nst = try Vec.stats(st, memories_neural_index()).map_error(vec_err)
+      Ok((sp, nst.doc_count))
+    end
+  )
+  cfg_opt = try_resolve_embed_config_soft(db, env)
+
+  (use_neural?, q_vec_opt, vec_idx, min_vec, backend) = if mode == "bm25"
+    (false, None, memories_vec_index(), None, "bm25")
+  else
+    neural_match? = case cfg_opt
+      Some(c): neural_docs > 0 and stored_prov == Some(c.tag)
+      None: false
+    end
+    if neural_match?
+      cfg = cfg_opt or stop "cfg"
+      case Llm.embed_text(network, db.clock, cfg, clean, Llm.EmbedQuery)
+        Ok(qv): (
+          true,
+          Some(qv),
+          memories_neural_index(),
+          Some(min_vec_score_for_backend(cfg.tag)),
+          cfg.tag
+        )
+        Error(_): (
+          false,
+          Some(Vec.text_sketch_embedding(clean, vec_dimensions)),
+          memories_vec_index(),
+          Some(min_vec_score_for_backend("sketch:128")),
+          "sketch:128 (fallback)"
+        )
+      end
+    else
+      (
+        false,
+        Some(Vec.text_sketch_embedding(clean, vec_dimensions)),
+        memories_vec_index(),
+        Some(min_vec_score_for_backend("sketch:128")),
+        "sketch:128"
+      )
+    end
+  end
+
+  if not use_neural? and Fts.tokenize(clean, 64).empty?
+    return Ok(MemorySearchResponse(query: query, mode: mode, embedding_backend: backend, hits: []))
+  end
+
+  allow_doc = fn(_doc_id, doc_scope)
+    case scope_opt
+      Some(s): doc_scope == s or doc_scope == "shared"
+      None: true
+    end
+  end
+
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      var out = []
+      if mode == "bm25"
+        fopts = SearchOptions(limit: cap, prefix_last_term?: true, required_scope: None)
+        fhits = try Fts.search_filtered(st, memories_fts_index(), clean, fopts, allow_doc)
+          .map_error(fts_err)
+        for (i, fh) in fhits.enumerate
+          case fh.doc_id.to_int
+            Some(mid):
+              case try Table.get(st, memories_table(), mid).map_error(table_err)
+                Some(m) if not m.staged and not m.archived?: out = out.append(
+                  MemorySearchHit(
+                    memory: mem_row_to_entry(m),
+                    score: fh.score,
+                    fts_rank: Some(i + 1),
+                    fts_score: Some(fh.score),
+                    vec_rank: None,
+                    vec_score: None,
+                    matched_terms: fh.matched_terms
+                  )
+                )
+                Some(_) | None: Unit
+              end
+            None: Unit
+          end
+        end
+      else if mode == "semantic"
+        qv = q_vec_opt or []
+        vopts = Vec.VecSearchOptions(limit: cap, required_scope: None, min_score: min_vec)
+        vhits = try Vec.search_filtered(st, vec_idx, qv, vopts, allow_doc).map_error(vec_err)
+        for (i, vh) in vhits.enumerate
+          case vh.doc_id.to_int
+            Some(mid):
+              case try Table.get(st, memories_table(), mid).map_error(table_err)
+                Some(m) if not m.staged and not m.archived?: out = out.append(
+                  MemorySearchHit(
+                    memory: mem_row_to_entry(m),
+                    score: vh.score,
+                    fts_rank: None,
+                    fts_score: None,
+                    vec_rank: Some(i + 1),
+                    vec_score: Some(vh.score),
+                    matched_terms: []
+                  )
+                )
+                Some(_) | None: Unit
+              end
+            None: Unit
+          end
+        end
+      else
+        cand_lim = if cap * 4 > 24: cap * 4 else: 24
+        hopts = Vec.HybridOptions(
+          limit: cap,
+          prefix_last_term?: true,
+          required_scope: None,
+          rrf_k: 60,
+          fts_weight: 1.0.to_float,
+          vec_weight: if use_neural?: 1.2.to_float else: 0.9.to_float,
+          candidate_limit: cand_lim,
+          min_vec_score: min_vec
+        )
+        hhits = try Vec.hybrid_search_filtered(
+          st,
+          memories_fts_index(),
+          vec_idx,
+          clean,
+          q_vec_opt,
+          hopts,
+          allow_doc
+        ).map_error(vec_err)
+        for hh in hhits
+          case hh.doc_id.to_int
+            Some(mid):
+              case try Table.get(st, memories_table(), mid).map_error(table_err)
+                Some(m) if not m.staged and not m.archived?: out = out.append(
+                  MemorySearchHit(
+                    memory: mem_row_to_entry(m),
+                    score: hh.score,
+                    fts_rank: hh.fts_rank,
+                    fts_score: hh.fts_score,
+                    vec_rank: hh.vec_rank,
+                    vec_score: hh.vec_score,
+                    matched_terms: hh.matched_terms
+                  )
+                )
+                Some(_) | None: Unit
+              end
+            None: Unit
+          end
+        end
+      end
+      Ok(MemorySearchResponse(query: query, mode: mode, embedding_backend: backend, hits: out))
+    end
+  )
+end
+
+## Rich scored hybrid/BM25/semantic search over append-only session events (neural when synced).
+fn search_events_rich(
+  db: DbHandle,
+  network: Network,
+  env: Env,
+  query: Text,
+  mode_raw: Text,
+  limit: Int
+) : Result(EventSearchResponse, MotetError)
+  mode = normalize_search_mode(mode_raw)
+  clean = query.trim
+  cap = if limit > 0 and limit <= 100: limit else: 20
+  if clean.empty?
+    be = if mode == "bm25": "bm25" else: "sketch:128"
+    return Ok(EventSearchResponse(query: query, mode: mode, embedding_backend: be, hits: []))
+  end
+
+  (stored_prov, neural_docs) = try with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      sp = try Table.get(st, app_settings_table(), neural_provider_setting_key).map_error(
+        table_err
+      )
+      nst = try Vec.stats(st, events_neural_index()).map_error(vec_err)
+      Ok((sp, nst.doc_count))
+    end
+  )
+  cfg_opt = try_resolve_embed_config_soft(db, env)
+
+  (use_neural?, q_vec_opt, vec_idx, min_vec, backend) = if mode == "bm25"
+    (false, None, events_vec_index(), None, "bm25")
+  else
+    neural_match? = case cfg_opt
+      Some(c): neural_docs > 0 and stored_prov == Some(c.tag)
+      None: false
+    end
+    if neural_match?
+      cfg = cfg_opt or stop "cfg"
+      case Llm.embed_text(network, db.clock, cfg, clean, Llm.EmbedQuery)
+        Ok(qv): (
+          true,
+          Some(qv),
+          events_neural_index(),
+          Some(min_vec_score_for_backend(cfg.tag)),
+          cfg.tag
+        )
+        Error(_): (
+          false,
+          Some(Vec.text_sketch_embedding(clean, vec_dimensions)),
+          events_vec_index(),
+          Some(min_vec_score_for_backend("sketch:128")),
+          "sketch:128 (fallback)"
+        )
+      end
+    else
+      (
+        false,
+        Some(Vec.text_sketch_embedding(clean, vec_dimensions)),
+        events_vec_index(),
+        Some(min_vec_score_for_backend("sketch:128")),
+        "sketch:128"
+      )
+    end
+  end
+
+  if not use_neural? and Fts.tokenize(clean, 64).empty?
+    return Ok(EventSearchResponse(query: query, mode: mode, embedding_backend: backend, hits: []))
+  end
+
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      var out = []
+      if mode == "bm25"
+        fopts = SearchOptions(limit: cap, prefix_last_term?: true, required_scope: None)
+        fhits = try Fts.search(st, events_fts_index(), clean, fopts).map_error(fts_err)
+        for (i, fh) in fhits.enumerate
+          case fh.doc_id.to_int
+            Some(eid):
+              case try Table.get(st, events_table(), eid).map_error(table_err)
+                Some(ev): out = out.append(
+                  EventSearchHit(
+                    event: ev,
+                    score: fh.score,
+                    fts_rank: Some(i + 1),
+                    fts_score: Some(fh.score),
+                    vec_rank: None,
+                    vec_score: None,
+                    matched_terms: fh.matched_terms
+                  )
+                )
+                None: Unit
+              end
+            None: Unit
+          end
+        end
+      else if mode == "semantic"
+        qv = q_vec_opt or []
+        vopts = Vec.VecSearchOptions(limit: cap, required_scope: None, min_score: min_vec)
+        vhits = try Vec.search(st, vec_idx, qv, vopts).map_error(vec_err)
+        for (i, vh) in vhits.enumerate
+          case vh.doc_id.to_int
+            Some(eid):
+              case try Table.get(st, events_table(), eid).map_error(table_err)
+                Some(ev): out = out.append(
+                  EventSearchHit(
+                    event: ev,
+                    score: vh.score,
+                    fts_rank: None,
+                    fts_score: None,
+                    vec_rank: Some(i + 1),
+                    vec_score: Some(vh.score),
+                    matched_terms: []
+                  )
+                )
+                None: Unit
+              end
+            None: Unit
+          end
+        end
+      else
+        cand_lim = if cap * 4 > 24: cap * 4 else: 24
+        hopts = Vec.HybridOptions(
+          limit: cap,
+          prefix_last_term?: true,
+          required_scope: None,
+          rrf_k: 60,
+          fts_weight: 1.0.to_float,
+          vec_weight: if use_neural?: 1.2.to_float else: 0.9.to_float,
+          candidate_limit: cand_lim,
+          min_vec_score: min_vec
+        )
+        hhits = try Vec.hybrid_search(
+          st,
+          events_fts_index(),
+          vec_idx,
+          clean,
+          q_vec_opt,
+          hopts
+        ).map_error(vec_err)
+        for hh in hhits
+          case hh.doc_id.to_int
+            Some(eid):
+              case try Table.get(st, events_table(), eid).map_error(table_err)
+                Some(ev): out = out.append(
+                  EventSearchHit(
+                    event: ev,
+                    score: hh.score,
+                    fts_rank: hh.fts_rank,
+                    fts_score: hh.fts_score,
+                    vec_rank: hh.vec_rank,
+                    vec_score: hh.vec_score,
+                    matched_terms: hh.matched_terms
+                  )
+                )
+                None: Unit
+              end
+            None: Unit
+          end
+        end
+      end
+      Ok(EventSearchResponse(query: query, mode: mode, embedding_backend: backend, hits: out))
+    end
+  )
 end
 
 fn get_settings(db: DbHandle) : Result(AppSettings, MotetError)
@@ -7134,14 +8092,209 @@ test "Modb.Fts BM25 ranking, prefix search, memory lifecycle, and v1->v2 migrati
   ) is
     Ok(_)
 
-  # Cold read immediately after opening upgraded binary must auto-migrate v1 -> v2 and serve hits
-  db_v2 = open(v1_files, clock)
-  assert search_events(db_v2, "cobalt", 10) is Ok(v2_ehits) and v2_ehits.size == 1
-  assert search_memories(db_v2, None, "amber") is Ok(v2_mhits) and v2_mhits.size == 1
-  assert search_memories(db_v2, None, "archived") == Ok([])
-  assert verify_all(db_v2) is Ok(v2_rep) and v2_rep.ok? and v2_rep.schema_version == 2
+  # Cold read immediately after opening upgraded binary must auto-migrate v1 -> v2 -> v3 and serve hits
+  db_v3 = open(v1_files, clock)
+  assert search_events(db_v3, "cobalt", 10) is Ok(v2_ehits) and v2_ehits.size == 1
+  assert search_memories(db_v3, None, "amber") is Ok(v2_mhits) and v2_mhits.size == 1
+  assert search_memories(db_v3, None, "archived") == Ok([])
+  assert verify_all(db_v3) is Ok(v2_rep) and v2_rep.ok? and v2_rep.schema_version == 3
   assert Modb.open_read_only(v1_files.read_only, default_db_path) is Ok(raw_v2)
   assert Modb.buckets(raw_v2) is Ok(bkts)
   assert not bkts.contains?("event_tokens") and not bkts.contains?("memory_tokens")
   assert bkts.contains?("events_fts_postings") and bkts.contains?("memories_fts_postings")
+  assert bkts.contains?("events_vec_data") and bkts.contains?("memories_vec_data")
+end
+
+test "Schema v2 -> v3 upgrade, vector lifecycle hygiene, and Gemini neural hybrid search vs offline fallback"
+  t0 = Time.parse("2026-11-26T10:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+  now = t0.to_text
+
+  # 1. Simulate live motet.modb at schema v2 (with FTS populated, no Vec buckets yet)
+  v2_files = Files.in_memory({})
+  sc_v2 = Ledger.schema(2).with_require_reason(true).with_migration(
+    Ledger.migration(1, "init v1", fn(tx) Ok(tx) end)
+  ).with_migration(
+    Ledger.migration(2, "init v2 fts", migrate_v1_to_v2)
+  )
+  assert Ledger.open(v2_files, default_db_path, sc_v2, t0) is Ok(ldb_v2)
+  m_meta = WriteMeta(principal: "operator", action: "seed_v2", reason: "v2 fixture", at: t0)
+  assert Ledger.write(
+    ldb_v2,
+    m_meta,
+    "seed v2 rows with fts",
+    Json.Object({}),
+    fn(tx)
+      t1 = try Table.put(
+        tx,
+        sessions_table(),
+        "chief-main",
+        SessionSummary(
+          id: "chief-main",
+          bot_name: "chief",
+          title: "Main",
+          trust: Owner,
+          canonical?: true,
+          compaction_seq: 0,
+          created_at: now,
+          updated_at: now,
+          event_count: 1
+        )
+      )
+      ev1 = SessionEvent(
+        id: 1,
+        session_id: "chief-main",
+        seq: 1,
+        kind: "message",
+        role: "user",
+        content: "Track quarterly VAT tax deductions for Lisbon office",
+        tool_name: None,
+        tool_call_id: None,
+        tool_calls_json: None,
+        cost_usd: 0.0,
+        created_at: now
+      )
+      t2 = try Table.put(t1, events_table(), 1, ev1)
+      t3 = try Fts.tx_index_document(t2, events_fts_index(), event_fts_doc(ev1)).map_error(
+        fts_to_table_err
+      )
+      m1 = MemoryRow(
+        id: 1,
+        scope: "shared",
+        kind: "profile",
+        content: "Direct flights out of SFO preferred over layovers",
+        provenance: "user",
+        origin: "owner",
+        session_kind: "direct",
+        staged: false,
+        archived?: false,
+        created_at: now
+      )
+      t4 = try Table.put(t3, memories_table(), 1, m1)
+      t5 = try Fts.tx_index_document(t4, memories_fts_index(), memory_fts_doc(m1)).map_error(
+        fts_to_table_err
+      )
+      t6 = try Table.put(t5, seqs_table(), "events", 1)
+      t7 = try Table.put(t6, seqs_table(), "memories", 1)
+      Table.put(t7, seqs_table(), "_seeded", 1)
+    end
+  ) is
+    Ok(_)
+
+  # Cold read auto-migrates v2 -> v3 and populates deterministic 128-d sketch vectors
+  db = open(v2_files, clock)
+  assert verify_all(db) is Ok(v3_rep) and v3_rep.ok? and v3_rep.schema_version == 3
+  env_empty = Env.of({})
+  assert search_stats(db, env_empty) is Ok(st0)
+  assert st0.memories_fts_docs == 1 and st0.memories_sketch_docs == 1 and st0.memories_neural_docs == 0
+  assert st0.events_fts_docs == 1 and st0.events_sketch_docs == 1 and st0.events_neural_docs == 0
+
+  # Save a second memory about airline loyalty & sync neural embeddings via mocked Gemini API!
+  assert save_memory(
+    db,
+    "personal",
+    "fact",
+    "Book nonstop flights avoiding intermediate stops",
+    "user",
+    now
+  ) is
+    Ok(m2)
+  assert save_memory(
+    db,
+    "finance",
+    "fact",
+    "Quarterly grocery budget envelope",
+    "user",
+    now
+  ) is
+    Ok(m3)
+
+  # Build 128-d orthogonal basis vectors: axis 0 = aviation/travel, axis 1 = groceries, axis 2 = Lisbon tax
+  basis = fn(hot_dim)
+    var xs = []
+    for i in 0..vec_dimensions
+      xs = xs.append(if i == hot_dim: 1.0.to_float else: 0.0.to_float)
+    end
+    xs
+  end
+  gem_env = Env.of({"GEMINI_API_KEY": "gem-test-v3"})
+  assert resolve_embed_config(db, gem_env) is Ok(Some(cfg))
+
+  # Reindex sends batch for all active memories (3 docs) + events (1 doc), then semantic query sends 1 query
+  # Memories scan order: m1 (#1 SFO layovers -> axis 0), m2 (#2 nonstop -> axis 0), m3 (#3 grocery -> axis 1)
+  mem_texts = [
+    "[shared/profile] Direct flights out of SFO preferred over layovers",
+    "[personal/fact] Book nonstop flights avoiding intermediate stops",
+    "[finance/fact] Quarterly grocery budget envelope"
+  ]
+  ev_texts = ["message user: Track quarterly VAT tax deductions for Lisbon office"]
+  (_u1, req_m_batch) = Llm.build_batch_embed_request(cfg, mem_texts, Llm.EmbedDocument)
+  (_u2, req_e_batch) = Llm.build_batch_embed_request(cfg, ev_texts, Llm.EmbedDocument)
+  (_u3, req_q_travel) = Llm.build_embed_request(cfg, "vacation airfare routing", Llm.EmbedQuery)
+  (_u4, req_q_tax) = Llm.build_embed_request(cfg, "fiscal compliance", Llm.EmbedQuery)
+
+  m_batch_body = Json.Object({
+    "embeddings": Json.Array([
+      Json.Object({"values": basis(0).to_json}),
+      Json.Object({"values": basis(0).to_json}),
+      Json.Object({"values": basis(1).to_json})
+    ])
+  }).to_text
+  e_batch_body = Json.Object({
+    "embeddings": Json.Array([Json.Object({"values": basis(2).to_json})])
+  }).to_text
+  q_travel_body = Json.Object({"embedding": Json.Object({"values": basis(0).to_json})}).to_text
+  q_tax_body = Json.Object({"embedding": Json.Object({"values": basis(2).to_json})}).to_text
+
+  net = Network.fake(
+    Http.replies([
+      (req_m_batch, Http.reply(200, m_batch_body)),
+      (req_e_batch, Http.reply(200, e_batch_body)),
+      (req_q_travel, Http.reply(200, q_travel_body)),
+      (req_q_tax, Http.reply(200, q_tax_body))
+    ])
+  )
+
+  assert reindex_neural_vectors(db, net, gem_env) is Ok(rx)
+  assert rx.backend == "gemini:gemini-embedding-001:128"
+  assert rx.memories_indexed == 3 and rx.events_indexed == 1
+
+  assert search_stats(db, gem_env) is Ok(st1)
+  assert st1.neural_provider == Some("gemini:gemini-embedding-001:128")
+  assert st1.memories_neural_docs == 3 and st1.events_neural_docs == 1
+
+  # Zero shared keywords ("vacation airfare routing" vs "nonstop/SFO"): pure neural semantic recall wins!
+  assert search_memories_rich(db, net, gem_env, Some("personal"), "vacation airfare routing", "hybrid", 10) is
+    Ok(mres)
+  assert mres.embedding_backend == "gemini:gemini-embedding-001:128"
+  assert mres.hits.size == 2
+  assert (mres.hits.first or stop "h0").vec_score is Some(vs) and vs > 0.99
+  assert not mres.hits.any?(fn(h) h.memory.id == m3.id end)
+
+  assert search_events_rich(db, net, gem_env, "fiscal compliance", "semantic", 10) is Ok(eres)
+  assert eres.embedding_backend == "gemini:gemini-embedding-001:128"
+  assert eres.hits.size == 1 and (eres.hits.first or stop "e0").event.id == 1
+
+  # Offline fallback when network doesn't have a reply (falls back gracefully to sketch:128)
+  assert search_memories_rich(
+    db,
+    Network.fake({}),
+    gem_env,
+    None,
+    "nonstop layovers",
+    "hybrid",
+    10
+  ) is
+    Ok(fb_res)
+  assert fb_res.embedding_backend == "sketch:128 (fallback)" and fb_res.hits.size >= 1
+
+  # Vector lifecycle hygiene: editing or archiving removes stale neural + sketch docs cleanly
+  assert update_memory_content(db, m2.id, "Updated unrelated cooking note") is Ok(_)
+  assert archive_memory(db, 1) is Ok(Unit)
+  assert search_stats(db, gem_env) is Ok(st2)
+  # m2 neural removed on edit (1 left: m3), m1 removed on archive -> memories_neural_docs=1 (m3), sketch_docs=2 (m2, m3)
+  assert st2.memories_neural_docs == 1 and st2.memories_sketch_docs == 2 and st2.memories_fts_docs == 2
+  assert delete_memory(db, m3.id) is Ok(Unit)
+  assert search_stats(db, gem_env) is Ok(st3)
+  assert st3.memories_neural_docs == 0 and st3.memories_sketch_docs == 1
 end

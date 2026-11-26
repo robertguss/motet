@@ -11,8 +11,10 @@ use Api
 use Brain
 use Command
 use Connectors
+use Http
 use Intents
 use Json
+use Llm
 use Mcp{parse_host_port, resolve_connector_url}
 use Memory
 use Modb.Claims
@@ -52,8 +54,10 @@ use Types{
   EnqueueRunRequest,
   EvaluateIntentsRequest,
   EvaluateIntentsResponse,
+  EventSearchResponse,
   HealthSummary,
   MemoryEntry,
+  MemorySearchResponse,
   ModbVerifySummary,
   MotetError,
   OpenChildWorldRequest,
@@ -70,6 +74,8 @@ use Types{
   SaveMemoryRequest,
   SaveSecretRequest,
   SaveSkillRequest,
+  SearchIndexStats,
+  SearchReindexResult,
   SessionEvent,
   SessionSummary,
   SkillDoc,
@@ -144,6 +150,7 @@ api
 
   get "/v1/sessions" get_sessions
   get "/v1/sessions/search" get_search_sessions
+  get "/v1/sessions/search/scored" get_search_sessions_scored
   get "/v1/sessions/:id/events" get_session_events
 
   get "/v1/inbox" get_inbox
@@ -162,6 +169,7 @@ api
   get "/v1/vault/search" get_vault_search
 
   get "/v1/memory" get_memory
+  get "/v1/memory/search" get_memory_search
   post "/v1/memory" post_memory
   get "/v1/memory/staged" get_staged_memory
   post "/v1/memory/staged/:id/promote" post_promote_staged_memory
@@ -170,6 +178,8 @@ api
   get "/v1/memory/dream/history" get_dreaming_history
   post "/v1/memory/dream/:id/rollback" post_rollback_dreaming
   delete "/v1/memory/:id" delete_memory_by_id
+  get "/v1/search/stats" get_search_stats
+  post "/v1/search/reindex" post_search_reindex
 
   get "/v1/intents" get_intents
   post "/v1/intents" post_intent
@@ -675,13 +685,34 @@ fn get_sessions(_op: Operator, files: Files, clock: Clock, bot: Option(Text)) : 
   Store.list_sessions(db, bot)
 end
 
-## Full-text searches across all append-only session event logs.
-fn get_search_sessions(_op: Operator, files: Files, clock: Clock, q: Text) : Result(
-  List(SessionEvent),
-  MotetError
-)
+## Hybrid BM25 + semantic searches across all append-only session event logs.
+fn get_search_sessions(
+  _op: Operator,
+  files: Files,
+  network: Network,
+  env: Env,
+  clock: Clock,
+  q: Text,
+  mode: Option(Text)
+) : Result(List(SessionEvent), MotetError)
   db = try ensure_ready(files, clock)
-  Store.search_events(db, q, 25)
+  res = try Store.search_events_rich(db, network, env, q, mode or "hybrid", 25)
+  Ok(res.hits.map(fn(h) h.event end))
+end
+
+## Scored hybrid BM25 + semantic search across session event logs with per-channel RRF/vector scores.
+fn get_search_sessions_scored(
+  _op: Operator,
+  files: Files,
+  network: Network,
+  env: Env,
+  clock: Clock,
+  q: Text,
+  mode: Option(Text),
+  limit: Option(Int)
+) : Result(EventSearchResponse, MotetError)
+  db = try ensure_ready(files, clock)
+  Store.search_events_rich(db, network, env, q, mode or "hybrid", limit or 25)
 end
 
 ## Reads the append-only event stream for one session (supports `?after_seq=N` live tailing).
@@ -886,31 +917,56 @@ fn get_vault_search(
   Ok(VaultSearchResponse(query: q, results: res))
 end
 
-## Lists or keyword-searches persistent shared and bot-scoped memory.
+## Lists or hybrid-searches persistent shared and bot-scoped memory.
 fn get_memory(
   _op: Operator,
   files: Files,
+  network: Network,
+  env: Env,
   clock: Clock,
   scope: Option(Text),
-  q: Option(Text)
+  q: Option(Text),
+  mode: Option(Text)
 ) : Result(List(MemoryEntry), MotetError)
   db = try ensure_ready(files, clock)
   case q
-    Some(query) if not query.trim.empty?: Store.search_memories(db, scope, query)
+    Some(query) if not query.trim.empty?:
+      res = try Store.search_memories_rich(db, network, env, scope, query, mode or "hybrid", 25)
+      Ok(res.hits.map(fn(h) h.memory end))
     Some(_) | None: Store.list_memories(db, scope, 50)
   end
 end
 
-## Saves a persistent memory entry (`shared` or bot-scoped).
-fn post_memory(_op: Operator, files: Files, clock: Clock, body: SaveMemoryRequest) : Result(
-  MemoryEntry,
-  MotetError
-)
+## Scored hybrid BM25 + semantic search across persistent memory with per-channel ranks and scores.
+fn get_memory_search(
+  _op: Operator,
+  files: Files,
+  network: Network,
+  env: Env,
+  clock: Clock,
+  scope: Option(Text),
+  q: Text,
+  mode: Option(Text),
+  limit: Option(Int)
+) : Result(MemorySearchResponse, MotetError)
+  db = try ensure_ready(files, clock)
+  Store.search_memories_rich(db, network, env, scope, q, mode or "hybrid", limit or 25)
+end
+
+## Saves a persistent memory entry (`shared` or bot-scoped) and best-effort syncs its neural embedding.
+fn post_memory(
+  _op: Operator,
+  files: Files,
+  network: Network,
+  env: Env,
+  clock: Clock,
+  body: SaveMemoryRequest
+) : Result(MemoryEntry, MotetError)
   db = try ensure_ready(files, clock)
   return Error(BadInput(message: "memory content cannot be empty")) if body.content.trim.empty?
   scope = if body.scope.trim.empty?: "shared" else: body.scope.trim
   kind = if body.kind.trim.empty?: "fact" else: body.kind.trim
-  Store.save_memory(
+  saved = try Store.save_memory(
     db,
     scope,
     kind,
@@ -918,6 +974,8 @@ fn post_memory(_op: Operator, files: Files, clock: Clock, body: SaveMemoryReques
     body.provenance or "user",
     clock.now.to_text
   )
+  Store.sync_memory_neural_embedding(db, network, env, saved)
+  Ok(saved)
 end
 
 ## Deletes a persistent memory entry by id.
@@ -940,12 +998,39 @@ fn get_staged_memory(_op: Operator, files: Files, clock: Clock) : Result(
 end
 
 ## Promotes a staged memory candidate into active owner-verified durable memory.
-fn post_promote_staged_memory(_op: Operator, files: Files, clock: Clock, id: Int) : Result(
-  MemoryEntry,
+fn post_promote_staged_memory(
+  _op: Operator,
+  files: Files,
+  network: Network,
+  env: Env,
+  clock: Clock,
+  id: Int
+) : Result(MemoryEntry, MotetError)
+  db = try ensure_ready(files, clock)
+  promoted = try Store.promote_staged_memory(db, id)
+  Store.sync_memory_neural_embedding(db, network, env, promoted)
+  Ok(promoted)
+end
+
+## Reports corpus counts across BM25 FTS, deterministic 128-d sketch, and neural 128-d vector indexes.
+fn get_search_stats(_op: Operator, files: Files, env: Env, clock: Clock) : Result(
+  SearchIndexStats,
   MotetError
 )
   db = try ensure_ready(files, clock)
-  Store.promote_staged_memory(db, id)
+  Store.search_stats(db, env)
+end
+
+## Backfills or rebuilds vector embeddings across active memories & session events.
+fn post_search_reindex(
+  _op: Operator,
+  files: Files,
+  network: Network,
+  env: Env,
+  clock: Clock
+) : Result(SearchReindexResult, MotetError)
+  db = try ensure_ready(files, clock)
+  Store.reindex_neural_vectors(db, network, env)
 end
 
 ## Runs Overnight Dreaming consolidation (Light -> REM -> Deep) with a pre-image rollback snapshot.
@@ -2264,12 +2349,33 @@ fn post_mcp(
       }),
       Json.Object({
         "name": Json.String("motet_memory_search"),
-        "description": Json.String("Search Motet persistent shared and bot memory"),
+        "description": Json.String(
+          "Hybrid (BM25 + Modb.Vec semantic RRF) search over Motet persistent shared and bot memory"
+        ),
         "inputSchema": Json.Object({
           "type": Json.String("object"),
-          "properties": Json.Object({"query": Json.Object({"type": Json.String("string")})}),
+          "properties": Json.Object({
+            "query": Json.Object({"type": Json.String("string")}),
+            "scope": Json.Object({"type": Json.String("string")}),
+            "mode": Json.Object({"type": Json.String("string")}),
+            "limit": Json.Object({"type": Json.String("integer")})
+          }),
           "required": Json.Array([Json.String("query")])
         })
+      }),
+      Json.Object({
+        "name": Json.String("motet_search_stats"),
+        "description": Json.String(
+          "Inspect Modb.Fts BM25, 128-d sketch, and neural vector index counts and active embedding backend"
+        ),
+        "inputSchema": Json.Object({"type": Json.String("object")})
+      }),
+      Json.Object({
+        "name": Json.String("motet_search_reindex"),
+        "description": Json.String(
+          "Backfill or rebuild 128-d vector embeddings across all active memories and session events"
+        ),
+        "inputSchema": Json.Object({"type": Json.String("object")})
       }),
       Json.Object({
         "name": Json.String("motet_memory_save"),
@@ -2381,14 +2487,29 @@ fn post_mcp(
     end
     if tname == "motet_memory_search"
       q = args.text_at("query") or ""
-      mems = try Store.search_memories(db, None, q)
-      return Ok(mcp_ok(id, mcp_text_result(Json.encode(mems), mems.to_json)))
+      scope_opt = case args.text_at("scope")
+        Some(s) if not s.trim.empty?: Some(s.trim)
+        Some(_) | None: None
+      end
+      mode = args.text_at("mode") or "hybrid"
+      lim = args.int_at("limit") or 20
+      res = try Store.search_memories_rich(db, network, env, scope_opt, q, mode, lim)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(res), res.to_json)))
+    end
+    if tname == "motet_search_stats"
+      st = try Store.search_stats(db, env)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(st), st.to_json)))
+    end
+    if tname == "motet_search_reindex"
+      rx = try Store.reindex_neural_vectors(db, network, env)
+      return Ok(mcp_ok(id, mcp_text_result(Json.encode(rx), rx.to_json)))
     end
     if tname == "motet_memory_save"
       scope = args.text_at("scope") or "shared"
       kind = args.text_at("kind") or "fact"
       content = args.text_at("content") or ""
       saved = try Store.save_memory(db, scope, kind, content, "mcp", clock.now.to_text)
+      Store.sync_memory_neural_embedding(db, network, env, saved)
       return Ok(mcp_ok(id, mcp_text_result(Json.encode(saved), saved.to_json)))
     end
     if tname == "motet_verify"
@@ -3001,6 +3122,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
       )
     ),
     files,
+    Network.fake({}),
     env,
     clock,
     srng
@@ -3067,6 +3189,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     Server,
     Api.get("/v1/memory").with_bearer("secret-op").with_query("q", "Temporary mistake"),
     files,
+    Network.fake({}),
     env,
     clock,
     srng
@@ -3115,6 +3238,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
       )
     ),
     files,
+    Network.fake({}),
     env,
     clock,
     srng
@@ -3131,6 +3255,7 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
       )
     ),
     files,
+    Network.fake({}),
     env,
     clock,
     srng
@@ -3421,4 +3546,249 @@ test "Motet v1 API serves specialist roster, write-only Vault, async runs + job 
     Json.decode[Store.WorldsOverview](w_ov2.text) is Ok(ov2) and
     ov2.telemetry.child_worlds_landed >= 1 and
     ov2.links.any?(fn(l) l.child_world_id == "w-srv-child" and l.merged_into_parent? end)
+end
+
+test "HTTP and MCP serve hybrid/BM25/semantic search, Vault Gemini reindex, and search stats"
+  files = Files.in_memory({})
+  srng = SecureRandom.seeded(77)
+  env = Env.of({"MOTET_API_TOKEN": "secret-op", "MOTET_MASTER_KEY": "master-search-v3"})
+  t0 = Time.parse("2026-11-26T12:00:00Z") or stop "time"
+  clock = Clock.fixed(t0)
+
+  # Save two memories & one session event offline first (without GEMINI_API_KEY in env)
+  assert ApiTest.send(
+    Server,
+    Api.post("/v1/memory").with_bearer("secret-op").with_json(
+      SaveMemoryRequest(
+        scope: "shared",
+        kind: "profile",
+        content: "Direct flights from SFO preferred for international trips",
+        provenance: Some("user")
+      )
+    ),
+    files,
+    Network.fake({}),
+    env,
+    clock,
+    srng
+  ).status ==
+    200
+
+  assert ApiTest.send(
+    Server,
+    Api.post("/v1/memory").with_bearer("secret-op").with_json(
+      SaveMemoryRequest(
+        scope: "finance",
+        kind: "fact",
+        content: "Grocery budget cap is $600 monthly",
+        provenance: Some("user")
+      )
+    ),
+    files,
+    Network.fake({}),
+    env,
+    clock,
+    srng
+  ).status ==
+    200
+
+  # Create canonical session & append one session event
+  assert ApiTest.send(
+    Server,
+    Api.get("/v1/bots/chief/canonical").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  ).status ==
+    200
+  db_t = Store.open(files, clock)
+  assert Store.append_event(
+    db_t,
+    "chief-main",
+    "message",
+    "user",
+    "Audit Portuguese VAT receipts for Q4",
+    None,
+    None,
+    0.0,
+    t0.to_text
+  ) is
+    Ok(_)
+
+  # Initial search stats: schema=v3, sketch populated, neural=0
+  st0 = ApiTest.send(
+    Server,
+    Api.get("/v1/search/stats").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert st0.status == 200 and
+    Json.decode[SearchIndexStats](st0.text) is Ok(s0) and
+    s0.schema_version == 3 and
+    s0.memories_fts_docs == 2 and
+    s0.memories_sketch_docs == 2 and
+    s0.memories_neural_docs == 0 and
+    s0.events_sketch_docs == 1
+
+  # Seal GEMINI_API_KEY in Vault and reindex via mocked Gemini batch endpoint
+  assert ApiTest.send(
+    Server,
+    Api.post("/v1/vault/secrets").with_bearer("secret-op").with_json(
+      SaveSecretRequest(name: "GEMINI_API_KEY", value: "gem-vault-live", scope: Some("llm"))
+    ),
+    files,
+    env,
+    clock,
+    srng
+  ).status ==
+    200
+
+  basis = fn(hot_dim)
+    var xs = []
+    for i in 0..Store.vec_dimensions
+      xs = xs.append(if i == hot_dim: 1.0.to_float else: 0.0.to_float)
+    end
+    xs
+  end
+  cfg = Llm.resolve_embed_config(Some("gem-vault-live"), None, Store.vec_dimensions) or stop "cfg"
+  mem_texts = [
+    "[shared/profile] Direct flights from SFO preferred for international trips",
+    "[finance/fact] Grocery budget cap is $600 monthly"
+  ]
+  ev_texts = ["message user: Audit Portuguese VAT receipts for Q4"]
+  (_u1, req_m_b) = Llm.build_batch_embed_request(cfg, mem_texts, Llm.EmbedDocument)
+  (_u2, req_e_b) = Llm.build_batch_embed_request(cfg, ev_texts, Llm.EmbedDocument)
+  (_u3, req_q_mem) = Llm.build_embed_request(cfg, "vacation airfare routing", Llm.EmbedQuery)
+  (_u4, req_q_ev) = Llm.build_embed_request(cfg, "lisbon tax obligations", Llm.EmbedQuery)
+
+  m_b_body = Json.Object({
+    "embeddings": Json.Array([
+      Json.Object({"values": basis(0).to_json}),
+      Json.Object({"values": basis(1).to_json})
+    ])
+  }).to_text
+  e_b_body = Json.Object({
+    "embeddings": Json.Array([Json.Object({"values": basis(2).to_json})])
+  }).to_text
+  q_mem_body = Json.Object({"embedding": Json.Object({"values": basis(0).to_json})}).to_text
+  q_ev_body = Json.Object({"embedding": Json.Object({"values": basis(2).to_json})}).to_text
+
+  net = Network.fake(
+    Http.replies([
+      (req_m_b, Http.reply(200, m_b_body)),
+      (req_e_b, Http.reply(200, e_b_body)),
+      (req_q_mem, Http.reply(200, q_mem_body)),
+      (req_q_ev, Http.reply(200, q_ev_body))
+    ])
+  )
+
+  rx_resp = ApiTest.send(
+    Server,
+    Api.post("/v1/search/reindex").with_bearer("secret-op"),
+    files,
+    net,
+    env,
+    clock,
+    srng
+  )
+  assert rx_resp.status == 200 and
+    Json.decode[SearchReindexResult](rx_resp.text) is Ok(rx) and
+    rx.backend == "gemini:gemini-embedding-001:128" and
+    rx.memories_indexed == 2 and
+    rx.events_indexed == 1
+
+  # Semantic/hybrid HTTP search over zero-keyword-overlap natural query finds SFO flights!
+  ms_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/memory/search").with_bearer("secret-op").with_query(
+      "q",
+      "vacation airfare routing"
+    ).with_query("mode", "hybrid"),
+    files,
+    net,
+    env,
+    clock,
+    srng
+  )
+  assert ms_resp.status == 200 and
+    Json.decode[MemorySearchResponse](ms_resp.text) is Ok(msr) and
+    msr.embedding_backend == "gemini:gemini-embedding-001:128" and
+    msr.hits.size == 1 and
+    (msr.hits.first or stop "mhit").memory.content.contains?("SFO")
+
+  # BM25 HTTP search works strictly offline
+  bm_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/memory/search").with_bearer("secret-op").with_query("q", "grocery").with_query(
+      "mode",
+      "bm25"
+    ),
+    files,
+    Network.fake({}),
+    env,
+    clock,
+    srng
+  )
+  assert bm_resp.status == 200 and
+    Json.decode[MemorySearchResponse](bm_resp.text) is Ok(bmr) and
+    bmr.mode == "bm25" and
+    bmr.hits.size == 1
+
+  # Scored session event search hits Portuguese VAT via neural semantic vector
+  es_resp = ApiTest.send(
+    Server,
+    Api.get("/v1/sessions/search/scored").with_bearer("secret-op").with_query(
+      "q",
+      "lisbon tax obligations"
+    ).with_query("mode", "semantic"),
+    files,
+    net,
+    env,
+    clock,
+    srng
+  )
+  assert es_resp.status == 200 and
+    Json.decode[EventSearchResponse](es_resp.text) is Ok(esr) and
+    esr.hits.size == 1 and
+    (esr.hits.first or stop "ehit").event.content.contains?("VAT")
+
+  # MCP motet_search_stats and motet_memory_search
+  mcp_st = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_text(
+      "{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"tools/call\",\"params\":{\"name\":\"motet_search_stats\",\"arguments\":{}}}"
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_st.status == 200 and mcp_st.text.contains?("gemini:gemini-embedding-001:128")
+
+  mcp_ms = ApiTest.send(
+    Server,
+    Api.post("/mcp").with_bearer("secret-op").with_json(
+      Json.Object({
+        "jsonrpc": "2.0".to_json,
+        "id": 102.to_json,
+        "method": "tools/call".to_json,
+        "params": Json.Object({
+          "name": "motet_memory_search".to_json,
+          "arguments": Json.Object({
+            "query": "vacation airfare routing".to_json,
+            "mode": "hybrid".to_json
+          })
+        })
+      })
+    ),
+    files,
+    net,
+    env,
+    clock,
+    srng
+  )
+  assert mcp_ms.status == 200 and mcp_ms.text.contains?("SFO")
 end

@@ -50,6 +50,13 @@ fn obj_schema(props: Map(Text, Json), required: List(Text)) : Json
   })
 end
 
+fn fmt_score(s: Float) : Text
+  case s.to_decimal
+    Some(d): d.to_fixed(4)
+    None: s.to_text
+  end
+end
+
 ## Lean core tool surface (progressive disclosure for skills & remote MCP connectors).
 fn core_tool_defs() : List(ToolDef)
   [
@@ -78,13 +85,25 @@ fn core_tool_defs() : List(ToolDef)
     ),
     ToolDef(
       name: "memory_search",
-      description: "Search persistent shared and bot-scoped memory by keywords.",
-      schema: obj_schema({"query": str_prop("Search keywords")}, ["query"])
+      description: "Search persistent shared and bot-scoped memory using hybrid BM25 + semantic vector search.",
+      schema: obj_schema(
+        {
+          "query": str_prop("Search keywords or natural-language question"),
+          "mode": str_prop("Optional search mode: hybrid (default), bm25, or semantic")
+        },
+        ["query"]
+      )
     ),
     ToolDef(
       name: "session_search",
-      description: "Search past append-only session event logs across conversations.",
-      schema: obj_schema({"query": str_prop("Search keywords")}, ["query"])
+      description: "Search past append-only session event logs using hybrid BM25 + semantic vector search.",
+      schema: obj_schema(
+        {
+          "query": str_prop("Search keywords or natural-language question"),
+          "mode": str_prop("Optional search mode: hybrid (default), bm25, or semantic")
+        },
+        ["query"]
+      )
     ),
     ToolDef(
       name: "skill_read",
@@ -557,6 +576,7 @@ fn execute_tool_with_grant(
         "staged memory candidate ##{entry.id} [#{entry.scope}/#{entry.kind}] for owner review (taint gate: #{origin}/#{session_kind})"
       )
     else
+      Store.sync_memory_neural_embedding(db, rt.network, rt.env, entry)
       return Ok("saved memory ##{entry.id} [#{entry.scope}/#{entry.kind}]")
     end
   end
@@ -570,29 +590,41 @@ fn execute_tool_with_grant(
       return Ok("memory_patch blocked: only Owner direct turns may patch durable hot memory")
     end
     return case Memory.patch_memory(db, mid, content)
-      Ok(entry): Ok("patched memory ##{entry.id} [#{entry.scope}/#{entry.kind}]")
+      Ok(entry):
+        Store.sync_memory_neural_embedding(db, rt.network, rt.env, entry)
+        Ok("patched memory ##{entry.id} [#{entry.scope}/#{entry.kind}]")
       Error(err): Ok("memory_patch error: #{err}")
     end
   end
 
   if tool_name == "memory_search"
     q = args.text_at("query") or ""
-    hits = try Store.search_memories(db, Some(bot.name), q)
-    if hits.empty?
-      return Ok("no matching memories")
+    mode = args.text_at("mode") or "hybrid"
+    res = try Store.search_memories_rich(db, rt.network, rt.env, Some(bot.name), q, mode, 15)
+    if res.hits.empty?
+      return Ok("no matching memories (#{res.mode}/#{res.embedding_backend})")
     end
-    lines = hits.map(fn(m) "##{m.id} [#{m.scope}/#{m.kind}] #{m.content}" end)
-    return Ok(lines.join("\n"))
+    hdr = "[memory_search mode=#{res.mode} backend=#{res.embedding_backend}]"
+    lines = res.hits.map(fn(h)
+      m = h.memory
+      "##{m.id} [#{m.scope}/#{m.kind}] (score=#{fmt_score(h.score)}) #{m.content}"
+    end)
+    return Ok(([hdr].concat(lines)).join("\n"))
   end
 
   if tool_name == "session_search"
     q = args.text_at("query") or ""
-    hits = try Store.search_events(db, q, 12)
-    if hits.empty?
-      return Ok("no matching session events")
+    mode = args.text_at("mode") or "hybrid"
+    res = try Store.search_events_rich(db, rt.network, rt.env, q, mode, 12)
+    if res.hits.empty?
+      return Ok("no matching session events (#{res.mode}/#{res.embedding_backend})")
     end
-    lines = hits.map(fn(ev) "[#{ev.session_id}##{ev.seq} #{ev.role}] #{ev.content}" end)
-    return Ok(lines.join("\n"))
+    hdr = "[session_search mode=#{res.mode} backend=#{res.embedding_backend}]"
+    lines = res.hits.map(fn(h)
+      ev = h.event
+      "[#{ev.session_id}##{ev.seq} #{ev.role}] (score=#{fmt_score(h.score)}) #{ev.content}"
+    end)
+    return Ok(([hdr].concat(lines)).join("\n"))
   end
 
   if tool_name == "skill_read"

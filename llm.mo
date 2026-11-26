@@ -8,12 +8,21 @@ expose PromptTiers(..),
 ToolDef(..),
 LlmMessage(..),
 LlmResponse(..),
+EmbedTask(..),
+EmbedProvider(..),
+EmbedConfig(..),
 build_http_request,
 chat_turn,
-chat_turn_with_key
+chat_turn_with_key,
+resolve_embed_config,
+build_embed_request,
+build_batch_embed_request,
+embed_text,
+embed_batch
 use Http
 use Json
 use Mcp{parse_host_port}
+use Modb.Vec
 use Types{BotConfig, MotetError, ProviderKind, ToolCallReq}
 
 struct PromptTiers
@@ -556,6 +565,304 @@ fn chat_turn(
   chat_turn_with_key(network, clock, bot, api_key, tiers, messages, tools)
 end
 
+## Task hint for embedding endpoints (`RETRIEVAL_DOCUMENT` vs `RETRIEVAL_QUERY`).
+enum EmbedTask
+  EmbedDocument
+  EmbedQuery
+end
+
+## Supported neural embedding backends reusing Vault / Env API keys.
+enum EmbedProvider
+  GeminiEmbed(model: Text)
+  OpenAiEmbed(endpoint: Text, model: Text)
+end
+
+## Resolved neural embedding configuration (tag names the metric/model/dims space).
+struct EmbedConfig
+  provider: EmbedProvider
+  api_key: Text
+  dimensions: Int
+  tag: Text
+end
+
+embed_batch_chunk_size = 64
+
+embed_max_input_chars = 2000
+
+fn embed_task_to_gemini(t: EmbedTask) : Text
+  case t
+    EmbedDocument: "RETRIEVAL_DOCUMENT"
+    EmbedQuery: "RETRIEVAL_QUERY"
+  end
+end
+
+fn cap_embed_text(text: Text, max_chars: Int) : Text
+  clean = text.trim
+  if clean.empty?
+    "(empty)"
+  else if max_chars <= 0
+    ""
+  else if clean.char_count <= max_chars
+    clean
+  else
+    Text.from_chars(clean.chars.take(max_chars))
+  end
+end
+
+## Resolves neural embedding configuration (`GEMINI_API_KEY` prioritized, then `OPENAI_API_KEY`).
+fn resolve_embed_config(
+  gemini_key: Option(Text),
+  openai_key: Option(Text),
+  dims: Int
+) : Option(EmbedConfig)
+  eff_dims = if dims > 0 and dims <= 4096: dims else: 128
+  case gemini_key
+    Some(gk) if not gk.trim.empty?: Some(
+      EmbedConfig(
+        provider: GeminiEmbed(model: "gemini-embedding-001"),
+        api_key: gk.trim,
+        dimensions: eff_dims,
+        tag: "gemini:gemini-embedding-001:#{eff_dims}"
+      )
+    )
+    Some(_) | None:
+      case openai_key
+        Some(ok_key) if not ok_key.trim.empty?: Some(
+          EmbedConfig(
+            provider: OpenAiEmbed(
+              endpoint: "https://api.openai.com/v1/embeddings",
+              model: "text-embedding-3-small"
+            ),
+            api_key: ok_key.trim,
+            dimensions: eff_dims,
+            tag: "openai:text-embedding-3-small:#{eff_dims}"
+          )
+        )
+        Some(_) | None: None
+      end
+  end
+end
+
+fn gemini_embed_item_json(model: Text, text: Text, task: EmbedTask, dims: Int) : Json
+  safe = cap_embed_text(text, embed_max_input_chars)
+  Json.Object({
+    "model": Json.String("models/#{model.trim}"),
+    "content": Json.Object({"parts": Json.Array([Json.Object({"text": Json.String(safe)})])}),
+    "taskType": Json.String(embed_task_to_gemini(task)),
+    "outputDimensionality": Json.int(dims)
+  })
+end
+
+## Builds single-text HTTP request `(target_url, Http.Request)` for `cfg`.
+fn build_embed_request(cfg: EmbedConfig, text: Text, task: EmbedTask) : (Text, Http.Request)
+  case cfg.provider
+    GeminiEmbed(model: m):
+      url = "https://generativelanguage.googleapis.com/v1beta/models/#{m.trim}:embedContent"
+      payload = gemini_embed_item_json(m, text, task, cfg.dimensions)
+      req = Http.post(url).header("x-goog-api-key", cfg.api_key).json(payload).within(30.seconds)
+      (url, req)
+    OpenAiEmbed(endpoint: ep, model: m):
+      safe = cap_embed_text(text, embed_max_input_chars)
+      payload = Json.Object({
+        "model": Json.String(m.trim),
+        "input": Json.String(safe),
+        "dimensions": Json.int(cfg.dimensions)
+      })
+      var req = Http.post(ep)
+      if not cfg.api_key.trim.empty?
+        req = req.header("Authorization", "Bearer #{cfg.api_key.trim}")
+      end
+      (ep, req.json(payload).within(30.seconds))
+  end
+end
+
+## Builds batch HTTP request `(target_url, Http.Request)` for up to `embed_batch_chunk_size` texts.
+fn build_batch_embed_request(
+  cfg: EmbedConfig,
+  texts: List(Text),
+  task: EmbedTask
+) : (Text, Http.Request)
+  case cfg.provider
+    GeminiEmbed(model: m):
+      url = "https://generativelanguage.googleapis.com/v1beta/models/#{m.trim}:batchEmbedContents"
+      reqs = texts.map(fn(t) gemini_embed_item_json(m, t, task, cfg.dimensions) end)
+      payload = Json.Object({"requests": Json.Array(reqs)})
+      req = Http.post(url).header("x-goog-api-key", cfg.api_key).json(payload).within(45.seconds)
+      (url, req)
+    OpenAiEmbed(endpoint: ep, model: m):
+      inputs = texts.map(fn(t) Json.String(cap_embed_text(t, embed_max_input_chars)) end)
+      payload = Json.Object({
+        "model": Json.String(m.trim),
+        "input": Json.Array(inputs),
+        "dimensions": Json.int(cfg.dimensions)
+      })
+      var req = Http.post(ep)
+      if not cfg.api_key.trim.empty?
+        req = req.header("Authorization", "Bearer #{cfg.api_key.trim}")
+      end
+      (ep, req.json(payload).within(45.seconds))
+  end
+end
+
+fn parse_float_array(vals: List(Json), expected_dims: Int) : Result(List(Float), MotetError)
+  var out = []
+  for v in vals
+    f = case v
+      Json.Number(num):
+        case num.to_float
+          Some(x) if not x.nan? and not x.infinite?: x
+          Some(_) | None: return Error(
+            UpstreamFailed(message: "embedding vector contains non-finite value")
+          )
+        end
+      Json.Null | Json.Boolean(_) | Json.String(_) | Json.Array(_) | Json.Object(_): return Error(
+        UpstreamFailed(message: "embedding response contains non-numeric entry")
+      )
+    end
+    out = out.append(f)
+  end
+  if out.size != expected_dims
+    return Error(
+      UpstreamFailed(
+        message: "embedding dimension mismatch: expected #{expected_dims}, got #{out.size}"
+      )
+    )
+  end
+  normed = Vec.normalize(out)
+  if normed.all?(fn(x) x == 0.0 end)
+    return Error(UpstreamFailed(message: "embedding provider returned zero-norm vector"))
+  end
+  Ok(normed)
+end
+
+fn send_embed_json(
+  network: Network,
+  clock: Clock,
+  target_url: Text,
+  req: Http.Request
+) : Result(Json, MotetError)
+  pinned = network.allow_hosts([parse_host_port(target_url)])
+  var attempt = 0
+  while attempt < 2
+    resp = try req.send(pinned).map_error(
+      fn(e) UpstreamFailed(message: "Embedding request failed: #{e}") end
+    )
+    if (resp.status == 429 or resp.status == 529) and attempt == 0
+      clock.sleep(1.seconds)
+      attempt += 1
+      continue
+    end
+    if not resp.ok?
+      err_txt = (resp.text or "").replace("\n", " ").replace("\r", "").trim
+      err_short = Text.from_chars(err_txt.chars.take(240))
+      return Error(UpstreamFailed(message: "Embedding HTTP #{resp.status}: #{err_short}"))
+    end
+    return resp.json.map_error(
+      fn(e) UpstreamFailed(message: "Embedding response JSON parse error: #{e}") end
+    )
+  end
+  Error(UpstreamFailed(message: "Embedding retry loop exhausted"))
+end
+
+## Generates one L2-normalized embedding vector via `cfg` (with single 429/529 retry).
+fn embed_text(
+  network: Network,
+  clock: Clock,
+  cfg: EmbedConfig,
+  text: Text,
+  task: EmbedTask
+) : Result(List(Float), MotetError)
+  if text.trim.empty?
+    return Error(Types.BadInput(message: "cannot embed empty text"))
+  end
+  (url, req) = build_embed_request(cfg, text, task)
+  doc = try send_embed_json(network, clock, url, req)
+  raw_vals = case cfg.provider
+    GeminiEmbed(model: _): try doc.list_at("embedding.values").or_fail(
+      UpstreamFailed(message: "Gemini embedContent response missing embedding.values")
+    )
+    OpenAiEmbed(endpoint: _, model: _):
+      data_items = try doc.list_at("data").or_fail(
+        UpstreamFailed(message: "OpenAI embeddings response missing data array")
+      )
+      first_item = try data_items.first.or_fail(
+        UpstreamFailed(message: "OpenAI embeddings response empty data")
+      )
+      try first_item.list_at("embedding").or_fail(
+        UpstreamFailed(message: "OpenAI embeddings item missing embedding")
+      )
+  end
+  parse_float_array(raw_vals, cfg.dimensions)
+end
+
+fn embed_batch_chunk(
+  network: Network,
+  clock: Clock,
+  cfg: EmbedConfig,
+  chunk: List(Text),
+  task: EmbedTask
+) : Result(List(List(Float)), MotetError)
+  (url, req) = build_batch_embed_request(cfg, chunk, task)
+  doc = try send_embed_json(network, clock, url, req)
+  var out = []
+  case cfg.provider
+    GeminiEmbed(model: _):
+      embs = try doc.list_at("embeddings").or_fail(
+        UpstreamFailed(message: "Gemini batchEmbedContents response missing embeddings array")
+      )
+      for item in embs
+        vals = try item.list_at("values").or_fail(
+          UpstreamFailed(message: "Gemini batch item missing values array")
+        )
+        out = out.append(try parse_float_array(vals, cfg.dimensions))
+      end
+    OpenAiEmbed(endpoint: _, model: _):
+      raw_data = try doc.list_at("data").or_fail(
+        UpstreamFailed(message: "OpenAI batch embeddings response missing data array")
+      )
+      indexed = raw_data.enumerate.map(fn(pair)
+        idx = pair.1.int_at("index") or pair.0
+        (idx, pair.1)
+      end).sort_by(fn(p) p.0 end)
+      for (_idx, item) in indexed
+        vals = try item.list_at("embedding").or_fail(
+          UpstreamFailed(message: "OpenAI batch item missing embedding array")
+        )
+        out = out.append(try parse_float_array(vals, cfg.dimensions))
+      end
+  end
+  if out.size != chunk.size
+    return Error(
+      UpstreamFailed(
+        message: "batch embedding count mismatch: expected #{chunk.size}, got #{out.size}"
+      )
+    )
+  end
+  Ok(out)
+end
+
+## Generates L2-normalized embeddings for all `texts` in batches of `embed_batch_chunk_size`.
+fn embed_batch(
+  network: Network,
+  clock: Clock,
+  cfg: EmbedConfig,
+  texts: List(Text),
+  task: EmbedTask
+) : Result(List(List(Float)), MotetError)
+  return Ok([]) if texts.empty?
+  var out = []
+  var offset = 0
+  while offset < texts.size
+    chunk = texts.drop(offset).take(embed_batch_chunk_size)
+    vecs = try embed_batch_chunk(network, clock, cfg, chunk, task)
+    for v in vecs
+      out = out.append(v)
+    end
+    offset += chunk.size
+  end
+  Ok(out)
+end
+
 test "OpenAI-compatible, Anthropic (with parallel tool_result merge), and native Google Gemini adapters work"
   tiers = PromptTiers(stable: "You are Chief.", context: "Wall: personal", volatile: "Now: t0")
   tools = [
@@ -685,4 +992,61 @@ test "OpenAI-compatible, Anthropic (with parallel tool_result merge), and native
     r3.tool_calls.size == 1 and
     r3.input_tokens == 400 and
     r3.cached_input_tokens == 250
+end
+
+test "Gemini and OpenAI neural embedding adapters resolve priority, normalize MRL vectors, and batch cleanly"
+  clock = Clock.fixed(Time.parse("2026-11-26T00:00:00Z") or stop "time")
+
+  # Priority: Gemini > OpenAI > None
+  assert resolve_embed_config(None, None, 128) == None
+  cfg_oai = resolve_embed_config(Some("   "), Some("sk-oai"), 128) or stop "oai"
+  assert cfg_oai.tag == "openai:text-embedding-3-small:128"
+  cfg_gem = resolve_embed_config(Some("gem-k"), Some("sk-oai"), 128) or stop "gem"
+  assert cfg_gem.tag == "gemini:gemini-embedding-001:128"
+
+  # Gemini 4-d test with scientific notation + MRL L2 renormalization
+  cfg4_gem = resolve_embed_config(Some("gem-k"), None, 4) or stop "gem4"
+  (_u1, greq) = build_embed_request(cfg4_gem, "tax deductible travel expense", EmbedQuery)
+  g_body = "{\"embedding\":{\"values\":[3.0, 4.0, -1.25e-05, 0.0]}}"
+
+  (_u2, gbreq) = build_batch_embed_request(
+    cfg4_gem,
+    ["doc one", "doc two"],
+    EmbedDocument
+  )
+  gb_body = "{\"embeddings\":[{\"values\":[2.0, 0.0, 0.0, 0.0]},{\"values\":[0.0, 5.0, 0.0, 0.0]}]}"
+
+  # OpenAI 4-d test (including out-of-order `index` sorting on batch)
+  cfg4_oai = resolve_embed_config(None, Some("sk-oai"), 4) or stop "oai4"
+  (_u3, oreq) = build_embed_request(cfg4_oai, "morning brief preference", EmbedQuery)
+  o_body = "{\"data\":[{\"index\":0,\"embedding\":[0.0, 0.0, 6.0, 8.0]}]}"
+
+  (_u4, obreq) = build_batch_embed_request(cfg4_oai, ["first", "second"], EmbedDocument)
+  ob_body = "{\"data\":[{\"index\":1,\"embedding\":[0.0, 3.0, 0.0, 0.0]},{\"index\":0,\"embedding\":[4.0, 0.0, 0.0, 0.0]}]}"
+
+  net = Network.fake(
+    Http.replies([
+      (greq, Http.reply(200, g_body)),
+      (gbreq, Http.reply(200, gb_body)),
+      (oreq, Http.reply(200, o_body)),
+      (obreq, Http.reply(200, ob_body))
+    ])
+  )
+
+  assert embed_text(net, clock, cfg4_gem, "tax deductible travel expense", EmbedQuery) is Ok(gv)
+  assert gv.size == 4
+  assert Vec.l2_norm(gv) > 0.999 and Vec.l2_norm(gv) < 1.001
+  assert (gv.first or 0.0) > 0.59 and (gv.first or 0.0) < 0.61
+
+  assert embed_batch(net, clock, cfg4_gem, ["doc one", "doc two"], EmbedDocument) is Ok(gbv)
+  assert gbv.size == 2
+  assert ((gbv.first or []).first or 0.0) > 0.999
+  assert ((gbv.get(1) or []).get(1) or 0.0) > 0.999
+
+  assert embed_text(net, clock, cfg4_oai, "morning brief preference", EmbedQuery) is Ok(ov)
+  assert (ov.get(2) or 0.0) > 0.59 and (ov.get(3) or 0.0) > 0.79
+
+  assert embed_batch(net, clock, cfg4_oai, ["first", "second"], EmbedDocument) is Ok(obv)
+  assert ((obv.first or []).first or 0.0) > 0.999
+  assert ((obv.get(1) or []).get(1) or 0.0) > 0.999
 end

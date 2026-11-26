@@ -364,7 +364,7 @@ fn run_turn_internal(
   end
 
   prior = try load_prior_messages(db, session_id)
-  _ev_u = try Store.append_event(
+  ev_u = try Store.append_event(
     db,
     session_id,
     "message",
@@ -375,6 +375,7 @@ fn run_turn_internal(
     0.0,
     now_text
   )
+  Store.sync_event_neural_embedding(db, rt.network, rt.env, ev_u)
 
   tiers = try build_prompt_tiers(db, rt.files.read_only, bot, trust, now_text)
   tool_defs = core_tool_defs()
@@ -506,7 +507,7 @@ fn run_turn_internal(
     end
 
     if resp.tool_calls.empty?
-      _ev_a = try Store.append_event(
+      ev_a = try Store.append_event(
         db,
         session_id,
         "message",
@@ -517,6 +518,7 @@ fn run_turn_internal(
         step_cost,
         step_now
       )
+      Store.sync_event_neural_embedding(db, rt.network, rt.env, ev_a)
       break
     end
 

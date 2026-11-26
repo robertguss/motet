@@ -73,6 +73,12 @@ WorldCallRequest(..),
 WorldLandRequest(..),
 OpenChildWorldRequest(..),
 WorldPriorityRequest(..),
+MemorySearchHit(..),
+MemorySearchResponse(..),
+EventSearchHit(..),
+EventSearchResponse(..),
+SearchIndexStats(..),
+SearchReindexResult(..),
 provider_to_text,
 provider_from_text,
 effect_to_text,
@@ -673,6 +679,60 @@ struct WorldPriorityRequest
   buckets: List(Text)
   min_stale_threshold: Option(Int)
   hold_seconds: Option(Int)
+end
+
+struct MemorySearchHit
+  memory: MemoryEntry
+  score: Float
+  fts_rank: Option(Int)
+  fts_score: Option(Float)
+  vec_rank: Option(Int)
+  vec_score: Option(Float)
+  matched_terms: List(Text)
+end
+
+struct MemorySearchResponse
+  query: Text
+  mode: Text
+  embedding_backend: Text
+  hits: List(MemorySearchHit)
+end
+
+struct EventSearchHit
+  event: SessionEvent
+  score: Float
+  fts_rank: Option(Int)
+  fts_score: Option(Float)
+  vec_rank: Option(Int)
+  vec_score: Option(Float)
+  matched_terms: List(Text)
+end
+
+struct EventSearchResponse
+  query: Text
+  mode: Text
+  embedding_backend: Text
+  hits: List(EventSearchHit)
+end
+
+struct SearchIndexStats
+  schema_version: Int
+  dimensions: Int
+  neural_provider: Option(Text)
+  configured_provider: Option(Text)
+  memories_fts_docs: Int
+  memories_sketch_docs: Int
+  memories_neural_docs: Int
+  events_fts_docs: Int
+  events_sketch_docs: Int
+  events_neural_docs: Int
+end
+
+struct SearchReindexResult
+  backend: Text
+  memories_indexed: Int
+  events_indexed: Int
+  cleared_stale_neural?: Bool
 end
 
 fn provider_to_text(p: ProviderKind) : Text

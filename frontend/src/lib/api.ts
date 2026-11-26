@@ -548,6 +548,60 @@ export interface ModbReadLogEntry {
   at: string;
 }
 
+export interface MemorySearchHit {
+  memory: MemoryEntry;
+  score: number;
+  fts_rank?: number | null;
+  fts_score?: number | null;
+  vec_rank?: number | null;
+  vec_score?: number | null;
+  matched_terms: string[];
+}
+
+export interface MemorySearchResponse {
+  query: string;
+  mode: string;
+  embedding_backend: string;
+  hits: MemorySearchHit[];
+}
+
+export interface EventSearchHit {
+  event: SessionEvent;
+  score: number;
+  fts_rank?: number | null;
+  fts_score?: number | null;
+  vec_rank?: number | null;
+  vec_score?: number | null;
+  matched_terms: string[];
+}
+
+export interface EventSearchResponse {
+  query: string;
+  mode: string;
+  embedding_backend: string;
+  hits: EventSearchHit[];
+}
+
+export interface SearchIndexStats {
+  schema_version: number;
+  dimensions: number;
+  neural_provider?: string | null;
+  configured_provider?: string | null;
+  memories_fts_docs: number;
+  memories_sketch_docs: number;
+  memories_neural_docs: number;
+  events_fts_docs: number;
+  events_sketch_docs: number;
+  events_neural_docs: number;
+}
+
+export interface SearchReindexResult {
+  backend: string;
+  memories_indexed: number;
+  events_indexed: number;
+  'cleared_stale_neural?': boolean;
+}
+
 export function getStoredToken(): string {
   return localStorage.getItem('motet_token') || '';
 }

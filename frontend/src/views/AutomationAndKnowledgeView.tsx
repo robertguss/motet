@@ -8,6 +8,7 @@ import {
   Pause,
   Play,
   Plus,
+  RefreshCw,
   RotateCcw,
   Save,
   Search,
@@ -21,9 +22,12 @@ import {
   BotConfig,
   DreamingDigest,
   MemoryEntry,
+  MemorySearchResponse,
   ModbDreamingWorldPreview,
   ModbWorldLandResult,
   RoutineSpec,
+  SearchIndexStats,
+  SearchReindexResult,
   SkillDoc,
   SkillSummary,
   StandingIntent,
@@ -736,19 +740,62 @@ export const MemoryView: React.FC<{
   const [dreamPreview, setDreamPreview] = useState<ModbDreamingWorldPreview | null>(null);
   const [previewingDream, setPreviewingDream] = useState(false);
   const [landingDream, setLandingDream] = useState(false);
+  const [searchStats, setSearchStats] = useState<SearchIndexStats | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchMode, setSearchMode] = useState<'hybrid' | 'bm25' | 'semantic'>('hybrid');
+  const [searchRes, setSearchRes] = useState<MemorySearchResponse | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [reindexing, setReindexing] = useState(false);
 
   async function loadAdvanced() {
-    const [st, dg] = await Promise.all([
+    const [st, dg, stats] = await Promise.all([
       apiOptional<MemoryEntry[]>('/v1/memory/staged', []),
       apiOptional<DreamingDigest[]>('/v1/memory/dream/history', []),
+      apiOptional<SearchIndexStats | null>('/v1/search/stats', null),
     ]);
     setStaged(st);
     setDigests(dg);
+    setSearchStats(stats);
   }
 
   useEffect(() => {
     loadAdvanced();
   }, []);
+
+  async function runMemorySearch(e: React.FormEvent) {
+    e.preventDefault();
+    const q = searchQuery.trim();
+    if (!q) return;
+    setSearching(true);
+    try {
+      const res = await api<MemorySearchResponse>(
+        `/v1/memory/search?q=${encodeURIComponent(q)}&mode=${encodeURIComponent(searchMode)}`
+      );
+      setSearchRes(res);
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function reindexEmbeddings() {
+    setReindexing(true);
+    try {
+      const res = await api<SearchReindexResult>('/v1/search/reindex', {
+        method: 'POST',
+        body: '{}',
+      });
+      toast(
+        `Reindexed ${res.memories_indexed} memories & ${res.events_indexed} events (${res.backend})`
+      );
+      await loadAdvanced();
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setReindexing(false);
+    }
+  }
 
   async function saveMemory(e: React.FormEvent) {
     e.preventDefault();
@@ -878,6 +925,106 @@ export const MemoryView: React.FC<{
           </div>
         </Card>
       )}
+
+      <Card>
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap">
+            <strong className="text-sm">Hybrid Memory Search (Modb.Fts + Modb.Vec)</strong>
+            {searchStats && (
+              <>
+                <Badge tone="info">FTS {searchStats.memories_fts_docs}</Badge>
+                <Badge tone="accent">Sketch {searchStats.dimensions}d: {searchStats.memories_sketch_docs}</Badge>
+                <Badge tone={searchStats.memories_neural_docs > 0 ? 'ok' : 'neutral'}>
+                  Neural: {searchStats.memories_neural_docs}
+                  {searchStats.neural_provider ? ` (${searchStats.neural_provider})` : ''}
+                </Badge>
+              </>
+            )}
+          </div>
+          <Button variant="ghost" size="sm" onClick={reindexEmbeddings} disabled={reindexing}>
+            <RefreshCw className={`w-3.5 h-3.5 ${reindexing ? 'animate-spin' : ''}`} />
+            <span>{reindexing ? 'Reindexing…' : 'Reindex Embeddings'}</span>
+          </Button>
+        </div>
+
+        <form onSubmit={runMemorySearch} className="flex gap-2 flex-wrap">
+          <input
+            className={`${inputCls} flex-1 min-w-48`}
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search memories by keyword or natural meaning…"
+          />
+          <select
+            className={`${inputCls} w-auto`}
+            aria-label="Memory search mode"
+            value={searchMode}
+            onChange={(e) => setSearchMode(e.target.value as 'hybrid' | 'bm25' | 'semantic')}
+          >
+            <option value="hybrid">Hybrid RRF</option>
+            <option value="bm25">BM25 Only</option>
+            <option value="semantic">Semantic Vec</option>
+          </select>
+          <Button type="submit" variant="ghost" size="sm" disabled={searching}>
+            <Search className="w-3.5 h-3.5" />
+            <span>{searching ? 'Searching…' : 'Search Memory'}</span>
+          </Button>
+          {searchRes && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setSearchRes(null)}
+            >
+              Clear
+            </Button>
+          )}
+        </form>
+
+        {searchRes && (
+          <div className="flex flex-col gap-2 pt-1">
+            <div className="flex items-center gap-2 text-xs text-[var(--fg-muted)] flex-wrap">
+              <Badge tone="accent">{searchRes.mode}</Badge>
+              <Badge tone="info">{searchRes.embedding_backend}</Badge>
+              <span>{searchRes.hits.length} hit(s)</span>
+            </div>
+            {searchRes.hits.length === 0 ? (
+              <div className="text-xs text-[var(--fg-muted)]">No matching memories.</div>
+            ) : (
+              searchRes.hits.map((hit) => (
+                <div
+                  key={hit.memory.id}
+                  className="p-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-elev)] flex flex-col gap-1.5"
+                >
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <Badge tone="accent">
+                        {hit.memory.scope} / {hit.memory.kind}
+                      </Badge>
+                      <Badge tone="ok">score {hit.score.toFixed(4)}</Badge>
+                      {hit.fts_score != null && (
+                        <Badge tone="info">
+                          bm25 #{hit.fts_rank ?? 1} ({hit.fts_score.toFixed(2)})
+                        </Badge>
+                      )}
+                      {hit.vec_score != null && (
+                        <Badge tone="accent">
+                          vec #{hit.vec_rank ?? 1} (cos {hit.vec_score.toFixed(3)})
+                        </Badge>
+                      )}
+                    </div>
+                    {hit.matched_terms.length > 0 && (
+                      <span className="text-[11px] font-mono text-[var(--fg-muted)]">
+                        terms: {hit.matched_terms.join(', ')}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-xs">{hit.memory.content}</div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+      </Card>
 
       <Card>
         <strong className="text-sm">Add Owner-Verified Memory</strong>

@@ -46,11 +46,13 @@ fn print_usage(console: Console)
       "  motet connectors add <name> <url> <auth_env> [effect]",
       "  motet memory [scope]                             List persistent memory",
       "  motet memory add <scope> <kind> <content...>     Save a durable memory entry",
-      "  motet memory search <query...>                   Full-text search memory",
+      "  motet memory search [--mode M] <query...>        Hybrid (BM25 + vector) memory search",
       "  motet skills                                     List progressive-disclosure SKILL.md skills",
       "  motet skills show <name>                         Print a skill's full SKILL.md",
       "  motet log <session_id>                           Print a session's append-only event log",
-      "  motet search <query...>                          Full-text search across all session logs",
+      "  motet search [--mode M] <query...>               Hybrid (BM25 + vector) session search",
+      "  motet search stats                               Show FTS, 128-d sketch & neural index stats",
+      "  motet search reindex                             Backfill neural embeddings across corpus",
       "  motet budget                                     Show exact Decimal USD spend per bot",
       "  motet verify                                     Full MoDB verify + refresh verification checkpoint",
       "  motet compact                                    Rebuild motet.modb cleanly with CoW replay baseline",
@@ -377,7 +379,40 @@ fn cmd_connectors(db: Store.DbHandle, console: Console, rest: List(Text)) : Int
   2
 end
 
-fn cmd_memory(db: Store.DbHandle, clock: Clock, console: Console, rest: List(Text)) : Int
+fn fmt_score(s: Float) : Text
+  case s.to_decimal
+    Some(d): d.to_fixed(4)
+    None: s.to_text
+  end
+end
+
+fn parse_search_mode_and_terms(rest: List(Text)) : (Text, List(Text))
+  var mode = "hybrid"
+  var terms = []
+  var expect_mode? = false
+  for arg in rest
+    if expect_mode?
+      mode = arg
+      expect_mode? = false
+    else if arg == "--mode"
+      expect_mode? = true
+    else if arg.starts_with?("--mode=")
+      mode = Text.from_chars(arg.chars.drop(7))
+    else
+      terms = terms.append(arg)
+    end
+  end
+  (mode, terms)
+end
+
+fn cmd_memory(
+  db: Store.DbHandle,
+  network: Network,
+  env: Env,
+  clock: Clock,
+  console: Console,
+  rest: List(Text)
+) : Int
   if rest.empty?
     return case Store.list_memories(db, None, 40)
       Ok(items):
@@ -395,17 +430,25 @@ fn cmd_memory(db: Store.DbHandle, clock: Clock, console: Console, rest: List(Tex
     content = rest.drop(3).join(" ")
     return case Store.save_memory(db, scope, kind, content, "user", clock.now.to_text)
       Ok(saved):
+        Store.sync_memory_neural_embedding(db, network, env, saved)
         console.print("saved memory ##{saved.id} [#{saved.scope}/#{saved.kind}]")
         0
       Error(err): print_err(console, err)
     end
   end
   if sub == "search" and rest.size >= 2
-    q = rest.drop(1).join(" ")
-    return case Store.search_memories(db, None, q)
-      Ok(items):
-        for m in items
-          console.print("##{m.id} [#{m.scope}/#{m.kind}] #{m.content}")
+    (mode, terms) = parse_search_mode_and_terms(rest.drop(1))
+    q = terms.join(" ")
+    if q.trim.empty?
+      console.error("usage: motet memory search [--mode hybrid|bm25|semantic] <query...>")
+      return 2
+    end
+    return case Store.search_memories_rich(db, network, env, None, q, mode, 25)
+      Ok(res):
+        console.print("[memory search mode=#{res.mode} backend=#{res.embedding_backend}]")
+        for h in res.hits
+          m = h.memory
+          console.print("##{m.id} [#{m.scope}/#{m.kind}] score=#{fmt_score(h.score)} #{m.content}")
         end
         0
       Error(err): print_err(console, err)
@@ -415,6 +458,60 @@ fn cmd_memory(db: Store.DbHandle, clock: Clock, console: Console, rest: List(Tex
     Ok(items):
       for m in items
         console.print("##{m.id} [#{m.scope}/#{m.kind}] #{m.content}")
+      end
+      0
+    Error(err): print_err(console, err)
+  end
+end
+
+fn cmd_search(
+  db: Store.DbHandle,
+  network: Network,
+  env: Env,
+  console: Console,
+  rest: List(Text)
+) : Int
+  sub = rest.first or ""
+  if sub == "stats"
+    return case Store.search_stats(db, env)
+      Ok(st):
+        np = st.neural_provider or "none"
+        cp = st.configured_provider or "none"
+        console.print(
+          "SearchStats schema=v#{st.schema_version} dims=#{st.dimensions} neural=#{np} configured=#{cp} memories=(fts=#{st
+            .memories_fts_docs}, sketch=#{st.memories_sketch_docs}, neural=#{st
+            .memories_neural_docs}) events=(fts=#{st.events_fts_docs}, sketch=#{st
+            .events_sketch_docs}, neural=#{st.events_neural_docs})"
+        )
+        0
+      Error(err): print_err(console, err)
+    end
+  end
+  if sub == "reindex"
+    return case Store.reindex_neural_vectors(db, network, env)
+      Ok(rx):
+        console.print(
+          "Search reindex ok backend=#{rx.backend} memories=#{rx.memories_indexed} events=#{rx
+            .events_indexed}"
+        )
+        0
+      Error(err): print_err(console, err)
+    end
+  end
+  (mode, terms) = parse_search_mode_and_terms(rest)
+  q = terms.join(" ").trim
+  if q.empty?
+    console.error("usage: motet search ([--mode hybrid|bm25|semantic] <query...> | stats | reindex)")
+    return 2
+  end
+  case Store.search_events_rich(db, network, env, q, mode, 25)
+    Ok(res):
+      console.print("[session search mode=#{res.mode} backend=#{res.embedding_backend}]")
+      for h in res.hits
+        ev = h.event
+        console.print(
+          "[#{ev.session_id}##{ev.seq} #{ev.role}] score=#{fmt_score(h.score)} #{ev.content}"
+        )
       end
       0
     Error(err): print_err(console, err)
@@ -651,7 +748,7 @@ fn main(
   return cmd_resolve(rt, db, console, rest, false) if head == "deny"
   return cmd_vault(db, env, clock, srng, console, rest) if head == "vault"
   return cmd_connectors(db, console, rest) if head == "connectors"
-  return cmd_memory(db, clock, console, rest) if head == "memory"
+  return cmd_memory(db, network, env, clock, console, rest) if head == "memory"
   return cmd_skills(files.read_only, console, rest) if head == "skills"
   return cmd_budget(db, console) if head == "budget"
   return cmd_watch(rt, db, console, rest) if head == "watch"
@@ -692,14 +789,7 @@ fn main(
   end
 
   if head == "search" and not rest.empty?
-    return case Store.search_events(db, rest.join(" "), 25)
-      Ok(hits):
-        for ev in hits
-          console.print("[#{ev.session_id}##{ev.seq} #{ev.role}] #{ev.content}")
-        end
-        0
-      Error(err): print_err(console, err)
-    end
+    return cmd_search(db, network, env, console, rest)
   end
 
   console.error("unknown command: #{argv.join(" ")}")
@@ -817,4 +907,23 @@ test "motet CLI initializes specialist roster, seals Vault API key, runs canonic
   assert main(Args.of(["worlds"]), env, c8, files, cmd, Network.fake({}), clock, srng) == 0
   assert (c8.printed.first or "").contains?("LandingMetrics landed=") and
     (c8.printed.join("\n")).contains?("No speculative CoW Worlds recorded.")
+
+  c9 = Console.fake()
+  assert main(Args.of(["search", "stats"]), env, c9, files, cmd, Network.fake({}), clock, srng) == 0
+  assert (c9.printed.first or "").contains?("schema=v3") and
+    (c9.printed.first or "").contains?("memories=(fts=1, sketch=1")
+
+  c10 = Console.fake()
+  assert main(
+    Args.of(["memory", "search", "--mode", "hybrid", "Todoist"]),
+    env,
+    c10,
+    files,
+    cmd,
+    Network.fake({}),
+    clock,
+    srng
+  ) ==
+    0
+  assert (c10.printed.join("\n")).contains?("Todoist")
 end

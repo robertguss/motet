@@ -38,6 +38,7 @@ ssh "${SSH_OPTS[@]}" "$HOST" 'bash -s' <<'REMOTE'
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 cd "$HOME/motet"
+mo test llm.mo
 mo test store.mo
 mo test memory.mo
 mo test tools.mo

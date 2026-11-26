@@ -22,6 +22,7 @@ import {
   ConnectorAuthStatus,
   ConnectorSpec,
   EffectClass,
+  EventSearchResponse,
   fmtUsd,
   getStoredToken,
   HealthSummary,
@@ -31,7 +32,6 @@ import {
   ModbVerifySummary,
   PolicyRule,
   PushSubscriptionItem,
-  SessionEvent,
   SessionSummary,
   setStoredToken,
   TelegramConfig,
@@ -760,40 +760,82 @@ export const SessionsView: React.FC<{
   onOpenChat: (bot: string) => void;
 }> = ({ sessions, onOpenChat }) => {
   const [query, setQuery] = useState('');
-  const [hits, setHits] = useState<SessionEvent[]>([]);
+  const [mode, setMode] = useState<'hybrid' | 'bm25' | 'semantic'>('hybrid');
+  const [searchRes, setSearchRes] = useState<EventSearchResponse | null>(null);
+  const [searching, setSearching] = useState(false);
 
   async function search(e: React.FormEvent) {
     e.preventDefault();
     if (!query.trim()) return;
-    setHits(await api<SessionEvent[]>(`/v1/sessions/search?q=${encodeURIComponent(query.trim())}`));
+    setSearching(true);
+    try {
+      setSearchRes(
+        await api<EventSearchResponse>(
+          `/v1/sessions/search/scored?q=${encodeURIComponent(query.trim())}&mode=${encodeURIComponent(mode)}`
+        )
+      );
+    } finally {
+      setSearching(false);
+    }
   }
 
   return (
     <div className="flex flex-col gap-4">
       <SectionHeader
-        title="Sessions & Full-Text Search"
-        subtitle="Browse canonical forever-chats, delegated runs, and external webhook logs."
+        title="Sessions & Hybrid Search"
+        subtitle="Browse canonical forever-chats, delegated runs, and hybrid BM25 + semantic Modb.Vec session search."
       />
-      <form onSubmit={search} className="flex gap-2">
+      <form onSubmit={search} className="flex gap-2 flex-wrap">
         <input
-          className={inputCls}
+          className={`${inputCls} flex-1 min-w-48`}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search across all append-only session events…"
         />
-        <Button type="submit" variant="ghost">
+        <select
+          className={`${inputCls} w-auto`}
+          aria-label="Session search mode"
+          value={mode}
+          onChange={(e) => setMode(e.target.value as 'hybrid' | 'bm25' | 'semantic')}
+        >
+          <option value="hybrid">Hybrid RRF</option>
+          <option value="bm25">BM25 Only</option>
+          <option value="semantic">Semantic Vec</option>
+        </select>
+        <Button type="submit" variant="ghost" disabled={searching}>
           <Search className="w-4 h-4" />
-          <span>Search</span>
+          <span>{searching ? 'Searching…' : 'Search Sessions'}</span>
         </Button>
+        {searchRes && (
+          <Button type="button" variant="ghost" onClick={() => setSearchRes(null)}>
+            Clear
+          </Button>
+        )}
       </form>
-      {hits.length > 0 && (
+      {searchRes && (
         <div className="flex flex-col gap-2">
-          {hits.map((h) => (
-            <Card key={h.id}>
-              <div className="text-xs font-mono text-[var(--fg-muted)]">
-                {h.session_id} #{h.seq} · {h.role} · {h.created_at}
+          <div className="flex items-center gap-2 text-xs text-[var(--fg-muted)]">
+            <Badge tone="accent">{searchRes.mode}</Badge>
+            <Badge tone="info">{searchRes.embedding_backend}</Badge>
+            <span>{searchRes.hits.length} matching event(s)</span>
+          </div>
+          {searchRes.hits.map((h) => (
+            <Card key={h.event.id}>
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="text-xs font-mono text-[var(--fg-muted)]">
+                  {h.event.session_id} #{h.event.seq} · {h.event.role} · {h.event.created_at}
+                </div>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <Badge tone="ok">score {h.score.toFixed(4)}</Badge>
+                  {h.fts_score != null && (
+                    <Badge tone="info">bm25 {h.fts_score.toFixed(2)}</Badge>
+                  )}
+                  {h.vec_score != null && (
+                    <Badge tone="accent">cos {h.vec_score.toFixed(3)}</Badge>
+                  )}
+                </div>
               </div>
-              <div className="text-xs whitespace-pre-wrap">{h.content}</div>
+              <div className="text-xs whitespace-pre-wrap">{h.event.content}</div>
             </Card>
           ))}
         </div>

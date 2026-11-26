@@ -8,6 +8,7 @@ function mockFetch() {
   let grantRevoked = false;
   let worldLanded = false;
   let dreamLanded = false;
+  let reindexed = false;
 
   return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     const url = String(input);
@@ -559,6 +560,87 @@ function mockFetch() {
         },
       ]);
     }
+    if (url.includes('/v1/search/reindex')) {
+      reindexed = true;
+      return json({
+        backend: 'gemini:gemini-embedding-001:128',
+        memories_indexed: 3,
+        events_indexed: 12,
+        'cleared_stale_neural?': false,
+      });
+    }
+    if (url.includes('/v1/search/stats')) {
+      return json({
+        schema_version: 3,
+        dimensions: 128,
+        neural_provider: reindexed ? 'gemini:gemini-embedding-001:128' : null,
+        configured_provider: 'gemini:gemini-embedding-001:128',
+        memories_fts_docs: 3,
+        memories_sketch_docs: 3,
+        memories_neural_docs: reindexed ? 3 : 0,
+        events_fts_docs: 12,
+        events_sketch_docs: 12,
+        events_neural_docs: reindexed ? 12 : 0,
+      });
+    }
+    if (url.includes('/v1/memory/search')) {
+      return json({
+        query: 'vacation airfare',
+        mode: 'hybrid',
+        embedding_backend: 'gemini:gemini-embedding-001:128',
+        hits: [
+          {
+            memory: {
+              id: 7,
+              scope: 'shared',
+              kind: 'profile',
+              content: 'Prefer direct flights out of SFO.',
+              provenance: 'user',
+              origin: 'owner',
+              session_kind: 'direct',
+              staged: false,
+              created_at: '2026-11-26T00:00:00Z',
+            },
+            score: 0.0328,
+            fts_rank: null,
+            fts_score: null,
+            vec_rank: 1,
+            vec_score: 0.941,
+            matched_terms: [],
+          },
+        ],
+      });
+    }
+    if (url.includes('/v1/sessions/search/scored')) {
+      return json({
+        query: 'vat',
+        mode: 'hybrid',
+        embedding_backend: 'gemini:gemini-embedding-001:128',
+        hits: [
+          {
+            event: {
+              id: 42,
+              session_id: 'chief-main',
+              seq: 3,
+              kind: 'message',
+              role: 'user',
+              content: 'Check Portuguese VAT invoice filing deadline.',
+              tool_name: null,
+              tool_call_id: null,
+              tool_calls_json: null,
+              cost_usd: '0.00',
+              created_at: '2026-11-26T00:00:00Z',
+            },
+            score: 0.0328,
+            fts_rank: 1,
+            fts_score: 2.15,
+            vec_rank: 1,
+            vec_score: 0.912,
+            matched_terms: ['vat'],
+          },
+        ],
+      });
+    }
     return json([]);
   });
 }
@@ -718,6 +800,54 @@ describe('Motet Control Plane Dashboard', () => {
     fireEvent.click(screen.getAllByText('Exclude World in Replay →')[0]);
     await waitFor(() => {
       expect(screen.getByText('Exclude World ID')).toBeInTheDocument();
+    });
+  });
+
+  it('runs hybrid memory search, reindexes neural embeddings, and searches sessions with scores', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('5 bots · 1 inbox')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Memory & Dreaming'));
+    await waitFor(() => {
+      expect(screen.getByText('Hybrid Memory Search (Modb.Fts + Modb.Vec)')).toBeInTheDocument();
+      expect(screen.getByText('FTS 3')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Reindex Embeddings'));
+    await waitFor(() => {
+      expect(
+        screen.getByText('Neural: 3 (gemini:gemini-embedding-001:128)')
+      ).toBeInTheDocument();
+    });
+
+    fireEvent.change(
+      screen.getByPlaceholderText('Search memories by keyword or natural meaning…'),
+      { target: { value: 'vacation airfare' } }
+    );
+    fireEvent.click(screen.getByText('Search Memory'));
+    await waitFor(() => {
+      expect(screen.getByText('Prefer direct flights out of SFO.')).toBeInTheDocument();
+      expect(screen.getByText('vec #1 (cos 0.941)')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Sessions'));
+    await waitFor(() => {
+      expect(screen.getByText('Sessions & Hybrid Search')).toBeInTheDocument();
+    });
+
+    fireEvent.change(
+      screen.getByPlaceholderText('Search across all append-only session events…'),
+      { target: { value: 'vat' } }
+    );
+    fireEvent.click(screen.getByText('Search Sessions'));
+    await waitFor(() => {
+      expect(
+        screen.getByText('Check Portuguese VAT invoice filing deadline.')
+      ).toBeInTheDocument();
+      expect(screen.getByText('cos 0.912')).toBeInTheDocument();
     });
   });
 });
