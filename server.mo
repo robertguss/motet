@@ -23,6 +23,7 @@ use Modb.Export
 use Modb.Feeds
 use Modb.Grants
 use Modb.Ledger
+use Modb.Matview
 use Modb.Policy
 use Modb.Proposals
 use Modb.Replay
@@ -241,6 +242,10 @@ api
   get "/v1/modb/export" get_modb_export
   get "/v1/modb/describe" get_modb_describe
   post "/v1/modb/query" post_modb_query
+  post "/v1/modb/query/explain" post_modb_query_explain
+  get "/v1/modb/matviews" get_modb_matviews
+  post "/v1/modb/matviews/:name/refresh" post_modb_matview_refresh
+  get "/v1/modb/matviews/:name/query" get_modb_matview_query
   post "/v1/modb/releases/:name" post_modb_release
   get "/v1/modb/reads" get_modb_reads
   get "/v1/modb/worlds" get_modb_worlds
@@ -2155,6 +2160,51 @@ fn post_modb_query(
 ) : Result(Views.ReadResult, MotetError)
   db = try ensure_ready(files, clock)
   Store.run_read_program(db, op.subject, grant_id, body, clock.now)
+end
+
+## Explains the physical QueryPlan (`index_eq` | `index_in_list` | `index_range` | `full_scan`) for a ReadProgram.
+fn post_modb_query_explain(
+  op: Operator,
+  files: Files,
+  clock: Clock,
+  grant_id: Option(Text),
+  body: Views.ReadProgram
+) : Result(Json, MotetError)
+  db = try ensure_ready(files, clock)
+  Store.explain_read_program(db, op.subject, grant_id, body, clock.now)
+end
+
+## Lists all incremental CoW Materialized Views (`approvals_by_status`, `budget_by_bot`).
+fn get_modb_matviews(_op: Operator, files: Files, clock: Clock) : Result(
+  List(Matview.MatViewMeta),
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  Store.list_matviews(db)
+end
+
+## Incrementally refreshes one MatView in O(diff) and pushes a `matview.refreshed` SSE frame.
+fn post_modb_matview_refresh(_op: Operator, files: Files, clock: Clock, name: Text) : Result(
+  Api.Response,
+  MotetError
+)
+  db = try ensure_ready(files, clock)
+  rep = try Store.refresh_matview(db, name.trim)
+  Ok(
+    json_motet_sse(rep, [("motet", "matview.refreshed")], ["_modb_matview_rows"], "refresh_matview")
+  )
+end
+
+## Queries a Materialized View with optional k-anonymity minimum group threshold (`min_k`).
+fn get_modb_matview_query(
+  _op: Operator,
+  files: Files,
+  clock: Clock,
+  name: Text,
+  min_k: Option(Int)
+) : Result(Matview.MatQueryResult, MotetError)
+  db = try ensure_ready(files, clock)
+  Store.query_matview(db, name.trim, min_k)
 end
 
 fn parse_optional_json(req: Api.Request) : Result(Json, MotetError)
@@ -5345,4 +5395,57 @@ test "HTTP and MCP serve hybrid/BM25/semantic search, Vault Gemini reindex, and 
     srng
   )
   assert pub_bad.status == 400
+
+  # Milestone 15: /v1/modb/query/explain + /v1/modb/matviews*
+  ex_idx = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/query/explain").with_bearer("secret-op").with_json(
+      Views.ReadProgram(
+        view: "sessions",
+        where_clause: Some(Views.Eq(field: "bot_name", value: Json.String("chief"))),
+        select: None,
+        group_by: None,
+        aggregates: None,
+        order_by: None,
+        limit: None
+      )
+    ),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert ex_idx.status == 200 and ex_idx.text.contains?("\"strategy\":\"index_eq\"") and
+    ex_idx.text.contains?("bot_name")
+
+  mvs_list = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/matviews").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mvs_list.status == 200 and mvs_list.text.contains?("approvals_by_status") and
+    mvs_list.text.contains?("budget_by_bot")
+
+  mvs_ref = ApiTest.send(
+    Server,
+    Api.post("/v1/modb/matviews/approvals_by_status/refresh").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mvs_ref.status == 200 and mvs_ref.text.contains?("approvals_by_status")
+
+  mvs_q = ApiTest.send(
+    Server,
+    Api.get("/v1/modb/matviews/approvals_by_status/query").with_bearer("secret-op"),
+    files,
+    env,
+    clock,
+    srng
+  )
+  assert mvs_q.status == 200 and mvs_q.text.contains?("approvals_by_status")
 end

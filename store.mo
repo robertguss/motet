@@ -227,7 +227,11 @@ authorize_session_action,
 list_taint_sessions,
 clear_taint_session,
 list_erasure_receipts,
-erase_subject_data
+erase_subject_data,
+explain_read_program,
+list_matviews,
+refresh_matview,
+query_matview
 use Http
 use Json
 use Llm
@@ -240,6 +244,7 @@ use Modb.Feeds
 use Modb.Fts{DocumentInput, FieldInput, FtsIndex, SearchOptions}
 use Modb.Grants{GrantSpec}
 use Modb.Ledger{AuditEntry, LedgerError, Schema, WriteMeta}
+use Modb.Matview
 use Modb.Policy
 use Modb.Proposals
 use Modb.Replay{ReplayCatalog, ReplayFilter, ReplayProposal}
@@ -775,6 +780,15 @@ fn views_err(e: Views.ViewsError) : MotetError
     Views.ViewLoadFailed(view: _, detail: _) | Views.ReleaseFailed(release: _, detail: _): StorageFailed(
       message: e.to_text
     )
+  end
+end
+
+fn matview_err(e: Matview.MatViewError) : MotetError
+  case e
+    Matview.Storage(me): modb_err(me)
+    Matview.TableFailure(te): table_err(te)
+    Matview.UnknownMatView(name: _): ItemNotFound(message: Matview.to_text(e))
+    Matview.InvalidDefinition(reason: _): BadInput(message: Matview.to_text(e))
   end
 end
 
@@ -3079,7 +3093,7 @@ end
 
 ## Grant-scoped ViewCatalog + k-anonymous Release catalog (secrets excluded physically).
 fn motet_view_catalog() : ViewCatalog
-  Views.catalog().with_view(
+  cat0 = Views.catalog().with_view(
     ViewDef(
       name: "bots",
       description: "Active and paused bot configurations (omits API credentials and internal headers)",
@@ -3369,6 +3383,324 @@ fn motet_view_catalog() : ViewCatalog
       "budget_ledger_non_negative",
       "Every recorded spend ledger row has cost_usd >= 0 and non-negative token counts"
     ).with_invariant_doc("memories_non_empty", "Every memory entry has non-empty scope and content")
+  with_motet_view_indexes(cat0)
+end
+
+fn json_text_val(jv: Json) : Text
+  case jv
+    Json.String(s): s
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): jv.to_text
+  end
+end
+
+fn bot_map_full(b: BotConfig) : Map(Text, Json)
+  {
+    "name": Json.String(b.name),
+    "role": Json.String(b.role),
+    "model_tier": Json.String(b.model_tier),
+    "model": Json.String(b.model),
+    "workspace": Json.String(b.workspace),
+    "daily_budget_usd": Json.String(b.daily_budget_usd.to_fixed(2)),
+    "max_steps": Json.int(b.max_steps),
+    "active": Json.Boolean(b.active?)
+  }
+end
+
+fn bot_map_public(b: BotConfig) : Map(Text, Json)
+  {
+    "name": Json.String(b.name),
+    "role": Json.String(b.role),
+    "model_tier": Json.String(b.model_tier),
+    "active": Json.Boolean(b.active?)
+  }
+end
+
+fn memory_map_full(m: MemoryRow) : Map(Text, Json)
+  {
+    "id": Json.int(m.id),
+    "scope": Json.String(m.scope),
+    "kind": Json.String(m.kind),
+    "content": Json.String(m.content),
+    "provenance": Json.String(m.provenance),
+    "staged": Json.Boolean(m.staged),
+    "created_at": Json.String(m.created_at)
+  }
+end
+
+fn memory_map_shared(m: MemoryRow) : Map(Text, Json)
+  {
+    "id": Json.int(m.id),
+    "scope": Json.String(m.scope),
+    "kind": Json.String(m.kind),
+    "content": Json.String(m.content),
+    "staged": Json.Boolean(m.staged),
+    "created_at": Json.String(m.created_at)
+  }
+end
+
+fn reg_bot_view_idx(cat: ViewCatalog, vname: Text, map_fn: fn(BotConfig) : Map(Text, Json)) : ViewCatalog
+  bt = bots_table()
+  Views.with_view_range_index(
+    cat,
+    vname,
+    "name",
+    fn(st, jv)
+      case try Table.get(st, bt, json_text_val(jv)).map_error(fn(e) e.to_text end)
+        Some(b): Ok([map_fn(b)])
+        None: Ok([])
+      end
+    end,
+    fn(st, lo_opt, hi_opt, _lo_inc, hi_inc)
+      lo_k = lo_opt.map(json_text_val)
+      hi_k = case hi_opt
+        Some(jv):
+          s = json_text_val(jv)
+          Some(if hi_inc: "#{s}\u{10ffff}" else: s)
+        None: None
+      end
+      rows = try Table.scan(st, bt, lo_k, hi_k, 0).map_error(fn(e) e.to_text end)
+      Ok(rows.map(fn(p) map_fn(p.1) end))
+    end
+  )
+end
+
+fn with_motet_view_indexes(cat: ViewCatalog) : ViewCatalog
+  c1 = reg_bot_view_idx(reg_bot_view_idx(cat, "bots", bot_map_full), "bots_public", bot_map_public)
+  mem_t = memories_table()
+  mem_scope_idx = memories_by_scope_index()
+  c2 = Views.with_view_range_index(
+    c1,
+    "memories",
+    "id",
+    fn(st, jv)
+      case Json.Object({"v": jv}).int_at("v")
+        None: Ok([])
+        Some(mid):
+          case try Table.get(st, mem_t, mid).map_error(fn(e) e.to_text end)
+            Some(m) if not m.archived?: Ok([memory_map_full(m)])
+            Some(_) | None: Ok([])
+          end
+      end
+    end,
+    fn(st, lo_opt, hi_opt, lo_inc, hi_inc)
+      lo_k = case lo_opt
+        Some(jv):
+          case Json.Object({"v": jv}).int_at("v")
+            Some(iv): Some(if lo_inc: iv else: iv + 1)
+            None: None
+          end
+        None: None
+      end
+      hi_k = case hi_opt
+        Some(jv):
+          case Json.Object({"v": jv}).int_at("v")
+            Some(iv): Some(if hi_inc: iv + 1 else: iv)
+            None: None
+          end
+        None: None
+      end
+      rows = try Table.scan(st, mem_t, lo_k, hi_k, 0).map_error(fn(e) e.to_text end)
+      Ok(rows.filter(fn(p) not p.1.archived? end).map(fn(p) memory_map_full(p.1) end))
+    end
+  ).with_view_eq_index(
+    "memories",
+    "scope",
+    fn(st, jv)
+      rows = try Table.lookup(st, mem_t, mem_scope_idx, json_text_val(jv)).map_error(fn(e)
+        e.to_text
+      end)
+      Ok(rows.filter(fn(p) not p.1.archived? end).map(fn(p) memory_map_full(p.1) end))
+    end
+  ).with_view_range_index(
+    "memories_shared",
+    "id",
+    fn(st, jv)
+      case Json.Object({"v": jv}).int_at("v")
+        None: Ok([])
+        Some(mid):
+          case try Table.get(st, mem_t, mid).map_error(fn(e) e.to_text end)
+            Some(m) if not m.archived? and m.scope == "shared": Ok([memory_map_shared(m)])
+            Some(_) | None: Ok([])
+          end
+      end
+    end,
+    fn(st, lo_opt, hi_opt, lo_inc, hi_inc)
+      lo_k = case lo_opt
+        Some(jv):
+          case Json.Object({"v": jv}).int_at("v")
+            Some(iv): Some(if lo_inc: iv else: iv + 1)
+            None: None
+          end
+        None: None
+      end
+      hi_k = case hi_opt
+        Some(jv):
+          case Json.Object({"v": jv}).int_at("v")
+            Some(iv): Some(if hi_inc: iv + 1 else: iv)
+            None: None
+          end
+        None: None
+      end
+      rows = try Table.scan(st, mem_t, lo_k, hi_k, 0).map_error(fn(e) e.to_text end)
+      Ok(
+        rows.filter(fn(p) not p.1.archived? and p.1.scope == "shared" end).map(fn(p)
+          memory_map_shared(p.1)
+        end)
+      )
+    end
+  )
+
+  sess_t = sessions_table()
+  sess_bot_idx = sessions_by_bot_index()
+  c3 = Views.with_view_range_index(
+    c2,
+    "sessions",
+    "id",
+    fn(st, jv)
+      case try Table.get(st, sess_t, json_text_val(jv)).map_error(fn(e) e.to_text end)
+        Some(s): Ok([
+          {
+            "id": Json.String(s.id),
+            "bot_name": Json.String(s.bot_name),
+            "title": Json.String(s.title),
+            "trust": Json.String(Types.trust_to_text(s.trust)),
+            "canonical": Json.Boolean(s.canonical?),
+            "created_at": Json.String(s.created_at),
+            "updated_at": Json.String(s.updated_at),
+            "event_count": Json.int(s.event_count)
+          }
+        ])
+        None: Ok([])
+      end
+    end,
+    fn(st, lo_opt, hi_opt, _lo_inc, hi_inc)
+      lo_k = lo_opt.map(json_text_val)
+      hi_k = case hi_opt
+        Some(jv):
+          s = json_text_val(jv)
+          Some(if hi_inc: "#{s}\u{10ffff}" else: s)
+        None: None
+      end
+      rows = try Table.scan(st, sess_t, lo_k, hi_k, 0).map_error(fn(e) e.to_text end)
+      Ok(
+        rows.map(fn(p)
+          s = p.1
+          {
+            "id": Json.String(s.id),
+            "bot_name": Json.String(s.bot_name),
+            "title": Json.String(s.title),
+            "trust": Json.String(Types.trust_to_text(s.trust)),
+            "canonical": Json.Boolean(s.canonical?),
+            "created_at": Json.String(s.created_at),
+            "updated_at": Json.String(s.updated_at),
+            "event_count": Json.int(s.event_count)
+          }
+        end)
+      )
+    end
+  ).with_view_eq_index(
+    "sessions",
+    "bot_name",
+    fn(st, jv)
+      rows = try Table.lookup(st, sess_t, sess_bot_idx, json_text_val(jv)).map_error(fn(e)
+        e.to_text
+      end)
+      Ok(
+        rows.map(fn(p)
+          s = p.1
+          {
+            "id": Json.String(s.id),
+            "bot_name": Json.String(s.bot_name),
+            "title": Json.String(s.title),
+            "trust": Json.String(Types.trust_to_text(s.trust)),
+            "canonical": Json.Boolean(s.canonical?),
+            "created_at": Json.String(s.created_at),
+            "updated_at": Json.String(s.updated_at),
+            "event_count": Json.int(s.event_count)
+          }
+        end)
+      )
+    end
+  )
+
+  art_t = artifacts_table()
+  art_bot_idx = artifacts_by_bot_index()
+  c3.with_view_range_index(
+    "artifacts",
+    "id",
+    fn(st, jv)
+      case Json.Object({"v": jv}).int_at("v")
+        None: Ok([])
+        Some(aid):
+          case try Table.get(st, art_t, aid).map_error(fn(e) e.to_text end)
+            Some(a): Ok([
+              {
+                "id": Json.int(a.id),
+                "bot_name": Json.String(a.bot_name),
+                "session_id": Json.String(a.session_id),
+                "kind": Json.String(a.kind),
+                "title": Json.String(a.title),
+                "created_at": Json.String(a.created_at)
+              }
+            ])
+            None: Ok([])
+          end
+      end
+    end,
+    fn(st, lo_opt, hi_opt, lo_inc, hi_inc)
+      lo_k = case lo_opt
+        Some(jv):
+          case Json.Object({"v": jv}).int_at("v")
+            Some(iv): Some(if lo_inc: iv else: iv + 1)
+            None: None
+          end
+        None: None
+      end
+      hi_k = case hi_opt
+        Some(jv):
+          case Json.Object({"v": jv}).int_at("v")
+            Some(iv): Some(if hi_inc: iv + 1 else: iv)
+            None: None
+          end
+        None: None
+      end
+      rows = try Table.scan(st, art_t, lo_k, hi_k, 0).map_error(fn(e) e.to_text end)
+      Ok(
+        rows.map(fn(p)
+          a = p.1
+          {
+            "id": Json.int(a.id),
+            "bot_name": Json.String(a.bot_name),
+            "session_id": Json.String(a.session_id),
+            "kind": Json.String(a.kind),
+            "title": Json.String(a.title),
+            "created_at": Json.String(a.created_at)
+          }
+        end)
+      )
+    end
+  ).with_view_eq_index(
+    "artifacts",
+    "bot_name",
+    fn(st, jv)
+      rows = try Table.lookup(st, art_t, art_bot_idx, json_text_val(jv)).map_error(fn(e)
+        e.to_text
+      end)
+      Ok(
+        rows.map(fn(p)
+          a = p.1
+          {
+            "id": Json.int(a.id),
+            "bot_name": Json.String(a.bot_name),
+            "session_id": Json.String(a.session_id),
+            "kind": Json.String(a.kind),
+            "title": Json.String(a.title),
+            "created_at": Json.String(a.created_at)
+          }
+        end)
+      )
+    end
+  )
 end
 
 ## Layer 4 Sensitivity Policy across Motet buckets, Views, Releases, and search scopes.
@@ -7068,6 +7400,125 @@ fn run_read_program(
   )
 end
 
+fn explain_read_program(
+  db: DbHandle,
+  _principal: Text,
+  grant_id_opt: Option(Text),
+  program: ReadProgram,
+  now: Time
+) : Result(Json, MotetError)
+  with_db_read(
+    db,
+    fn(ldb)
+      st = Ledger.store(ldb)
+      (live_cat, _live_pol) = try effective_catalog_and_policy(st)
+      case grant_id_opt
+        Some(gid):
+          _g = try Grants.verify_view(
+            st,
+            gid,
+            program.view,
+            Views.view_narrows_map(live_cat),
+            now
+          ).map_error(grant_err)
+        None: Unit
+      end
+      Views.explain_read_program(live_cat, program).map_error(views_err)
+    end
+  )
+end
+
+fn default_motet_matview_defs() : List(Matview.MatViewDef)
+  [
+    Matview.MatViewDef(
+      name: "approvals_by_status",
+      description: "Incremental materialized count of Needs-You approvals grouped by status",
+      source_bucket: "approvals",
+      group_by: "status",
+      aggregates: [Matview.MatAggSpec(alias: "cnt", op: Matview.MatCount)]
+    ),
+    Matview.MatViewDef(
+      name: "budget_by_bot",
+      description: "Incremental Decimal-exact spend and token totals grouped by bot_name",
+      source_bucket: "budget_ledger",
+      group_by: "bot_name",
+      aggregates: [
+        Matview.MatAggSpec(alias: "turns", op: Matview.MatCount),
+        Matview.MatAggSpec(alias: "total_cost_usd", op: Matview.MatSum(field: "cost_usd")),
+        Matview.MatAggSpec(alias: "total_input_tokens", op: Matview.MatSum(field: "input_tokens")),
+        Matview.MatAggSpec(alias: "total_output_tokens", op: Matview.MatSum(field: "output_tokens")),
+        Matview.MatAggSpec(
+          alias: "total_cached_tokens",
+          op: Matview.MatSum(field: "cached_input_tokens")
+        )
+      ]
+    )
+  ]
+end
+
+fn ensure_motet_matviews_store(store: Modb.Store) : Result(Modb.Store, MotetError)
+  var cur = store
+  for mdef in default_motet_matview_defs()
+    ex = try Matview.get_matview(cur, mdef.name).map_error(matview_err)
+    if ex is None
+      (next_st, _meta) = try Matview.define_matview(cur, mdef).map_error(matview_err)
+      cur = next_st
+    end
+  end
+  Ok(cur)
+end
+
+fn ensure_motet_matviews_db(db: DbHandle) : Result(List(Matview.MatViewMeta), MotetError)
+  existing = try Modb.with_shared_lock(
+    db.files.read_only,
+    db.path,
+    modb_err,
+    fn(st) Matview.list_matviews(st).map_error(matview_err) end
+  )
+  if existing.size >= default_motet_matview_defs().size
+    return Ok(existing)
+  end
+  Modb.with_exclusive_lock(
+    db.files,
+    db.path,
+    modb_err,
+    fn(st)
+      s1 = try ensure_motet_matviews_store(st)
+      Matview.list_matviews(s1).map_error(matview_err)
+    end
+  )
+end
+
+fn list_matviews(db: DbHandle) : Result(List(Matview.MatViewMeta), MotetError)
+  ensure_motet_matviews_db(db)
+end
+
+fn refresh_matview(db: DbHandle, name: Text) : Result(Matview.MatRefreshReport, MotetError)
+  Modb.with_exclusive_lock(
+    db.files,
+    db.path,
+    modb_err,
+    fn(st)
+      s1 = try ensure_motet_matviews_store(st)
+      (_s2, rep) = try Matview.refresh_matview(s1, name).map_error(matview_err)
+      Ok(rep)
+    end
+  )
+end
+
+fn query_matview(db: DbHandle, name: Text, min_k: Option(Int)) : Result(
+  Matview.MatQueryResult,
+  MotetError
+)
+  _ = try ensure_motet_matviews_db(db)
+  Modb.with_shared_lock(
+    db.files.read_only,
+    db.path,
+    modb_err,
+    fn(st) Matview.query_matview(st, name, min_k).map_error(matview_err) end
+  )
+end
+
 fn run_release(
   db: DbHandle,
   principal: Text,
@@ -9380,4 +9831,24 @@ test "Milestone 12: sensitivity policy, governed export, agent proposals & react
   assert list_erasure_receipts(db) is Ok(recs) and recs.any?(fn(r) r.id == "motet-gdpr-1" end)
   assert search_memories(db, Some("personal"), "alice.gdpr@example.com") == Ok([])
   assert verify_all(db) is Ok(vrep2) and vrep2.ok? and vrep2.secrets_ok?
+
+  # 5. Milestone 15: ViewIndex query planner explain/execution + incremental MatViews
+  idx_prog = ReadProgram(
+    view: "memories",
+    where_clause: Some(Views.Eq(field: "scope", value: Json.String("shared"))),
+    select: Some(["id", "scope", "content"]),
+    group_by: None,
+    aggregates: None,
+    order_by: None,
+    limit: Some(20)
+  )
+  assert explain_read_program(db, "operator", None, idx_prog, t0) is Ok(exp_j) and
+    exp_j.text_at("strategy") == Some("index_eq") and
+    exp_j.text_at("field") == Some("scope")
+  assert run_read_program(db, "operator", None, idx_prog, t0) is Ok(r_idx) and
+    r_idx.rows_scanned >= 1
+
+  assert list_matviews(db) is Ok(mvs) and mvs.size >= 2
+  assert refresh_matview(db, "budget_by_bot") is Ok(mv_ref) and mv_ref.name == "budget_by_bot"
+  assert query_matview(db, "budget_by_bot", None) is Ok(mv_q) and mv_q.name == "budget_by_bot"
 end
